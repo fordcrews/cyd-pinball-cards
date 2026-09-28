@@ -21,6 +21,10 @@ Examples:
   python cyd_push.py --calibrate                 (on-device touch calibration)
   python cyd_push.py --cal show | reset | 200,3700,240,3800
   python cyd_push.py --ping
+  python cyd_push.py --list-displays            (every CYD found: id, name, role, port, fw)
+  python cyd_push.py --identify                 (each board shows its role/name/id for 5 s)
+  python cyd_push.py --assign cyd-a1b2c3 --role right --name "Right palm"   (saved on the board)
+  python cyd_push.py "Attack from Mars" --target left       (only the left display; default: all)
 
 Pinball table lookup (positional name, in the cards directory):
   1. exact filename (with or without .json)
@@ -44,9 +48,16 @@ Arcade/console lookup (--rom, or the positional name with --profile arcade):
 Settings come from the command line, else config.json (see config.example.json: profile, cabinet
 name, card/idle/keypad files, serial port, watched processes), else the profile defaults.
 
-If cyd_daemon.py is running it owns the serial port; cyd_push then hands its messages to the daemon
-over 127.0.0.1 (port 47291, env CYD_DAEMON_PORT) and falls back to direct serial when no daemon
-answers. --no-daemon forces direct serial.
+Multiple displays (1-5 CYDs, tested with 5 simulated boards): every command goes to every
+connected board (--target narrows it down). Each board has an identity (firmware 1.3.0: id, name,
+role saved on the board; config.json "displays" can set or override it). Card files may give each
+role its own cards ("displays": {"right": {...}} or per-card "roles": [...]); cards without roles go
+to every display. The same works for the idle file, and "keypad_roles" limits the keypad.
+
+If cyd_daemon.py is running it owns the serial ports; cyd_push then hands its messages to the daemon
+over 127.0.0.1 (port 47291, env CYD_DAEMON_PORT), which sends them to all boards in parallel, and
+falls back to direct serial (all detected boards in parallel, short timeouts) when no daemon answers.
+--no-daemon forces direct serial.
 """
 from __future__ import annotations
 
@@ -64,13 +75,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import serialport  # noqa: E402  (pyserial, or a termios fallback on Linux)
+import displays    # noqa: E402  (multi-display: identity, targeting, direct fan-out)
+from displays import Board  # noqa: E402
 
 # Known USB-serial bridges used on CYD boards: CH340, CH9102, CP2102
-KNOWN_VID_PID = {
-    (0x1A86, 0x7523): "CH340",
-    (0x1A86, 0x55D4): "CH9102",
-    (0x10C4, 0xEA60): "CP210x",
-}
+KNOWN_VID_PID = displays.KNOWN_VID_PID
 BAUD = 115200
 MAX_LINE = 6144          # firmware line limit (bytes, incl. nothing else)
 MAX_IDLE_SCREENS = 12    # firmware keeps at most this many idle screens
@@ -155,6 +164,10 @@ class Settings:
     key_hold_ms: int | None = None
     config_src: Path | None = None
     config: dict = field(default_factory=dict)
+    displays: dict = field(default_factory=dict)     # config.json "displays": board id -> name/role/...
+    keypad_roles: list | None = None                  # None: keypad on every board
+    exclude_ports: list = field(default_factory=list)
+    max_displays: int | None = None                   # None: no limit (5 documented / tested)
 
 
 def _cfg_path(value, cards_dir: Path, base: Path | None) -> Path | None:
@@ -205,6 +218,17 @@ def resolve_settings(args) -> Settings:
     s.key_backend = str(cfg.get("key_backend") or "auto")
     if cfg.get("key_hold_ms") is not None:
         s.key_hold_ms = int(cfg["key_hold_ms"])
+    if isinstance(cfg.get("displays"), dict):
+        s.displays = {k: v for k, v in cfg["displays"].items() if isinstance(v, dict)}
+    kr = cfg.get("keypad_roles")
+    if isinstance(kr, str):
+        kr = [kr]
+    s.keypad_roles = [str(x) for x in kr] if isinstance(kr, list) and kr else None
+    ex = cfg.get("exclude_ports")
+    s.exclude_ports = [str(x) for x in ex] if isinstance(ex, list) else ([str(ex)] if ex else [])
+    s.exclude_ports += [str(x) for x in (getattr(args, "exclude_port", None) or [])]
+    if cfg.get("max_displays"):
+        s.max_displays = int(cfg["max_displays"])
     return s
 
 
@@ -456,6 +480,91 @@ def build_keypad_msg(cfg: dict, page: int | None = None) -> dict:
     if page is not None:
         msg["page"] = int(page)
     return msg
+
+
+# ---------------------------------------------------------------- per-display content
+def _dedupe(cards: list) -> list:
+    seen, out = set(), []
+    for c in cards:
+        key = json.dumps(c, sort_keys=True) if isinstance(c, dict) else repr(c)
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
+def table_for_board(data: dict, board: Board | None) -> dict:
+    """The part of a card file one display shows.
+    * A board with a specific role: data["displays"][role|name|id] (a list of cards, or an object
+      with "cards" and optional "title"), else data["displays"]["default"], else the top-level
+      "cards". Then cards with a "roles" list are kept only if the board's role/name/id is listed.
+      Cards without "roles" go to every display.
+    * A board with role "all" (unassigned, or firmware 1.2.0) and --dry-run without --target: the
+      top-level cards unfiltered (a single display sees everything), else displays["default"],
+      else all sections merged."""
+    disp = data.get("displays") if isinstance(data.get("displays"), dict) else None
+    title = data.get("title", "")
+    if board is None or board.generic:
+        cards = data.get("cards") or []
+        if not cards and disp:
+            dflt = displays.section_for(disp, Board(port="", id="", role="default"))
+            secs = [dflt] if dflt is not None else [v for k, v in disp.items() if not str(k).startswith("_")]
+            for sec in secs:
+                cards = cards + list(sec.get("cards", []) if isinstance(sec, dict) else sec or [])
+            cards = _dedupe(cards)
+        return {**data, "title": title, "cards": list(cards)}
+    sec = displays.section_for(disp, board) if disp else None
+    if sec is None:
+        cards = data.get("cards") or []
+    elif isinstance(sec, dict):
+        cards = sec.get("cards") or []
+        title = sec.get("title") or title
+    else:
+        cards = list(sec)
+    cards = [c for c in cards if not isinstance(c, dict) or not c.get("roles")
+             or displays.role_listed(board, c.get("roles"))]
+    return {**data, "title": title, "cards": cards}
+
+
+def idle_cfg_for_board(cfg: dict, board: Board | None, cards_dir: Path, base: Path | None = None) -> dict:
+    """Idle config for one display: config.json displays[id].idle_config (a whole other file), else
+    the idle file's "displays"[role|name|id] section (its own "idle_config" file, or keys that
+    override the base: screens, cabinet, subtitle, duration...). Screens with a "roles" list only go
+    to the listed displays (role "all" boards see every screen)."""
+    out = dict(cfg)
+    if board is not None:
+        own = board.cfg.get("idle_config") if board.cfg else None
+        sec = displays.section_for(cfg.get("displays"), board)
+        if not own and isinstance(sec, dict):
+            own = sec.get("idle_config")
+        if own:
+            p = _cfg_path(own, cards_dir, base)
+            loaded, _ = load_idle_config(cards_dir, p)
+            out = dict(loaded) if loaded else out
+        elif isinstance(sec, dict):
+            out.update({k: v for k, v in sec.items() if k != "idle_config"})
+        if not board.generic:
+            out["screens"] = [sc for sc in out.get("screens", [])
+                              if not isinstance(sc, dict) or not sc.get("roles")
+                              or displays.role_listed(board, sc.get("roles"))]
+    out.pop("displays", None)
+    return out
+
+
+def keypad_allowed(board: Board, st: "Settings") -> bool:
+    """Keypad only on boards listed in config "keypad_roles" (if set) and not disabled per board."""
+    if not board.keypad:
+        return False
+    return st.keypad_roles is None or displays.role_listed(board, st.keypad_roles)
+
+
+def board_messages(plan: list, board: Board) -> list[dict]:
+    out = []
+    for part in plan:
+        m = part(board) if callable(part) else part
+        if m:
+            out.append(m)
+    return out
 
 
 def parse_cal_arg(value: str) -> dict:
@@ -790,11 +899,85 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--calibrate", action="store_true", help="start the on-device touch calibration (tap 4 crosses)")
     ap.add_argument("--cal", metavar="VALUES",
                     help="touch calibration: show | reset | debug | nodebug | x_min,x_max,y_min,y_max")
-    ap.add_argument("--ping", action="store_true", help="ask the display for its firmware version and mode")
+    ap.add_argument("--ping", action="store_true", help="ask each display for its firmware version, mode and identity")
+    g = ap.add_argument_group("multiple displays")
+    g.add_argument("--target", metavar="WHO",
+                   help="only these displays: all (default), or a comma list of roles, names, ids or ports "
+                        "(e.g. right  |  left,top  |  cyd-a1b2c3  |  COM5)")
+    g.add_argument("--list-displays", action="store_true", help="list the connected displays (id, name, role, port, fw)")
+    g.add_argument("--json", action="store_true", help="with --list-displays: print JSON")
+    g.add_argument("--identify", nargs="?", type=int, const=5, metavar="SECS",
+                   help="every targeted display shows a big label with its role, name and id (default 5 s)")
+    g.add_argument("--assign", metavar="ID",
+                   help="write an identity to one board (id, port or current name): with --role/--name/--rotation")
+    g.add_argument("--role", help="with --assign: role to save on the board (right, left, top, bottom, center, or free text)")
+    g.add_argument("--name", help="with --assign: display name to save on the board (e.g. 'Right palm')")
+    g.add_argument("--rotation", type=int, choices=range(4), metavar="0-3", help="with --assign: rotation to save")
+    g.add_argument("--board-keypad", choices=("on", "off"), help="with --assign: allow long-press keypad on that board")
+    g.add_argument("--new-id", metavar="ID", help="with --assign: replace the MAC-based id (use 'reset' to go back)")
+    g.add_argument("--exclude-port", action="append", metavar="PORT",
+                   help="never open this port (another device with a CH340/CP210x chip; repeatable)")
+    g.add_argument("--no-wait", action="store_true",
+                   help="daemon hand-off returns at once (the daemon sends in the background)")
     ap.add_argument("--no-daemon", action="store_true", help="never hand off to cyd_daemon; open the port directly")
     ap.add_argument("--timeout", type=float, default=3.0, help="seconds to wait for each ack")
     ap.add_argument("-q", "--quiet", action="store_true")
     return ap
+
+
+def _msg_size(m: dict) -> int:
+    return len(json.dumps(m, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _target_all(target) -> bool:
+    return not target or str(target).strip().lower() in ("all", "*")
+
+
+def dry_run_board(target) -> Board | None:
+    """--dry-run has no real boards: --target ROLE previews that role's content."""
+    if _target_all(target):
+        return None
+    first = str(target).split(",")[0].strip()
+    return Board(port="dry-run", id=f"dry-run-{first}", role=first.lower(), name=first)
+
+
+def print_displays(boards: list[Board], as_json: bool = False, via: str = "") -> None:
+    if as_json:
+        print(json.dumps([b.as_dict() for b in boards], indent=2))
+        return
+    if not boards:
+        print("no displays found")
+        return
+    rows = [("ID", "NAME", "ROLE", "PORT", "FW", "MODE", "KEYPAD", "IDENTITY")]
+    for b in boards:
+        src = "port (fw < 1.3.0)" if b.legacy else "board"
+        if b.configured:
+            src += " + config.json"
+        rows.append((b.id, b.name or "-", b.role, b.port, b.fw or "?", b.mode, "yes" if b.keypad else "no", src))
+    widths = [max(len(str(r[i])) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(str(v).ljust(w) for v, w in zip(r, widths)).rstrip())
+    n = len(boards)
+    print(f"{n} display{'s' if n != 1 else ''}{' via ' + via if via else ''}"
+          + (f" (more than the {displays.TESTED_MAX_DISPLAYS} tested)" if n > displays.TESTED_MAX_DISPLAYS else ""))
+
+
+def assign_message(args) -> dict:
+    msg: dict = {"cmd": "set_id" if args.new_id else "config"}
+    if args.new_id:
+        if args.new_id.lower() == "reset":
+            msg["reset"] = True
+        else:
+            msg["id"] = args.new_id
+    if args.role is not None:
+        msg["role"] = args.role
+    if args.name is not None:
+        msg["name"] = args.name
+    if args.rotation is not None:
+        msg["rotation"] = args.rotation
+    if args.board_keypad:
+        msg["keypad"] = args.board_keypad == "on"
+    return msg
 
 
 def main(argv=None) -> int:
@@ -807,8 +990,10 @@ def main(argv=None) -> int:
         print(json.dumps({
             "config": str(st.config_src) if st.config_src else None, "profile": st.profile,
             "cards_dir": str(cards_dir), "idle_config": str(st.idle_path), "keypad_config": str(st.keypad_path),
-            "default_card": st.default_card, "cabinet": st.cabinet, "ports": st.ports or "auto-detect",
-            "watch_processes": st.watch, "key_backend": st.key_backend, "serial": serialport.backend_name(),
+            "default_card": st.default_card, "cabinet": st.cabinet, "ports": st.ports or "auto-detect (all CYDs)",
+            "exclude_ports": st.exclude_ports, "displays": st.displays, "keypad_roles": st.keypad_roles or "all",
+            "max_displays": st.max_displays, "watch_processes": st.watch, "key_backend": st.key_backend,
+            "serial": serialport.backend_name(),
         }, indent=2))
         return 0
 
@@ -827,16 +1012,27 @@ def main(argv=None) -> int:
     rom = args.rom
     if rom is None and args.table and st.profile == "arcade":
         rom = args.table
+    explicit_target = not _target_all(args.target)
+    base = st.config_src.parent if st.config_src else None
+    no_clock = args.no_clock
 
-    messages: list[dict] = []
-    if args.brightness is not None:
+    # The plan: each entry is a message, or a function board -> message (None = nothing for that board)
+    plan: list = []
+    if args.assign:
+        amsg = assign_message(args)
+        if len(amsg) == 1:
+            ap.error("--assign needs --role, --name, --rotation, --board-keypad and/or --new-id")
+        plan.append(amsg)
+    if args.brightness is not None and not args.assign:
         if not 0 <= args.brightness <= 255:
             ap.error("--brightness must be 0-255")
-        messages.append({"cmd": "brightness", "value": args.brightness})
-    if args.bare_idle:
-        messages.append({"cmd": "idle"})
+        plan.append({"cmd": "brightness", "value": args.brightness})
+    if args.assign:
+        pass
+    elif args.bare_idle:
+        plan.append({"cmd": "idle"})
     elif args.idle or args.browsing:
-        cfg, src = load_idle_config(cards_dir, st.idle_path)
+        icfg, src = load_idle_config(cards_dir, st.idle_path)
         selected = None
         if args.browsing:
             selected = pretty_table_name(args.browsing, cards_dir)
@@ -845,37 +1041,45 @@ def main(argv=None) -> int:
                                      st.default_card if st.profile == "arcade" else "_default_arcade.json")[2]["title"]
         log(f"idle config -> {src if src else '(none: firmware defaults)'} [profile {st.profile}]"
             + (f"; up next: {selected}" if selected else ""), args.quiet)
-        messages.append(build_idle_msg(cfg, selected, with_clock=not args.no_clock,
-                                       cabinet=st.cabinet, subtitle=st.subtitle))
+        plan.append(lambda b, c=icfg, sel=selected: build_idle_msg(
+            idle_cfg_for_board(c, b, cards_dir, base), sel, with_clock=not no_clock,
+            cabinet=st.cabinet, subtitle=st.subtitle))
     elif rom:
         default = st.default_card if st.profile == "arcade" else "_default_arcade.json"
         data, src, info = find_rom_card(rom, cards_dir, args.system, args.game_name, args.rom_name, default)
         log(f"rom '{info['rom']}' system={info['system'] or '?'} -> {rel_name(src, cards_dir)} ({info['match']})",
             args.quiet)
-        messages.append(build_table_msg(data, with_clock=not args.no_clock))
+        plan.append(lambda b, d=data: build_table_msg(table_for_board(d, b), with_clock=not no_clock))
     elif args.table:
         data, src = find_table(args.table, cards_dir, st.default_card)
         log(f"table '{args.table}' -> {src.name if src else '(generated title card)'}", args.quiet)
-        messages.append(build_table_msg(data, with_clock=not args.no_clock))
-    if args.cal is not None:
-        try:
-            messages.append(parse_cal_arg(args.cal))
-        except ValueError as e:
-            ap.error(str(e))
-    if args.calibrate:
-        messages.append({"cmd": "calibrate"})
-    if args.keypad:
-        kcfg, ksrc = load_keypad_config(cards_dir, st.keypad_path)
-        log(f"keypad layout -> {ksrc if ksrc else '(none: firmware default layout)'}", args.quiet)
-        messages.append(build_keypad_msg(kcfg, args.keypad_page))
-    if args.ping:
-        messages.append({"cmd": "ping"})
-    if not messages:
-        ap.error("give a table name, --rom, --idle, --browsing, --keypad, --calibrate, --cal, --ping or --brightness")
+        plan.append(lambda b, d=data: build_table_msg(table_for_board(d, b), with_clock=not no_clock))
+    if not args.assign:
+        if args.cal is not None:
+            try:
+                plan.append(parse_cal_arg(args.cal))
+            except ValueError as e:
+                ap.error(str(e))
+        if args.calibrate:
+            plan.append({"cmd": "calibrate"})
+        if args.keypad:
+            kcfg, ksrc = load_keypad_config(cards_dir, st.keypad_path)
+            log(f"keypad layout -> {ksrc if ksrc else '(none: firmware default layout)'}", args.quiet)
+            kmsg = build_keypad_msg(kcfg, args.keypad_page)
+            plan.append(lambda b, m=kmsg: m if (b is None or explicit_target or keypad_allowed(b, st)) else None)
+        if args.identify is not None:
+            plan.append({"cmd": "identify", "secs": max(1, min(60, args.identify))})
+        if args.ping:
+            plan.append({"cmd": "ping"})
+    if not plan and not args.list_displays:
+        ap.error("give a table name, --rom, --idle, --browsing, --keypad, --calibrate, --cal, --ping, --brightness, "
+                 "--identify, --assign or --list-displays")
 
+    # size check on the generic rendering (per-role renderings are checked again before sending)
     too_big = False
-    for m in messages:
-        size = len(json.dumps(m, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    preview = board_messages(plan, dry_run_board(args.target)) if plan else []
+    for m in preview:
+        size = _msg_size(m)
         if size > MAX_LINE:
             log(f"error: cmd={m.get('cmd')} is {size} bytes; firmware limit is {MAX_LINE}. Shorten the text.")
             too_big = True
@@ -883,56 +1087,134 @@ def main(argv=None) -> int:
             log(f"warning: cmd={m.get('cmd')} is {size} bytes (limit {MAX_LINE})", args.quiet)
 
     if args.dry_run:
-        for m in messages:
+        for m in preview:
             print(json.dumps(m, ensure_ascii=False, separators=(",", ":")))
-        for m in messages:
-            size = len(json.dumps(m, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-            log(f"cmd={m.get('cmd')}: {size} bytes (limit {MAX_LINE})", args.quiet)
+        for m in preview:
+            log(f"cmd={m.get('cmd')}: {_msg_size(m)} bytes (limit {MAX_LINE})", args.quiet)
         return 1 if too_big else 0
     if too_big:
         return 1
 
-    ports = list(st.ports)
-    rc = 0
-    if not args.no_daemon:
-        dst = daemon_request({"op": "status"}, timeout=2.0)
-        if dst and dst.get("connected"):
-            dport = str(dst.get("port") or "")
-            if not ports or any(p.lower() == dport.lower() for p in ports):
-                r = daemon_request({"op": "send", "messages": messages, "timeout": args.timeout},
-                                   timeout=args.timeout * len(messages) + 3)
-                if r is None:
-                    log("daemon did not answer; trying the port directly")
-                else:
-                    for a in r.get("acks", []):
-                        log(f"{dport} (via daemon): {json.dumps(a, separators=(',', ':'))}", args.quiet)
-                    if r.get("err"):
-                        log(f"daemon: {r['err']}")
-                    rc = 0 if r.get("ok") else 1
-                    ports = [p for p in ports if p.lower() != dport.lower()]
-                    if not ports:
-                        return rc
-        elif dst:
-            log(f"daemon running but not connected to a display ({dst.get('port') or 'no port'}); trying directly",
-                args.quiet)
-    if not ports:
+    def plan_for(board: Board) -> list[dict]:
+        out = []
+        for m in board_messages(plan, board):
+            if _msg_size(m) > MAX_LINE:
+                log(f"error: cmd={m.get('cmd')} for {board.id} is too long ({_msg_size(m)} bytes); skipped")
+                continue
+            out.append(m)
+        return out
+
+    select_target = args.assign or args.target
+    explicit_ports = list(st.ports)
+    if args.side and not explicit_ports:
         try:
             p = find_port(args.side)
+        except RuntimeError as e:
+            log(f"error: {e}")
+            return 2
+        if p:
+            explicit_ports = [p]
+    rc = 0
+    reached: list[Board] = []
+    listed: list[Board] = []
+    direct_ports: list[str] | None = None
+
+    if not args.no_daemon:
+        dst = daemon_request({"op": "status"}, timeout=1.5)
+        if dst and isinstance(dst.get("boards"), list) and dst["boards"]:
+            boards = [Board.from_dict(b) for b in dst["boards"]]
+            if explicit_ports:
+                wanted = {p.lower() for p in explicit_ports}
+                boards = [b for b in boards if b.port.lower() in wanted]
+                held = {b.port.lower() for b in boards}
+                direct_ports = [p for p in explicit_ports if p.lower() not in held]
+            else:
+                direct_ports = []
+            listed += boards
+            targets = displays.select(boards, select_target)
+            sends = []
+            for b in targets:
+                msgs = plan_for(b)
+                if msgs:
+                    sends.append({"board": b.id, "messages": msgs})
+            if sends:
+                wait = not args.no_wait
+                longest = max(len(x["messages"]) for x in sends)
+                r = daemon_request({"op": "send", "sends": sends, "timeout": args.timeout, "wait": wait},
+                                   timeout=(args.timeout * longest + 3) if wait else 3.0)
+                if r is None:
+                    log("daemon did not answer; trying the ports directly")
+                    direct_ports = explicit_ports or None
+                else:
+                    if r.get("queued") is not None:
+                        log(f"daemon: queued for {r['queued']} display(s)", args.quiet)
+                    for res in r.get("results", []):
+                        tag = f"{res.get('port')} {res.get('board')} [{res.get('role')}] (via daemon)"
+                        for a in res.get("acks", []):
+                            log(f"{tag}: {json.dumps(a, separators=(',', ':'))}", args.quiet)
+                        if res.get("err"):
+                            log(f"{tag}: {res['err']}")
+                    if r.get("err"):
+                        log(f"daemon: {r['err']}")
+                    if not r.get("ok"):
+                        rc = 1
+                    reached += [b for b in targets if any(x["board"] == b.id for x in sends)]
+            elif plan and not direct_ports:
+                why = (f"no display matches --target {select_target!r}" if targets
+                       is not None and not targets else "none of the targeted displays takes these messages "
+                       "(keypad_roles / keypad off?)")
+                log(f"{why} (connected: {', '.join(b.label() for b in boards) or 'none'})")
+                return 2
+        elif dst:
+            log("daemon running but no display connected; trying the ports directly", args.quiet)
+
+    if direct_ports is None or direct_ports:
+        try:
+            ports = displays.candidate_ports(direct_ports or explicit_ports, st.exclude_ports)
         except RuntimeError as e:   # no pyserial on Windows
             log(f"error: {e}")
             return 2
-        if not p:
-            log("error: no CYD found (CH340/CH9102/CP210x). Use --port (COMx or /dev/ttyUSBx) or --list-ports.")
-            return 2
-        ports = [p]
+        if not ports:
+            if not listed:
+                log("error: no CYD found (CH340/CH9102/CP210x). Use --port (COMx or /dev/ttyUSBx) or --list-ports.")
+                return 2
+        else:
+            if st.max_displays and len(ports) > st.max_displays:
+                log(f"warning: {len(ports)} candidate ports, max_displays is {st.max_displays}; using the first ones")
+                ports = ports[:st.max_displays]
+            results = displays.fanout_direct(ports, plan_for, select_target, st.displays,
+                                             explicit=bool(direct_ports or explicit_ports), timeout=args.timeout,
+                                             ping_timeout=min(1.0, args.timeout))
+            for res in results:
+                if res.board is not None:
+                    listed.append(res.board)
+                tag = f"{res.port}" + (f" {res.board.id} [{res.board.role}]" if res.board else "")
+                for a in res.acks:
+                    log(f"{tag}: {json.dumps(a, separators=(',', ':'))}", args.quiet)
+                if res.err:
+                    log(f"error on {res.port}: {res.err}")
+                    rc = 1
+                elif res.skipped:
+                    log(f"{tag}: skipped, {res.skipped}", args.quiet or not plan)
+                elif not res.ok:
+                    rc = 1
+                if res.board is not None and not res.skipped and not res.err and plan:
+                    reached.append(res.board)
 
-    for port in ports:
-        try:
-            if not send(port, messages, args.timeout, args.quiet):
-                rc = 1
-        except Exception as e:  # serial errors must never break a frontend's launch
-            log(f"error on {port}: {e}")
-            rc = 1
+    if args.list_displays:
+        print_displays(sorted(listed, key=lambda b: displays._port_sort_key(b.port)), args.json)
+        return 0 if listed else 2
+    if plan and not reached:
+        if rc == 0:
+            log(f"no display matches --target {select_target!r}" if select_target else "error: no CYD answered")
+        return 2 if rc == 0 else rc
+    if args.assign:
+        for b in reached:
+            if b.legacy:
+                log(f"{b.port}: firmware {b.fw or '< 1.3.0'} has no identity; flash 1.3.0, or map "
+                    f"\"{b.id}\" in config.json \"displays\"")
+            elif b.configured:
+                log(f"note: config.json \"displays\" has an entry for {b.id}; its name/role win over the board's")
     return rc
 
 

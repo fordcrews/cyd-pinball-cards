@@ -13,6 +13,9 @@ Custom firmware and host scripts that turn an **ESP32 Cheap Yellow Display** (ES
 * **While nothing runs** it plays an idle/attract playlist: cabinet marquee, "pick a table/game"
   prompt, clock, house rules, pricing, a burn-in-safe animation, last played game. There is a
   pinball profile and an arcade profile.
+* **One to five displays** on one cabinet (right, left, topper...): every display updates when the
+  game changes, and each can show its own cards (instructions on the right, pricing on the left,
+  controls on top). Each board remembers its own identity. See [Multiple displays](#multiple-displays-1-to-5-boards).
 * **On demand** it becomes a **touch keypad** (Esc, Enter, arrows, F-keys, coin/start, MAME and
   RetroArch hotkeys, Alt+F4...) for the keys a cabinet doesn't have. Keys are injected with
   `SendInput` on Windows and a virtual `/dev/uinput` keyboard on Linux.
@@ -43,12 +46,14 @@ cyd-pinball-cards/
 │   └── src/main.cpp
 ├── host/              host tools (Windows + Linux, Python 3)
 │   ├── cyd_push.py      push table/game cards, idle, keypad (hands off to the daemon when it runs)
-│   ├── cyd_daemon.py    keeps the serial port open, turns keypad presses into key presses, optional process watch
+│   ├── cyd_daemon.py    keeps the serial ports open (all displays, hot-plug), turns keypad presses into key presses, optional process watch
+│   ├── displays.py      multi-display: board identity, --target matching, parallel direct fan-out
 │   ├── keymap.py        key names -> Windows VK + Linux KEY_* codes; SendInput / evdev / uinput injectors
 │   ├── serialport.py    pyserial when installed, else a termios + sysfs fallback (Linux)
 │   ├── test_keymap.py   unit tests: key codes (both backends), injectors, keypad layouts, process watch
 │   ├── test_arcade.py   unit + end-to-end tests: ROM parsing per frontend, card matching, profiles, fake display
-│   ├── fake_cyd.py      PTY device simulator for testing without hardware (Linux/macOS)
+│   ├── test_multi.py    multi-display tests: routing, targeting, fan-out timing, hot-plug, keypad on one board, fw 1.2.0 boards
+│   ├── fake_cyd.py      device simulator: one or many boards on PTYs (Linux/macOS) or an in-memory bus (any OS)
 │   └── requirements.txt
 ├── cards/             one JSON per table or game
 │   ├── template.json
@@ -64,7 +69,7 @@ cyd-pinball-cards/
 │   └── <system>/<rom>.json    optional per-system cards (e.g. cards/snes/sf2.json)
 ├── config.example.json  per-cabinet settings (copy to config.json)
 ├── frontends/         hook scripts + SETUP.md per frontend (popper, batocera, retrobat, retropie, es-de, emulationstation, linux)
-├── docs/              idle_preview.py / keypad_preview.py (Pillow mock-up renderers) + preview PNGs
+├── docs/              idle_preview.py / keypad_preview.py / multi_display_preview.py (Pillow mock-up renderers) + preview PNGs
 └── README.md
 ```
 
@@ -74,7 +79,7 @@ cyd-pinball-cards/
 |---|---|---|
 | 1 per display | **ESP32-2432S028R "Cheap Yellow Display"** | Any 2.8" CYD with resistive touch. Micro-USB and dual USB (micro + USB-C) versions both work. See the note on the ST7789 variant below. |
 | 1 per display | USB data cable (micro-USB or USB-C to USB-A) | It must be a **data** cable. Cables of 1 m or less are the most reliable inside a cabinet. |
-| optional | Powered USB 2.0 hub | Recommended for two displays or long runs. Each CYD draws roughly 100–150 mA with the backlight on full. |
+| optional (recommended for 3–5 displays) | Powered USB 2.0 hub | Each CYD draws roughly 100–150 mA with the backlight on full, so 5 boards need up to about 750 mA. See [USB and power](#usb-and-power). |
 | optional | 3D-printed shroud / thin bezel, M2/M3 screws | See Mounting. |
 | optional | Thin glass or acrylic cover (about 1–2 mm) | Needed for a flush glass look. |
 
@@ -93,7 +98,7 @@ cyd-pinball-cards/
    If the upload won't start, hold **BOOT**, tap **RST**, then release BOOT.
 
 ### Option B: esptool (flash a prebuilt binary without the toolchain)
-Prebuilt images (firmware 1.2.0) are in `firmware/bin/`. After your own `pio run`, they are in
+Prebuilt images (firmware 1.3.0) are in `firmware/bin/`. After your own `pio run`, they are in
 `firmware/.pio/build/cyd/`. Flash them with:
 ```
 pip install esptool
@@ -112,7 +117,8 @@ esptool.py --chip esp32 --port COM5 --baud 921600 write_flash -z ^
 | `CARD_ROTATE_MS` | `12000` | How long each card stays up before auto-advancing. 0 turns auto-rotate off. |
 | `DEFAULT_BRIGHTNESS` | `220` | Backlight brightness on first boot (0–255). The `brightness` command overrides it and the new value is saved. |
 | `TOUCH_X_MIN` / `TOUCH_X_MAX` / `TOUCH_Y_MIN` / `TOUCH_Y_MAX` | `200` / `3700` / `240` / `3800` | Raw XPT2046 readings at the screen edges (native landscape). They are only defaults: `--calibrate` or `--cal` values saved on the display take priority. See Touch calibration. |
-| `LONGPRESS_KEYPAD_MS` | `2000` | Hold time on the idle or card screen that opens the keypad. 0 turns it off. |
+| `LONGPRESS_KEYPAD_MS` | `2000` | Hold time on the idle or card screen that opens the keypad. 0 turns it off. (Per board at runtime: `{"cmd":"config","keypad":false}`.) |
+| `IDENTIFY_MS` | `5000` | How long `{"cmd":"identify"}` shows the board label when no `secs` is given. |
 | `DEFAULT_CABINET` | `"Crews Pinball"` | Cabinet name on the idle marquee until a host sends `cards/_idle.json`. Needs escaped quotes in build_flags: `-DDEFAULT_CABINET=\"My Cab\"`. |
 
 ### Pin assumptions (standard ESP32-2432S028R)
@@ -148,7 +154,10 @@ documents grow on the heap as needed (no fixed document size); a full idle confi
 | brightness | `{"cmd":"brightness","value":128}` (0–255) | `{"ack":"brightness","ok":true,"value":128}` |
 | rotation | `{"cmd":"rotation","value":3}` (0–3) | `{"ack":"rotation","ok":true,"value":3}` |
 | next | `{"cmd":"next"}` | `{"ack":"next","ok":true,"card":1}` |
-| ping | `{"cmd":"ping"}` | `{"ack":"ping","ok":true,"fw":"1.2.0","device":"cyd-pinball-cards","mode":"idle"}` (`mode`: idle, table, keypad, calibrate) |
+| ping / hello | `{"cmd":"ping"}` or `{"cmd":"hello"}` | `{"ack":"ping","ok":true,"fw":"1.3.0","device":"cyd-pinball-cards","mode":"idle","id":"cyd-a1b2c3","name":"Right palm","role":"right","rotation":1,"keypad":true}` (`mode`: idle, table, keypad, calibrate, identify). Firmware 1.2.0 answers `ping` without the identity keys. |
+| identify | `{"cmd":"identify","secs":5}` (1–60, default 5) | `{"ack":"identify","ok":true,"secs":5,"id":...,"name":...,"role":...}`. The board shows a big label with its role, name, id and fw in a role colour, then returns to what it showed. A tap closes it early. |
+| config | `{"cmd":"config","name":"Right palm","role":"right","rotation":1,"keypad":true}` (every key optional; `{"cmd":"config"}` alone just reads) | `{"ack":"config","ok":true,"fw":"1.3.0","id":"cyd-a1b2c3","name":"Right palm","role":"right","rotation":1,"keypad":true}` |
+| set_id | `{"cmd":"set_id","id":"cyd-right"}`, `{"cmd":"set_id","reset":true}` (back to the MAC id); also takes the `config` keys | same as config |
 | keypad | `{"cmd":"keypad"}` (saved/default layout) or `{"cmd":"keypad","layout":{"pages":[...]},"page":0}` | `{"ack":"keypad","ok":true,"pages":3,"page":0}` |
 | keypad exit | `{"cmd":"keypad","exit":true}` (back to the previous screen) | `{"ack":"keypad","ok":true}` |
 | cal | `{"cmd":"cal"}`, `{"cmd":"cal","x_min":200,"x_max":3700,"y_min":240,"y_max":3800}`, `{"cmd":"cal","reset":true}`, `{"cmd":"cal","debug":true}` | `{"ack":"cal","ok":true,"x_min":200,"x_max":3700,"y_min":240,"y_max":3800,"debug":false}` |
@@ -167,7 +176,13 @@ Existing host scripts ignore lines without `ack`, so the new events don't distur
 
 * Errors come back as `{"ack":"<cmd>","ok":false,"err":"..."}`, for example on bad JSON, an unknown
   cmd or an out-of-range value.
-* On boot the device prints `{"ready":true,"device":"cyd-pinball-cards","fw":"1.2.0"}`.
+* On boot the device prints `{"ready":true,"device":"cyd-pinball-cards","fw":"1.3.0","id":"cyd-a1b2c3","name":"","role":"","rotation":1,"keypad":true}`.
+* **Board identity (1.3.0):** `id` defaults to `cyd-` + the last 3 bytes of the ESP32's factory MAC
+  (e.g. `cyd-a1b2c3`), so it is unique per board and survives reflashing. `name` (up to 32 ASCII
+  characters), `role` (up to 16, stored in lower case: `right`, `left`, `top`, `bottom`, `center`
+  or any free text), a custom `id` (1–24 characters `a-z 0-9 - _ .`) and the per-board `keypad`
+  flag are saved in NVS and only rewritten when they change. `config` with a bad value changes nothing
+  and answers `"ok":false`.
 * `table` and `idle` always close the keypad or calibration screen. The display always boots into
   idle or the last table, never into the keypad. The last keypad layout and the touch calibration
   are saved in flash too.
@@ -351,8 +366,13 @@ On Linux, start it from the frontend's boot hook (Batocera service, RetroPie `au
 * The socket only accepts display commands (`table`, `idle`, `keypad`, ...). Keystrokes can only
   come from the display, never from the socket. A second daemon refuses to start while one is running.
 * If the display is unplugged, the daemon reconnects every 3 s.
-* The daemon drives one display, the first CYD found or `--port`. With two displays, give it the
-  port of the display you use as the keypad. `cyd_push.py` still opens the other port directly.
+* The daemon drives **every** CYD it finds (or every `--port` / config `port`), notices displays
+  being plugged in or out (scan every 2 s, `--scan-interval`), and reconnects. A USB-serial port
+  that doesn't answer like a CYD is closed again and left alone for 30 s; list other devices with
+  the same chip in `"exclude_ports"`. See [Multiple displays](#multiple-displays-1-to-5-boards).
+* Keys are accepted from every display, or only from the ones in config `"keypad_roles"`. A
+  long-press opens the keypad only on the display you pressed; on a display that may not have the
+  keypad the daemon closes it again.
 * Keys go to the **foreground window**, so the setup window must have focus. Windows blocks input
   from a normal program into a program **running as administrator** (UIPI). If keys do nothing
   while setup runs elevated, run the daemon elevated too (see below). `-v` logs the title of the
@@ -446,6 +466,11 @@ python cyd_push.py --rom kof98 --system mame --dry-run          # no card yet: _
 python cyd_push.py --idle --profile arcade                      # arcade idle playlist (cards\_idle_arcade.json)
 python cyd_push.py --idle --rom mslug                           # idle playlist with "UP NEXT: Metal Slug"
 python cyd_push.py --show-config                                # which config.json, profile, files and serial backend are used
+python cyd_push.py --list-displays                              # all connected CYDs: id, name, role, port, fw, mode
+python cyd_push.py --identify                                   # each display shows its role/name/id for 5 s
+python cyd_push.py --assign cyd-a1b2c3 --role right --name "Right palm"   # save an identity on one board
+python cyd_push.py "Attack from Mars" --target left             # only the left display (default: all)
+python cyd_push.py "Attack from Mars" --dry-run --target top    # preview what the top display gets
 ```
 * **Linux:** the same commands with `python3` and ports like `/dev/ttyUSB0` (CH340/CP210x) or
   `/dev/ttyACM0` (CH9102 on some kernels). pyserial is optional there: without it the kit uses
@@ -461,18 +486,22 @@ python cyd_push.py --show-config                                # which config.j
   `CYD_CONFIG` for another place) sets per cabinet, without editing scripts: `profile`, `cabinet`
   and `subtitle` (override the idle file), `idle_config`, `keypad_config`, `default_card`, `port`,
   `watch_processes`, `key_backend`, `key_hold_ms`. Command-line flags win over it.
-* If `cyd_daemon.py` is running, `cyd_push.py` sends through it (the log shows `(via daemon)`).
-  Otherwise it opens the COM port itself. `--no-daemon` forces direct serial.
-* Auto-detect looks for the CYD's USB-serial chip by VID:PID: CH340 `1A86:7523`, CH9102
-  `1A86:55D4` or CP210x `10C4:EA60`. It uses the first match. Use `--port` (or `"port"` in
-  config.json) whenever another device with the same chip is plugged in – arcade control encoders
-  and light-gun adapters sometimes use the same chips.
+* If `cyd_daemon.py` is running, `cyd_push.py` sends through it (the log shows `(via daemon)`) and
+  the daemon updates all displays in parallel. `--no-wait` makes the hand-off return at once.
+  Otherwise cyd_push opens every display's port itself, all at the same time (one thread per
+  port, 1 s ping timeout), sends each its own messages and closes the ports again.
+  `--no-daemon` forces direct serial.
+* Auto-detect uses **every** port whose USB-serial chip matches by VID:PID: CH340 `1A86:7523`,
+  CH9102 `1A86:55D4` or CP210x `10C4:EA60`, and only sends to ports that answer `ping` like a CYD.
+  Arcade control encoders and light-gun adapters sometimes use the same chips: put their ports in
+  `"exclude_ports"` (or `--exclude-port`, env `CYD_EXCLUDE_PORTS=COM9;COM10`), or list the CYD ports
+  in `"port"` / `--port`.
 * The cards folder is `cards\` next to the script (or next to the exe), or `..\cards\`. You can
   override it with `--cards-dir`.
 * `table` and `idle` messages include the PC's local time (`ts`) so the clock and "last played"
   screens work. `--no-clock` leaves it out. `--idle-config PATH` uses another idle config file.
 * The tool refuses to send a message longer than the firmware's 6144-byte line limit.
-* Exit codes: 0 ok, 1 no ack / error, 2 no device found. Serial errors never raise, so the
+* Exit codes: 0 ok, 1 no ack / error (on any display), 2 no device found / no display matches `--target`. Serial errors never raise, so the
   script can't break a frontend's game launch.
 
 ### Building a standalone exe (so the cabinet needs no Python)
@@ -558,24 +587,149 @@ to-verify in that file, as are the optional hooks for showing idle when Popper s
   the display resets when coils fire (mostly a real-pinball or DOF-toy issue).
 * The ESP32's Wi-Fi is never turned on, so the board runs cool and needs no ventilation.
 
-## Second display on the left
-1. Flash a second CYD with the same firmware. For a mirrored mount, set `CYD_ROTATION=3`, or send
-   `{"cmd":"rotation","value":3}` once.
-2. Plug it in, preferably through a powered hub. It shows up as a second COM port. Find both ports
-   with `cyd_push.py --list-ports`. Windows keeps the same COMx number as long as you use the same
-   USB port.
-3. **Same cards on both sides:** use `--port COM5 --port COM6`.
-4. **Different cards per side:** add two lines to the Popper launch script, one per port, each
-   with its own `--cards-dir` (for example `cards\` for the right display and `cards_left\` for the
-   left):
-   ```bat
-   START "" /B C:\cyd-pinball-cards\host\cyd_push.exe "[GAMENAME]" --port COM5 -q
-   START "" /B C:\cyd-pinball-cards\host\cyd_push.exe "[GAMENAME]" --port COM6 --cards-dir C:\cyd-pinball-cards\cards_left -q
+## Multiple displays (1 to 5 boards)
+
+Plug in several CYDs (right and left of the lockdown bar, a topper, one by the coin door...) and
+they all update together whenever the game changes. **Supported and tested with 5 displays**
+(simulated boards in `test_multi.py`); there is no hard limit in the code, set `"max_displays"` in
+config.json if you want a cap. Nothing changes in the frontend hooks: `cyd_push.py` and the daemon
+send to every display they find.
+
+![Multi-display mock-up](docs/multi-display-preview.png)
+
+*Mock-up (Pillow rendering, not a photo) of `cards/attack_from_mars.json` on three boards: left =
+pricing, right = instructions, top = controls. Regenerate with `python docs/multi_display_preview.py`.*
+
+### Set up
+1. Flash firmware **1.3.0** on every board (`firmware/bin/`). Plug them in, ideally through a powered hub.
+2. `python cyd_push.py --list-displays` shows each board with its id (from the ESP32 MAC, e.g.
+   `cyd-a1b2c3`), name, role, port and firmware.
+3. `python cyd_push.py --identify` – each display shows a big label (role, name, id) for 5 s, so
+   you can see which id is which screen. `--identify 15` for longer, `--target cyd-a1b2c3` for one.
+4. Give each board a role and a name. It is saved on the board, so it follows the board to any USB
+   port or PC:
    ```
-5. **Optional stable mapping:** CH340 chips mostly report no USB serial number, but CP210x and
-   CH9102 do. On those boards you can set the environment variables `CYD_SERIAL_RIGHT` and
-   `CYD_SERIAL_LEFT` to the `serial=` values shown by `--list-ports`, then use `--side right` or
-   `--side left` instead of fixed COM numbers.
+   python cyd_push.py --assign cyd-a1b2c3 --role right --name "Right palm"
+   python cyd_push.py --assign cyd-d4e5f6 --role left  --name "Left palm" --rotation 3
+   python cyd_push.py --assign cyd-0a0b0c --role top   --name "Topper" --board-keypad off
+   python cyd_push.py --assign COM7 --new-id cyd-coin   # custom id (--new-id reset: back to the MAC id)
+   ```
+   `--assign` takes an id, a port or the current name. Roles are free text; `right`, `left`,
+   `top`, `bottom`, `center` get their own colour on the identify screen.
+5. Or keep the identity on the host, in config.json (host values win over the board's):
+   ```json
+   {
+     "displays": {
+       "cyd-a1b2c3": { "name": "Right palm", "role": "right", "rotation": 1 },
+       "cyd-d4e5f6": { "name": "Left palm",  "role": "left",  "rotation": 3 },
+       "cyd-0a0b0c": { "name": "Topper",     "role": "top",   "keypad": false, "idle_config": "_idle_top.json" },
+       "port:COM7":  { "name": "Old board",  "role": "bottom" }
+     },
+     "keypad_roles": ["right"],
+     "exclude_ports": ["COM9"],
+     "max_displays": 5
+   }
+   ```
+   Keys per display: `name`, `role`, `rotation` (the daemon sends it when the board differs),
+   `keypad` (false = no keypad there), `idle_config` (a whole idle file for that display).
+
+### Per-role cards
+Cards without roles go to **every** display, so existing card files work unchanged. Two ways to split them:
+
+* **Per card:** add `"roles"` (role, board name or id; `"all"` = everywhere):
+  ```json
+  { "title": "Street Fighter II", "cards": [
+      { "type": "title",    "title": "NOW PLAYING", "text": "Street Fighter II" },
+      { "type": "controls", "roles": ["top"],   "title": "CONTROLS", "text": "..." },
+      { "type": "moves",    "roles": ["right"], "title": "MOTIONS",  "text": "..." },
+      { "type": "credits",  "roles": ["left"],  "title": "CREDITS",  "text": "1 COIN = 1 CREDIT" } ] }
+  ```
+* **Per display:** a top-level `"displays"` map keyed by role (or board name / id, or `"default"`
+  for all others), each with its own `cards` list (and optional `title`), or just a list of cards:
+  ```json
+  { "title": "Attack from Mars",
+    "cards": [ ...what a single display shows... ],
+    "displays": {
+      "right": { "cards": [ { "type": "instructions", "title": "HOW TO PLAY", "text": "..." } ] },
+      "left":  { "cards": [ { "type": "cost", "title": "PRICING", "text": "1 CREDIT = 25c\n3 BALLS" } ] },
+      "top":   { "cards": [ { "type": "controls", "title": "CONTROLS", "text": "FLIPPERS: ..." } ] } } }
+  ```
+  A display whose role has no section (and there is no `"default"`) gets the top-level `cards`,
+  filtered by `"roles"`.
+* A display with role **`all`** – an unassigned board, or any board with firmware 1.2.0 – shows the
+  top-level cards unfiltered, exactly like a single-display setup.
+* `cards/sf2.json` (per-card roles) and `cards/attack_from_mars.json` (displays map) are examples.
+  `python cyd_push.py "<game>" --dry-run --target left` shows what the left display would get.
+
+**Idle screens** work the same way: in `_idle.json` (or `_idle_arcade.json`) a `"displays"` map
+keyed by role overrides keys for that display (`screens`, `cabinet`, `subtitle`, `duration`...),
+or points to a whole other file with `"idle_config": "_idle_top.json"`; screens can carry `"roles"`
+too. config.json `displays.<id>.idle_config` beats both. `cards/_idle.json` has a left
+(pricing + clock) and a top (marquee + starfield) example; other roles get the full playlist.
+
+**Keypad:** `"keypad_roles": ["right"]` in config.json limits the keypad to those displays:
+`cyd_push.py --keypad` and the setup-program watcher only open it there, keys from other displays
+are ignored, and a long-press elsewhere is closed again by the daemon. Without `keypad_roles` every
+display can be a keypad. A long-press always opens the keypad **only on the display you pressed**.
+`--board-keypad off` turns long-press off on the board itself.
+
+### Targeting
+Every command goes to all displays unless you add `--target`: a role, name, id or port, or a
+comma list (`--target left,top`, `--target cyd-a1b2c3`, `--target COM6`). `--target all` is the
+default. Works for cards, `--idle`, `--keypad`, `--brightness`, `--identify`, `--ping`, `--cal`.
+
+### Timing
+When a game starts, every display gets its cards within about a second: the daemon serves each
+display on its own worker thread (messages to one display keep their order), and without the
+daemon cyd_push opens all ports in parallel. The tests check 5 boards that each take 0.3 s to
+draw finish in under 1 s. The frontend hooks start cyd_push in the background, the daemon
+hand-off takes milliseconds (`--no-wait` doesn't even wait for the displays), and the direct
+fallback uses a 1 s ping timeout, so a missing display never delays a game launch.
+
+### Hot-plug
+The daemon scans for new ports every 2 s. A display that is unplugged is dropped (`disconnected`
+in the log) and picked up again when it comes back, on any port. A board plugged in mid-game gets
+the last cards sent to its role. Each board also keeps its last table or idle screen in flash.
+
+### Firmware 1.2.0 boards
+Older boards keep working next to new ones: they answer `ping` without an identity, so they get
+the id `port:<port>` (e.g. `port:COM7`, `port:ttyUSB0`) and the role `all` (they show every
+card). Map them by that id in config.json `displays` to give them a role. `identify`,
+`config` and `set_id` need 1.3.0 (1.2.0 answers `unknown cmd`).
+
+### USB and power
+* **Power:** each CYD draws roughly 100–150 mA with the backlight on (up to ~750 mA for five). One
+  or two boards on PC ports are fine; for **3–5 boards use a powered USB 2.0 hub** (a 2 A+ supply)
+  so the ESP32s don't brown out or reset when the backlights come on. Lower `--brightness` if
+  a board resets on an unpowered hub.
+* **Unique ports:** every board needs its own USB port / hub port and a data cable (1 m or less
+  inside the cabinet). The COM number or `/dev/ttyUSBx` does not matter: the identity lives on the
+  board, so boards can move between ports.
+* **Windows:** COM numbers change when you use another USB port; that is irrelevant now. Only use
+  `"port"` / `--port` if you want to restrict the kit to certain ports; use `"exclude_ports"` for
+  other devices with a CH340/CP210x chip (control encoders, light guns).
+* **Linux:** `ttyUSBx` numbers depend on plug-in order, which is also irrelevant. Your user needs
+  the `dialout` group. For fixed names anyway, use `/dev/serial/by-id/...` (CP210x/CH9102 boards
+  have serial numbers; most CH340 boards don't) or a udev rule by USB path, e.g.
+  `SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", KERNELS=="1-1.2", SYMLINK+="cyd-right"`
+  in `/etc/udev/rules.d/99-cyd.rules`. On Ubuntu remove `brltty` if CH340 ports vanish.
+* **Hardware checks still to do** (the multi-display code is tested with simulated boards only):
+  5 real boards on one hub (power, enumeration), `identify` / `config` on real firmware 1.3.0,
+  unplug/re-plug on Windows (COM port disappearing while open) and Linux.
+
+### Testing without hardware
+```
+cd host
+python -m unittest test_keymap.py test_arcade.py test_multi.py
+python fake_cyd.py --boards 3 --roles right,left,top     # Linux/macOS: three simulated boards on PTYs
+```
+`test_multi.py` runs five simulated boards on an in-memory bus (any OS, no COM port is opened)
+and, on Linux/macOS, boards on PTYs with the real daemon and cyd_push processes.
+
+### Older setups
+`--port COM5 --port COM6` still works (only those ports), and so do `--side` with the
+`CYD_SERIAL_<SIDE>` variables and a separate `--cards-dir` per port. With identities and per-role
+cards you normally don't need any of them.
 
 ## License
 This kit is yours to use and change. It uses TFT_eSPI (FreeBSD/MIT-style), XPT2046_Touchscreen (MIT),

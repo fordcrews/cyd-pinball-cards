@@ -1,9 +1,69 @@
 {
+  "_comment": "Multi-display example: \"displays\" gives each role its own cards (key = role, board name or id; \"default\" for the rest). A single display (role \"all\") keeps showing the top-level \"cards\".",
   "title": "Attack from Mars",
-  "match": ["Attack from Mars (Bally 1995)", "AFM"],
+  "match": [
+    "Attack from Mars (Bally 1995)",
+    "AFM"
+  ],
   "cards": [
-    { "type": "title", "title": "NOW PLAYING", "text": "Attack from Mars" },
-    { "type": "instructions", "title": "HOW TO PLAY", "text": "Hit the Martian saucer to damage it, then shoot the saucer to destroy it. Each destroyed saucer is a country saved.\nLight Martian Attack, Stroke of Luck and Total Annihilation for huge scores." },
-    { "type": "cost", "title": "PRICING", "text": "1 CREDIT = 25c\n3 BALLS\nREPLAY AT 2 BILLION" }
-  ]
+    {
+      "type": "title",
+      "title": "NOW PLAYING",
+      "text": "Attack from Mars"
+    },
+    {
+      "type": "instructions",
+      "title": "HOW TO PLAY",
+      "text": "Hit the Martian saucer to damage it, then shoot the saucer to destroy it. Each destroyed saucer is a country saved.\nLight Martian Attack, Stroke of Luck and Total Annihilation for huge scores."
+    },
+    {
+      "type": "cost",
+      "title": "PRICING",
+      "text": "1 CREDIT = 25c\n3 BALLS\nREPLAY AT 2 BILLION"
+    }
+  ],
+  "displays": {
+    "right": {
+      "cards": [
+        {
+          "type": "title",
+          "title": "NOW PLAYING",
+          "text": "Attack from Mars"
+        },
+        {
+          "type": "instructions",
+          "title": "HOW TO PLAY",
+          "text": "Hit the Martian saucer to damage it, then shoot the saucer to destroy it. Each destroyed saucer is a country saved.\nLight Martian Attack, Stroke of Luck and Total Annihilation for huge scores."
+        },
+        {
+          "type": "instructions",
+          "title": "BIG SCORES",
+          "text": "Light Martian Attack, Stroke of Luck and Total Annihilation. Rule the Universe by completing every mode."
+        }
+      ]
+    },
+    "left": {
+      "cards": [
+        {
+          "type": "cost",
+          "title": "PRICING",
+          "text": "1 CREDIT = 25c\n3 BALLS\nREPLAY AT 2 BILLION"
+        },
+        {
+          "type": "credits",
+          "title": "CREDITS",
+          "text": "FREE PLAY\nPRESS START"
+        }
+      ]
+    },
+    "top": {
+      "cards": [
+        {
+          "type": "controls",
+          "title": "CONTROLS",
+          "text": "FLIPPERS: left / right button\nLAUNCH: plunger\nSTART: add a player\nNUDGE: cabinet nudge"
+        }
+      ]
+    }
+  }
 }

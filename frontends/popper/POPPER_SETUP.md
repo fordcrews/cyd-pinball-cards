@@ -141,7 +141,19 @@ cyd_daemon.exe --dry-run -v        (then tap keys on the display: the log shows 
   keeps the port open on purpose, and `cyd_push` passes its messages to it automatically. Stop
   the daemon before you flash firmware.
 * **Keypad keys do nothing.** Run `cyd_daemon -v` and tap a key. If no `key ...` line appears,
-  the display isn't sending (check the firmware is 1.2.0 with `cyd_push --ping`, and check touch
+  the display isn't sending (check the firmware is 1.2.0 or newer with `cyd_push --ping`, and check touch
   with `cyd_push --cal debug`). If the line appears but the window doesn't react, the window
   doesn't have focus, or it runs as administrator (see section 5). Try `--scancodes`.
 * **Keypad buttons react off-target.** Run `cyd_push --calibrate` and tap the 4 crosses.
+
+## Multiple displays
+Up to 5 CYDs (tested with 5 simulated boards) work with the same hooks, unchanged: every connected
+display updates on each game start and end, all in parallel (through the daemon when it runs,
+else cyd_push opens every display's port itself with short timeouts, in the background). Give each
+board a role once, `cyd_push.py --list-displays`, `--identify`, then
+`--assign <id> --role right --name "Right palm"`, and split the cards per role (`"roles"` on a card
+or a `"displays"` map in the card file). See the main README, "Multiple displays", for the card
+format, `keypad_roles` and USB power (use a powered hub for 3-5 boards).
+On Windows the COM numbers don't matter (the identity is stored on each board). If another
+device with a CH340/CP210x chip is connected (control encoder, light gun), add its port to
+`"exclude_ports"` in config.json so the kit never opens it.

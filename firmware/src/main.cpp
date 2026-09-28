@@ -9,7 +9,11 @@
 //   {"cmd":"brightness","value":0-255}
 //   {"cmd":"rotation","value":0-3}
 //   {"cmd":"next"}        next card / next idle screen / next keypad page
-//   {"cmd":"ping"}
+//   {"cmd":"ping"}  |  {"cmd":"hello"}   reply includes fw, mode and the board identity (id, name, role)
+//   {"cmd":"identify"[,"secs":5]}   big on-screen label (role / name / id) for a few seconds
+//   {"cmd":"config"[,"name":"Right palm"][,"role":"right"][,"rotation":0-3][,"keypad":true|false]}
+//   {"cmd":"set_id"[,"id":"cyd-right"|"reset":true][,"name":..][,"role":..]}   same as config, plus the id
+//                         (identity is saved in NVS; the default id comes from the ESP32 MAC: cyd-a1b2c3)
 //   {"cmd":"keypad"[,"layout":{"pages":[...]}][,"page":N]}   touch mini-keyboard (see README)
 //   {"cmd":"keypad","exit":true}   leave the keypad and restore the previous screen
 //   {"cmd":"cal"}  |  {"cmd":"cal","x_min":200,"x_max":3700,"y_min":240,"y_max":3800}  |
@@ -21,6 +25,7 @@
 //   {"evt":"cal","ok":true,"x_min":..,...}   calibration finished (or "ok":false,"err":...)
 //   {"evt":"touch","raw_x":..,"raw_y":..,"x":..,"y":..}   only while cal debug is on
 // Replies: {"ack":"<cmd>","ok":true[, ...]} or {"ack":"<cmd>","ok":false,"err":"..."}
+// Boot line: {"ready":true,"device":"cyd-pinball-cards","fw":"1.3.0","id":"cyd-a1b2c3","name":"","role":""}
 //
 // "ts" is the host's LOCAL wall-clock time as seconds since 1970-01-01 00:00 (i.e. local time
 // encoded as if it were UTC). The ESP32 has no RTC, so the clock only runs after a host sent it,
@@ -65,8 +70,12 @@
 #ifndef LONGPRESS_KEYPAD_MS
 #define LONGPRESS_KEYPAD_MS 2000
 #endif
+// How long {"cmd":"identify"} shows the board label when no "secs" is given
+#ifndef IDENTIFY_MS
+#define IDENTIFY_MS 5000
+#endif
 
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.3.0"
 #define BL_CHANNEL 0
 #define MAX_CARDS 8
 #define MAX_IDLE_SCREENS 12
@@ -154,8 +163,20 @@ bool rxOverflow = false;
 unsigned long lastRotate = 0;
 
 // UI mode on top of the idle/table state: the keypad and calibration screens temporarily take over
-enum UiMode : uint8_t { UI_NORMAL, UI_KEYPAD, UI_CAL };
+enum UiMode : uint8_t { UI_NORMAL, UI_KEYPAD, UI_CAL, UI_IDENT };
 UiMode ui = UI_NORMAL;
+
+// ---------- Board identity (multi-display) ----------
+// Saved in NVS ("cards" namespace): bid (custom id, empty = MAC-derived), bname, brole, kpen.
+struct Identity {
+  String macId;       // cyd-a1b2c3 from the last 3 bytes of the factory MAC
+  String customId;    // set with {"cmd":"set_id","id":...}
+  String name;        // free text, e.g. "Right palm"
+  String role;        // right | left | top | bottom | center | any free text (lower case)
+  bool keypad = true; // false: long-press does not open the keypad on this board
+} ident;
+
+String boardId() { return ident.customId.length() ? ident.customId : ident.macId; }
 
 // ---------- Helpers ----------
 uint16_t headerColourFor(const String &type) {
@@ -1559,6 +1580,120 @@ void calTick(unsigned long now) {
   if (now - cal.stepStart > 30000UL) calEnd(false, "timeout");
 }
 
+// ---------- Identify overlay + identity persistence ----------
+UiMode identPrevUi = UI_NORMAL;
+unsigned long identUntil = 0;
+
+// A stable colour per role, so boards are easy to tell apart at a glance
+uint16_t roleColour(const String &role) {
+  if (role == "right") return 0x041F;   // blue
+  if (role == "left") return COL_GREEN;
+  if (role == "top") return COL_MAGENTA;
+  if (role == "bottom") return COL_ACCENT;
+  if (role == "center" || role == "centre") return COL_CYAN;
+  if (!role.length()) return COL_DIM;
+  static const uint16_t pal[] = {COL_GOLD, COL_RED, 0x07F0, 0xFB56, 0x867F, COL_YELLOW};
+  uint32_t h = 0;
+  for (char ch : role) h = h * 31 + (uint8_t)ch;
+  return pal[h % 6];
+}
+
+void drawIdentify() {
+  int W = tft.width(), H = tft.height();
+  uint16_t col = roleColour(ident.role);
+  tft.fillScreen(COL_BG);
+  for (int i = 0; i < 8; i++) tft.drawRect(i, i, W - 2 * i, H - 2 * i, col);
+  tft.setTextDatum(MC_DATUM);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(COL_DIM);
+  tft.drawString("THIS DISPLAY IS", W / 2, 24);
+  String r = ident.role.length() ? ident.role : String("no role");
+  r.toUpperCase();
+  drawCenteredFit(r, W / 2, H * 40 / 100, W - 36, H * 36 / 100, col, 0, COL_DARK);
+  String n = ident.name.length() ? ident.name : String("(no name set)");
+  drawCenteredFit(n, W / 2, H * 69 / 100, W - 36, 36, COL_TEXT, 2);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(COL_ACCENT);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(boardId() + "   fw " FW_VERSION, W / 2, H - 28);
+  tft.setTextDatum(TL_DATUM);
+}
+
+void startIdentify(unsigned long ms) {
+  if (ui != UI_IDENT) identPrevUi = ui;
+  ui = UI_IDENT;
+  identUntil = millis() + ms;
+  drawIdentify();
+}
+
+void endIdentify() {
+  if (ui != UI_IDENT) return;
+  ui = identPrevUi;
+  if (ui == UI_KEYPAD) drawKeypad();
+  else drawCard();
+  lastRotate = millis();
+}
+
+// Printable ASCII only, trimmed, at most maxLen characters (the fonts are ASCII-only)
+String cleanText(const char *s, size_t maxLen, bool lower) {
+  String out;
+  for (const char *p = s; *p && out.length() < maxLen; p++) {
+    char ch = *p;
+    if (ch < 32 || ch > 126) continue;
+    out += lower ? (char)tolower(ch) : ch;
+  }
+  out.trim();
+  return out;
+}
+
+bool validId(const String &id) {
+  if (id.length() < 1 || id.length() > 24) return false;
+  for (char ch : id)
+    if (!(isalnum((unsigned char)ch) || ch == '-' || ch == '_' || ch == '.')) return false;
+  return true;
+}
+
+void putStringIfChanged(const char *key, const String &v) {
+  if (prefs.getString(key, "") != v) prefs.putString(key, v);
+}
+
+// config / set_id: validate every given field first, then apply and save only what changed.
+bool applyIdentity(JsonDocument &doc, bool allowId, String &err) {
+  bool hasName = doc["name"].is<const char *>(), hasRole = doc["role"].is<const char *>();
+  bool hasKp = doc["keypad"].is<bool>(), hasRot = !doc["rotation"].isNull();
+  bool hasId = allowId && doc["id"].is<const char *>(), resetId = allowId && (doc["reset"] | false);
+  int rot = doc["rotation"] | -1;
+  if (hasRot && (rot < 0 || rot > 3)) { err = "rotation must be 0-3"; return false; }
+  String newId = hasId ? cleanText(doc["id"].as<const char *>(), 32, true) : String();
+  if (hasId && !validId(newId)) { err = "id: 1-24 chars a-z 0-9 - _ ."; return false; }
+  prefs.begin("cards", false);
+  if (hasName) { ident.name = cleanText(doc["name"].as<const char *>(), 32, false); putStringIfChanged("bname", ident.name); }
+  if (hasRole) { ident.role = cleanText(doc["role"].as<const char *>(), 16, true); putStringIfChanged("brole", ident.role); }
+  if (hasKp) { ident.keypad = doc["keypad"].as<bool>(); if (prefs.getBool("kpen", true) != ident.keypad) prefs.putBool("kpen", ident.keypad); }
+  if (resetId) { ident.customId = ""; putStringIfChanged("bid", ""); }
+  else if (hasId) { ident.customId = (newId == ident.macId) ? String() : newId; putStringIfChanged("bid", ident.customId); }
+  if (hasRot && rot != st.rotation) prefs.putUChar("rot", (uint8_t)rot);
+  prefs.end();
+  if (hasRot && rot != st.rotation) {
+    st.rotation = rot;
+    if (ui != UI_CAL) tft.setRotation(rot);
+    if (ui == UI_IDENT) drawIdentify();
+    else if (ui == UI_KEYPAD) drawKeypad();
+    else if (ui == UI_NORMAL) drawCard();
+  } else if (ui == UI_IDENT) {
+    drawIdentify();  // show the new name/role right away
+  }
+  return true;
+}
+
+void addIdentity(JsonDocument &r) {
+  r["id"] = boardId();
+  r["name"] = ident.name;
+  r["role"] = ident.role;
+  r["rotation"] = st.rotation;
+  r["keypad"] = ident.keypad;
+}
+
 // ---------- Serial ----------
 void reply(const char *cmd, bool ok, const char *err = nullptr, const char *extraKey = nullptr, int extraVal = 0) {
   JsonDocument r;
@@ -1580,12 +1715,14 @@ void leaveOverlay() {
 void redrawUi() {
   if (ui == UI_KEYPAD) drawKeypad();
   else if (ui == UI_CAL) calDrawTarget();
+  else if (ui == UI_IDENT) drawIdentify();
   else drawCard();
 }
 
 const char *modeName() {
   if (ui == UI_KEYPAD) return "keypad";
   if (ui == UI_CAL) return "calibrate";
+  if (ui == UI_IDENT) return "identify";
   return st.idle ? "idle" : "table";
 }
 
@@ -1660,6 +1797,7 @@ void handleLine(const String &line) {
     redrawUi();
     reply("rotation", true, nullptr, "value", v);
   } else if (!strcmp(cmd, "next")) {
+    endIdentify();
     if (ui == UI_KEYPAD) {
       kpGotoPage(kpPage + 1);
       reply("next", true, nullptr, "page", kpPage);
@@ -1667,17 +1805,39 @@ void handleLine(const String &line) {
     }
     nextCard();
     reply("next", true, nullptr, "card", st.idle ? irt.idx : st.current);
-  } else if (!strcmp(cmd, "ping")) {
+  } else if (!strcmp(cmd, "ping") || !strcmp(cmd, "hello")) {
     JsonDocument r;
-    r["ack"] = "ping";
+    r["ack"] = cmd;
     r["ok"] = true;
     r["fw"] = FW_VERSION;
     r["device"] = "cyd-pinball-cards";
     r["mode"] = modeName();
-    serializeJson(r, Serial);
-    Serial.println();
+    addIdentity(r);
+    emitLine(r);
+  } else if (!strcmp(cmd, "identify")) {
+    if (ui == UI_CAL) { reply("identify", false, "calibrating"); return; }
+    int secs = doc["secs"] | (IDENTIFY_MS / 1000);
+    secs = constrain(secs, 1, 60);
+    startIdentify((unsigned long)secs * 1000UL);
+    JsonDocument r;
+    r["ack"] = "identify";
+    r["ok"] = true;
+    r["secs"] = secs;
+    addIdentity(r);
+    emitLine(r);
+  } else if (!strcmp(cmd, "config") || !strcmp(cmd, "set_id")) {
+    String err;
+    bool ok = applyIdentity(doc, !strcmp(cmd, "set_id"), err);
+    JsonDocument r;
+    r["ack"] = cmd;
+    r["ok"] = ok;
+    if (!ok) r["err"] = err;
+    r["fw"] = FW_VERSION;
+    addIdentity(r);
+    emitLine(r);
   } else if (!strcmp(cmd, "keypad")) {
     if (doc["exit"] | false) {
+      if (ui == UI_IDENT && identPrevUi == UI_KEYPAD) identPrevUi = UI_NORMAL;
       if (ui == UI_KEYPAD) exitKeypad(false);
       reply("keypad", true);
       return;
@@ -1720,6 +1880,7 @@ void handleLine(const String &line) {
     }
     replyCal("cal");
   } else if (!strcmp(cmd, "calibrate")) {
+    if (ui == UI_IDENT) ui = identPrevUi;
     calStart();
     reply("calibrate", true);
   } else {
@@ -1760,6 +1921,11 @@ struct TouchState {
 unsigned long lastTapMs = 0;
 
 void onTouchDown() {
+  if (ui == UI_IDENT) {  // a tap closes the identify label; the rest of this touch is ignored
+    tch.consumed = true;
+    endIdentify();
+    return;
+  }
   if (ui == UI_KEYPAD) {
     kpPressed = kpHit(tch.x0, tch.y0);
     if (kpPressed >= 0) kpDrawKey(kpPressed, true);
@@ -1773,7 +1939,7 @@ void onTouchHeld(unsigned long now) {
       kpDrawKey(kpPressed, false);
       kpPressed = -1;
     }
-  } else if (ui == UI_NORMAL && LONGPRESS_KEYPAD_MS > 0 && !tch.consumed && now - tch.t0 >= LONGPRESS_KEYPAD_MS) {
+  } else if (ui == UI_NORMAL && ident.keypad && LONGPRESS_KEYPAD_MS > 0 && !tch.consumed && now - tch.t0 >= LONGPRESS_KEYPAD_MS) {
     tch.consumed = true;
     enterKeypad(0, true);
   }
@@ -1851,6 +2017,13 @@ void setup() {
   rxLine.reserve(1024);
   randomSeed(esp_random());
 
+  {  // default board id from the factory MAC (last 3 bytes), e.g. cyd-a1b2c3
+    uint64_t mac = ESP.getEfuseMac();
+    char buf[16];
+    snprintf(buf, sizeof buf, "cyd-%02x%02x%02x", (unsigned)((mac >> 24) & 0xFF), (unsigned)((mac >> 32) & 0xFF),
+             (unsigned)((mac >> 40) & 0xFF));
+    ident.macId = buf;
+  }
   prefs.begin("cards", true);
   st.brightness = prefs.getUChar("bright", DEFAULT_BRIGHTNESS);
   st.rotation = prefs.getUChar("rot", CYD_ROTATION);
@@ -1860,6 +2033,10 @@ void setup() {
   lastTitle = prefs.getString("lastT", "");
   lastTs = prefs.getULong("lastTs", 0);
   String kpLayout = loadBlob("kplayout");
+  ident.customId = prefs.getString("bid", "");
+  ident.name = prefs.getString("bname", "");
+  ident.role = prefs.getString("brole", "");
+  ident.keypad = prefs.getBool("kpen", true);
   if (prefs.getBytesLength("tcal") == sizeof(TouchCal)) {
     TouchCal c;
     prefs.getBytes("tcal", &c, sizeof c);
@@ -1903,7 +2080,12 @@ void setup() {
   tableStartMs = millis();
   drawCard();
   lastRotate = millis();
-  Serial.println("{\"ready\":true,\"device\":\"cyd-pinball-cards\",\"fw\":\"" FW_VERSION "\"}");
+  JsonDocument r;
+  r["ready"] = true;
+  r["device"] = "cyd-pinball-cards";
+  r["fw"] = FW_VERSION;
+  addIdentity(r);
+  emitLine(r);
 }
 
 void loop() {
@@ -1914,6 +2096,8 @@ void loop() {
     kpTick(now);
   } else if (ui == UI_CAL) {
     calTick(now);
+  } else if (ui == UI_IDENT) {
+    if ((long)(now - identUntil) >= 0) endIdentify();
   } else if (!st.idle) {
     if (st.cardCount > 1 && CARD_ROTATE_MS > 0 && now - lastRotate >= CARD_ROTATE_MS) {
       lastRotate = now;

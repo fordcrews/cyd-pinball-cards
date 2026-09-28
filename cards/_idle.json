@@ -15,5 +15,16 @@
     { "type": "last_played", "title": "LAST PLAYED", "duration": 8 },
     { "type": "anim", "style": "stars", "duration": 15, "enabled": false },
     { "type": "up_next", "title": "UP NEXT", "text": "Press START to play", "duration": 10 }
-  ]
+  ],
+  "displays": {
+    "_comment": "Optional per-display playlists (key = role, board name or id). Keys here override the ones above for that display; \"idle_config\": \"file.json\" uses a whole other file. Screens with a \"roles\" list only go to those displays.",
+    "left": { "screens": [
+      { "type": "pricing", "title": "PRICING", "text": "FREE PLAY\nPRESS START", "duration": 15 },
+      { "type": "clock", "duration": 10 }
+    ] },
+    "top": { "screens": [
+      { "type": "marquee", "duration": 20 },
+      { "type": "anim", "style": "stars", "duration": 20 }
+    ] }
+  }
 }

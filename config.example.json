@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to config.json (kit root or host/) and edit; config.json is git-ignored. Every key is optional; command-line flags win. profile: pinball (PinUP Popper) or arcade (Batocera, RetroBat, RetroPie, ES-DE). cabinet/subtitle override the idle file. idle_config/keypad_config/default_card: file names in cards/ (or paths). port: COM5, /dev/ttyUSB0 or a list; omit to auto-detect. watch_processes: programs that open the keypad while running (omit to use the keypad file's list, [] for none). key_backend: auto | sendinput | evdev | uinput | dry-run. key_hold_ms: how long keypad keys are held (default 40).",
+  "_comment": "Copy to config.json (kit root or host/) and edit; config.json is git-ignored. Every key is optional; command-line flags win. profile: pinball (PinUP Popper) or arcade (Batocera, RetroBat, RetroPie, ES-DE). cabinet/subtitle override the idle file. idle_config/keypad_config/default_card: file names in cards/ (or paths). port: COM5, /dev/ttyUSB0 or a list; omit to auto-detect. watch_processes: programs that open the keypad while running (omit to use the keypad file's list, [] for none). key_backend: auto | sendinput | evdev | uinput | dry-run. key_hold_ms: how long keypad keys are held (default 40). displays: board id (from --list-displays; port:COM5 for firmware 1.2.0 boards) -> name / role / rotation / keypad / idle_config; host values win over the identity saved on the board. keypad_roles: only these displays show the keypad and send keys (omit = all). exclude_ports: never open these (other devices with a CH340/CP210x). Tested with 5 displays; there is no hard limit (max_displays caps it if you want).",
   "profile": "arcade",
   "cabinet": "Crews Arcade",
   "subtitle": "ARCADE CLASSICS",
@@ -8,5 +8,30 @@
   "default_card": "_default_arcade.json",
   "watch_processes": [],
   "key_backend": "auto",
-  "key_hold_ms": 40
+  "key_hold_ms": 40,
+  "displays": {
+    "cyd-a1b2c3": {
+      "name": "Right palm",
+      "role": "right",
+      "rotation": 1
+    },
+    "cyd-d4e5f6": {
+      "name": "Left palm",
+      "role": "left",
+      "rotation": 3
+    },
+    "cyd-0a0b0c": {
+      "name": "Topper",
+      "role": "top",
+      "keypad": false
+    },
+    "port:COM7": {
+      "name": "Old board (fw 1.2.0)",
+      "role": "bottom"
+    }
+  },
+  "keypad_roles": [
+    "right"
+  ],
+  "exclude_ports": []
 }

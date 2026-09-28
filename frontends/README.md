@@ -8,6 +8,9 @@ Each folder has ready-to-copy hook scripts and a `SETUP.md`. The pattern is the 
 | a game ends | `cyd_push.py --idle` |
 | the cabinet boots / the frontend starts (optional) | `cyd_daemon.py` (touch keypad → key presses) + `cyd_push.py --idle` |
 
+With several displays (1-5 CYDs) the hooks stay the same: each push goes to every connected display,
+in parallel, each with the cards for its role (main README, "Multiple displays").
+
 | Folder | Frontend | OS | Game start / end hook | Boot / daemon |
 |---|---|---|---|---|
 | [`popper/`](popper/POPPER_SETUP.md) | PinUP Popper | Windows | VPX emulator Launch / Close Script | Startup folder or Task Scheduler (main README) |

@@ -300,7 +300,7 @@ class EndToEnd(unittest.TestCase):
             return subprocess.run([sys.executable, str(HERE / "cyd_push.py"), *argv], capture_output=True,
                                   text=True, env=env, timeout=30)
         try:
-            wait_for("display fw 1.2.0")
+            wait_for("connected, fw 1.2.0")
             self.assertTrue(any("profile arcade" in ln and "serial via termios" in ln for ln in lines), lines)
             self.assertTrue(any("process watch off" in ln for ln in lines), lines)   # arcade keypad: []
             r = push("--rom", "/userdata/roms/mame/mslug.zip", "--system", "mame")

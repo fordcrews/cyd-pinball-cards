@@ -37,3 +37,15 @@ C:\RetroBat\emulationstation\.emulationstation\scripts\game-start\cyd_game_start
 ```
 Keys from the keypad go to the foreground window with SendInput, as on a Popper cabinet
 (see the main README: an emulator running as administrator needs the daemon elevated too).
+
+## Multiple displays
+Up to 5 CYDs (tested with 5 simulated boards) work with the same hooks, unchanged: every connected
+display updates on each game start and end, all in parallel (through the daemon when it runs,
+else cyd_push opens every display's port itself with short timeouts, in the background). Give each
+board a role once, `cyd_push.py --list-displays`, `--identify`, then
+`--assign <id> --role right --name "Right palm"`, and split the cards per role (`"roles"` on a card
+or a `"displays"` map in the card file). See the main README, "Multiple displays", for the card
+format, `keypad_roles` and USB power (use a powered hub for 3-5 boards).
+On Windows the COM numbers don't matter (the identity is stored on each board). If another
+device with a CH340/CP210x chip is connected (control encoder, light gun), add its port to
+`"exclude_ports"` in config.json so the kit never opens it.
