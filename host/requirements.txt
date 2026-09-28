@@ -1,1 +1,2 @@
 pyserial>=3.5
+psutil>=5.9      # cyd_daemon.py process watch (optional: falls back to tasklist)

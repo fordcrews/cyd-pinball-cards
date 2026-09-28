@@ -82,6 +82,31 @@ START "" /B "C:\cyd-pinball-cards\host\cyd_push.exe" --browsing "[GAMENAME]" -q
 your hook provides.) Without such a hook, simply don't use `--browsing`: the Up next screen is only
 shown while a `selected` table was sent, and it is cleared by the next table launch or plain `--idle`.
 
+## 5. Optional: touch keypad while Popper's setup program is open  (exe name TO-VERIFY)
+
+With `host\cyd_daemon.py` (or `cyd_daemon.exe`) running, the display turns into a touch keypad
+(Esc, Enter, Tab, arrows, F1-F12, Alt+F4, PgUp/PgDn, Home/End, Del, Ctrl/Shift/Alt/Win) whenever
+Popper's setup/config program is running. When that program closes, the display goes back to the
+idle playlist. Nothing in Popper has to change: the daemon simply watches the process list. See the
+README section **Touch keypad** for the layout, calibration and how to start the daemon at logon.
+
+* The watched process is **`PinUpMenuSetup.exe`**. That name appears in public PinUP docs and forum
+  posts, but it is **not verified** on this cabinet. With the setup program open, check Task
+  Manager → Details. If the name differs, put the right one in `cards\_keypad.json`
+  (`"watch_processes": ["TheRealName.exe"]`) or start the daemon with `--watch TheRealName.exe`.
+  Leave out any shortcut name: only the exe name counts.
+* The Popper setup windows must have keyboard focus for the keys to reach them. Tap the setup
+  window with the mouse or touchscreen first, if the cabinet has either.
+* If the setup program runs **as administrator**, Windows blocks keys from a non-elevated
+  program. Then run the daemon elevated too (Task Scheduler, *Run with highest privileges*).
+* Key presses reach the foreground window only. The daemon doesn't know which Popper dialog is
+  open and can't send keys to a background window.
+* Launch/close scripts keep working unchanged while the daemon runs: `cyd_push.exe` finds the
+  daemon on 127.0.0.1 and passes the table/idle message to it, because only one program can
+  open the COM port.
+* Without the daemon: `cyd_push.exe --keypad` opens the keypad by hand, but then nothing turns the
+  presses into Windows keys. The keypad is only useful with the daemon running.
+
 ## Testing without Popper
 
 Open a command prompt in `host\`:
@@ -93,6 +118,8 @@ cyd_push.exe "Medieval Madness (Williams 1997)"
 cyd_push.exe --idle --dry-run
 cyd_push.exe --idle
 cyd_push.exe --browsing "Attack from Mars (Bally 1995)"
+cyd_push.exe --keypad
+cyd_daemon.exe --dry-run -v        (then tap keys on the display: the log shows what would be pressed)
 ```
 
 ## Troubleshooting
@@ -110,4 +137,11 @@ cyd_push.exe --browsing "Attack from Mars (Bally 1995)"
   `--idle`. Run `cyd_push.exe --idle --dry-run` to check that `cards\_idle.json` was found (the
   first line of output names the file).
 * **Two apps fighting over the COM port.** Only one program can hold a COM port at a time.
-  Close the PlatformIO serial monitor or Arduino IDE before you run the cabinet.
+  Close the PlatformIO serial monitor or Arduino IDE before you run the cabinet. `cyd_daemon`
+  keeps the port open on purpose, and `cyd_push` passes its messages to it automatically. Stop
+  the daemon before you flash firmware.
+* **Keypad keys do nothing.** Run `cyd_daemon -v` and tap a key. If no `key ...` line appears,
+  the display isn't sending (check the firmware is 1.2.0 with `cyd_push --ping`, and check touch
+  with `cyd_push --cal debug`). If the line appears but the window doesn't react, the window
+  doesn't have focus, or it runs as administrator (see section 5). Try `--scancodes`.
+* **Keypad buttons react off-target.** Run `cyd_push --calibrate` and tap the 4 crosses.

@@ -13,6 +13,10 @@ Examples (Windows):
   python cyd_push.py "Attack from Mars" --port COM5
   python cyd_push.py "Attack from Mars" --dry-run
   python cyd_push.py --list-ports
+  python cyd_push.py --keypad                    (touch keypad from cards/_keypad.json)
+  python cyd_push.py --calibrate                 (on-device touch calibration)
+  python cyd_push.py --cal show | reset | 200,3700,240,3800
+  python cyd_push.py --ping
 
 Table lookup order (in the cards directory):
   1. exact filename (with or without .json)
@@ -20,6 +24,10 @@ Table lookup order (in the cards directory):
   3. normalised name (lowercase, punctuation stripped, "(Manufacturer Year)" removed)
   4. substring match on normalised names
   5. otherwise _default.json if present, else a generated title-only card
+
+If cyd_daemon.py is running it owns the COM port; cyd_push then hands its messages to the daemon
+over 127.0.0.1 (port 47291, env CYD_DAEMON_PORT) and falls back to direct serial when no daemon
+answers. --no-daemon forces direct serial.
 """
 from __future__ import annotations
 
@@ -28,6 +36,7 @@ import calendar
 import json
 import os
 import re
+import socket
 import sys
 import time
 import unicodedata
@@ -42,6 +51,9 @@ KNOWN_VID_PID = {
 BAUD = 115200
 MAX_LINE = 6144          # firmware line limit (bytes, incl. nothing else)
 MAX_IDLE_SCREENS = 12    # firmware keeps at most this many idle screens
+MAX_KP_PAGES, MAX_KP_KEYS, MAX_KP_GRID = 6, 24, 6   # firmware keypad limits
+DAEMON_HOST = "127.0.0.1"
+DAEMON_PORT = int(os.environ.get("CYD_DAEMON_PORT", "47291"))
 IDLE_SCREEN_TYPES = {
     "marquee", "logo", "title", "cabinet", "choose", "pick", "pick_table", "prompt", "clock", "time",
     "rules", "house_rules", "instructions", "pricing", "cost", "price", "anim", "animation", "pinball",
@@ -217,6 +229,82 @@ def build_idle_msg(cfg: dict, selected: str | None = None, with_clock: bool = Tr
     return msg
 
 
+def load_keypad_config(cards_dir: Path, path: Path | None = None) -> tuple[dict, Path | None]:
+    """Load cards/_keypad.json (or an explicit path). Missing file -> {} (firmware default layout)."""
+    cand = path or (cards_dir / "_keypad.json")
+    if cand.is_file():
+        try:
+            return load_json(cand), cand
+        except (OSError, json.JSONDecodeError) as e:
+            log(f"warning: ignoring {cand}: {e}")
+    elif path:
+        log(f"warning: keypad config {path} not found; using the firmware's default layout")
+    return {}, None
+
+
+def build_keypad_msg(cfg: dict, page: int | None = None) -> dict:
+    """_keypad.json -> {"cmd":"keypad","layout":{"pages":[...]}} (host-only keys stripped, labels
+    folded to ASCII). With no pages the firmware keeps the layout it already has."""
+    try:
+        import keymap  # same folder; only used to warn about unknown key names
+    except ImportError:
+        keymap = None
+    msg: dict = {"cmd": "keypad"}
+    pages = []
+    for pg in cfg.get("pages", [])[:MAX_KP_PAGES]:
+        if not isinstance(pg, dict):
+            continue
+        out = {"title": to_ascii(pg.get("title", ""))}
+        for k in ("cols", "rows"):
+            if k in pg:
+                out[k] = max(1, min(MAX_KP_GRID, int(pg[k])))
+        keys = []
+        for kd in pg.get("keys", []):
+            if isinstance(kd, str):
+                kd = {"key": kd}
+            if not isinstance(kd, dict) or not kd:
+                keys.append(None)
+                continue
+            o = {k: v for k, v in kd.items() if not str(k).startswith("_")}
+            if "label" in o:
+                o["label"] = to_ascii(o["label"])
+            if keymap and o.get("key") and not o.get("action") and not o.get("mod"):
+                try:
+                    keymap.parse_combo(o["key"])
+                except ValueError as e:
+                    log(f"warning: keypad page '{out['title']}': {e}")
+            if "mod" in o and str(o["mod"]).lower() not in ("ctrl", "control", "shift", "alt", "win", "gui", "super", "meta"):
+                log(f"warning: keypad page '{out['title']}': unknown mod '{o['mod']}'")
+            keys.append(o)
+        if len([k for k in keys if k]) > MAX_KP_KEYS:
+            log(f"warning: keypad page '{out['title']}' has more than {MAX_KP_KEYS} keys; extra keys are dropped")
+        out["keys"] = keys
+        pages.append(out)
+    if len(cfg.get("pages", [])) > MAX_KP_PAGES:
+        log(f"warning: keypad has more than {MAX_KP_PAGES} pages; firmware keeps the first {MAX_KP_PAGES}")
+    if pages:
+        msg["layout"] = {"pages": pages}
+    if page is not None:
+        msg["page"] = int(page)
+    return msg
+
+
+def parse_cal_arg(value: str) -> dict:
+    v = value.strip().lower()
+    if v in ("show", "get", ""):
+        return {"cmd": "cal"}
+    if v == "reset":
+        return {"cmd": "cal", "reset": True}
+    if v in ("debug", "debug-on"):
+        return {"cmd": "cal", "debug": True}
+    if v in ("nodebug", "debug-off"):
+        return {"cmd": "cal", "debug": False}
+    nums = [int(x) for x in re.split(r"[,\s]+", v) if x]
+    if len(nums) != 4:
+        raise ValueError("--cal needs show | reset | debug | nodebug | x_min,x_max,y_min,y_max")
+    return {"cmd": "cal", "x_min": nums[0], "x_max": nums[1], "y_min": nums[2], "y_max": nums[3]}
+
+
 def pretty_table_name(name: str, cards_dir: Path) -> str:
     """Title for the "Up next" screen: the card file's title if one matches, else the cleaned name."""
     data, src = find_table(name, cards_dir)
@@ -245,17 +333,43 @@ def find_port(side: str | None = None) -> str | None:
     return ports[0].device if ports else None
 
 
-def send(port: str, messages: list[dict], timeout: float, quiet: bool) -> bool:
+def open_serial(port: str, timeout: float = 0.2):
+    """Open the CYD port with DTR/RTS held low so opening it does not reset the ESP32."""
     import serial
-    ok_all = True
-    # dsrdtr/rtscts off and DTR/RTS low so opening the port does not reset the ESP32
     ser = serial.Serial()
     ser.port = port
     ser.baudrate = BAUD
-    ser.timeout = 0.2
-    ser.dtr = False
-    ser.rts = False
+    ser.timeout = timeout
+    try:
+        ser.dtr = False
+        ser.rts = False
+    except (OSError, serial.SerialException):  # some virtual ports (PTYs) have no modem lines
+        pass
     ser.open()
+    return ser
+
+
+# ---------------------------------------------------------------- daemon hand-off
+def daemon_request(obj: dict, timeout: float = 5.0, port: int | None = None) -> dict | None:
+    """Send one JSON request to a running cyd_daemon; None if no daemon is listening."""
+    try:
+        with socket.create_connection((DAEMON_HOST, port or DAEMON_PORT), timeout=0.5) as s:
+            s.settimeout(timeout)
+            s.sendall((json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8"))
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        return json.loads(buf.decode("utf-8")) if buf.strip() else None
+    except (OSError, ValueError):
+        return None
+
+
+def send(port: str, messages: list[dict], timeout: float, quiet: bool) -> bool:
+    ok_all = True
+    ser = open_serial(port)
     try:
         time.sleep(0.1)
         ser.reset_input_buffer()
@@ -305,6 +419,14 @@ def main(argv=None) -> int:
     ap.add_argument("--cards-dir", type=Path, default=None, help="folder with table JSON files")
     ap.add_argument("--dry-run", action="store_true", help="print the JSON that would be sent; no serial I/O")
     ap.add_argument("--list-ports", action="store_true", help="list serial ports and exit")
+    ap.add_argument("--keypad", action="store_true", help="open the touch keypad (layout from cards/_keypad.json)")
+    ap.add_argument("--keypad-config", type=Path, default=None, help="keypad layout JSON (default: cards/_keypad.json)")
+    ap.add_argument("--keypad-page", type=int, default=None, help="open the keypad on this page (0-based)")
+    ap.add_argument("--calibrate", action="store_true", help="start the on-device touch calibration (tap 4 crosses)")
+    ap.add_argument("--cal", metavar="VALUES",
+                    help="touch calibration: show | reset | debug | nodebug | x_min,x_max,y_min,y_max")
+    ap.add_argument("--ping", action="store_true", help="ask the display for its firmware version and mode")
+    ap.add_argument("--no-daemon", action="store_true", help="never hand off to cyd_daemon; open the COM port directly")
     ap.add_argument("--timeout", type=float, default=3.0, help="seconds to wait for each ack")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
@@ -334,8 +456,21 @@ def main(argv=None) -> int:
         data, src = find_table(args.table, cards_dir)
         log(f"table '{args.table}' -> {src.name if src else '(generated title card)'}", args.quiet)
         messages.append(build_table_msg(data, with_clock=not args.no_clock))
+    if args.cal is not None:
+        try:
+            messages.append(parse_cal_arg(args.cal))
+        except ValueError as e:
+            ap.error(str(e))
+    if args.calibrate:
+        messages.append({"cmd": "calibrate"})
+    if args.keypad:
+        kcfg, ksrc = load_keypad_config(cards_dir, args.keypad_config)
+        log(f"keypad layout -> {ksrc if ksrc else '(none: firmware default layout)'}", args.quiet)
+        messages.append(build_keypad_msg(kcfg, args.keypad_page))
+    if args.ping:
+        messages.append({"cmd": "ping"})
     if not messages:
-        ap.error("give a table name, --idle, --browsing, or --brightness")
+        ap.error("give a table name, --idle, --browsing, --keypad, --calibrate, --cal, --ping or --brightness")
 
     too_big = False
     for m in messages:
@@ -357,6 +492,28 @@ def main(argv=None) -> int:
         return 1
 
     ports = args.port or []
+    rc = 0
+    if not args.no_daemon:
+        st = daemon_request({"op": "status"}, timeout=2.0)
+        if st and st.get("connected"):
+            dport = str(st.get("port") or "")
+            if not ports or any(p.lower() == dport.lower() for p in ports):
+                r = daemon_request({"op": "send", "messages": messages, "timeout": args.timeout},
+                                   timeout=args.timeout * len(messages) + 3)
+                if r is None:
+                    log("daemon did not answer; trying the port directly")
+                else:
+                    for a in r.get("acks", []):
+                        log(f"{dport} (via daemon): {json.dumps(a, separators=(',', ':'))}", args.quiet)
+                    if r.get("err"):
+                        log(f"daemon: {r['err']}")
+                    rc = 0 if r.get("ok") else 1
+                    ports = [p for p in ports if p.lower() != dport.lower()]
+                    if not ports:
+                        return rc
+        elif st:
+            log(f"daemon running but not connected to a display ({st.get('port') or 'no port'}); trying directly",
+                args.quiet)
     if not ports:
         p = find_port(args.side)
         if not p:
@@ -364,7 +521,6 @@ def main(argv=None) -> int:
             return 2
         ports = [p]
 
-    rc = 0
     for port in ports:
         try:
             if not send(port, messages, args.timeout, args.quiet):

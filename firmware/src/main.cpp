@@ -8,8 +8,18 @@
 //                         full idle: config comes from cards/_idle.json via cyd_push.py --idle (see README)
 //   {"cmd":"brightness","value":0-255}
 //   {"cmd":"rotation","value":0-3}
-//   {"cmd":"next"}
+//   {"cmd":"next"}        next card / next idle screen / next keypad page
 //   {"cmd":"ping"}
+//   {"cmd":"keypad"[,"layout":{"pages":[...]}][,"page":N]}   touch mini-keyboard (see README)
+//   {"cmd":"keypad","exit":true}   leave the keypad and restore the previous screen
+//   {"cmd":"cal"}  |  {"cmd":"cal","x_min":200,"x_max":3700,"y_min":240,"y_max":3800}  |
+//   {"cmd":"cal","reset":true}  |  {"cmd":"cal","debug":true|false}      touch calibration values
+//   {"cmd":"calibrate"}   on-device 4-point touch calibration (tap the crosshairs)
+// Events (device -> host, unsolicited):
+//   {"evt":"key","key":"alt+f4"[,"mods":["ctrl","shift","alt","win"]]}   keypad button released
+//   {"evt":"keypad","state":"on"|"off","source":"touch"}   keypad opened (long-press) / EXIT tapped
+//   {"evt":"cal","ok":true,"x_min":..,...}   calibration finished (or "ok":false,"err":...)
+//   {"evt":"touch","raw_x":..,"raw_y":..,"x":..,"y":..}   only while cal debug is on
 // Replies: {"ack":"<cmd>","ok":true[, ...]} or {"ack":"<cmd>","ok":false,"err":"..."}
 //
 // "ts" is the host's LOCAL wall-clock time as seconds since 1970-01-01 00:00 (i.e. local time
@@ -36,7 +46,27 @@
 #define DEFAULT_CABINET "Crews Pinball"
 #endif
 
-#define FW_VERSION "1.1.0"
+// Touch calibration defaults: raw XPT2046 readings (native / rotation-1 orientation) at the
+// left/right and top/bottom edges of the 320x240 landscape screen. Override in build_flags or at
+// runtime with {"cmd":"cal",...} / {"cmd":"calibrate"} (saved to flash).
+#ifndef TOUCH_X_MIN
+#define TOUCH_X_MIN 200
+#endif
+#ifndef TOUCH_X_MAX
+#define TOUCH_X_MAX 3700
+#endif
+#ifndef TOUCH_Y_MIN
+#define TOUCH_Y_MIN 240
+#endif
+#ifndef TOUCH_Y_MAX
+#define TOUCH_Y_MAX 3800
+#endif
+// Hold a finger on the idle/card screen this long to open the keypad (0 = disabled)
+#ifndef LONGPRESS_KEYPAD_MS
+#define LONGPRESS_KEYPAD_MS 2000
+#endif
+
+#define FW_VERSION "1.2.0"
 #define BL_CHANNEL 0
 #define MAX_CARDS 8
 #define MAX_IDLE_SCREENS 12
@@ -122,7 +152,10 @@ unsigned long tableStartMs = 0;
 String rxLine;
 bool rxOverflow = false;
 unsigned long lastRotate = 0;
-unsigned long lastTouch = 0;
+
+// UI mode on top of the idle/table state: the keypad and calibration screens temporarily take over
+enum UiMode : uint8_t { UI_NORMAL, UI_KEYPAD, UI_CAL };
+UiMode ui = UI_NORMAL;
 
 // ---------- Helpers ----------
 uint16_t headerColourFor(const String &type) {
@@ -990,22 +1023,25 @@ void saveIdle(bool idle) {
   prefs.end();
 }
 
-// Persist the idle config (without clock/selection), only when it changed (limits flash wear).
-void saveIdleConfig(const String &cfg) {
+// Persist a blob only when it changed (limits flash wear).
+void saveBlobIfChanged(const char *key, const String &val) {
   prefs.begin("cards", false);
-  size_t len = prefs.getBytesLength("idlecfg");
+  size_t len = prefs.getBytesLength(key);
   bool same = false;
-  if (len == cfg.length() && len > 0) {
+  if (len == val.length() && len > 0) {
     char *buf = (char *)malloc(len);
     if (buf) {
-      prefs.getBytes("idlecfg", buf, len);
-      same = memcmp(buf, cfg.c_str(), len) == 0;
+      prefs.getBytes(key, buf, len);
+      same = memcmp(buf, val.c_str(), len) == 0;
       free(buf);
     }
   }
-  if (!same) prefs.putBytes("idlecfg", cfg.c_str(), cfg.length());
+  if (!same) prefs.putBytes(key, val.c_str(), val.length());
   prefs.end();
 }
+
+// Persist the idle config (without clock/selection).
+void saveIdleConfig(const String &cfg) { saveBlobIfChanged("idlecfg", cfg); }
 
 String loadBlob(const char *key) {
   String out;
@@ -1054,6 +1090,475 @@ bool loadTableFromDoc(JsonDocument &doc) {
   return true;
 }
 
+// ---------- Touch: calibration + coordinate mapping ----------
+struct TouchCal {
+  int16_t xMin = TOUCH_X_MIN, xMax = TOUCH_X_MAX, yMin = TOUCH_Y_MIN, yMax = TOUCH_Y_MAX;
+} tcal;
+bool touchDebug = false;
+
+bool calValid(const TouchCal &c) {
+  int dx = abs(c.xMax - c.xMin), dy = abs(c.yMax - c.yMin);
+  return dx >= 1000 && dx <= 8000 && dy >= 1000 && dy <= 8000;
+}
+
+void saveCal() {
+  prefs.begin("cards", false);
+  prefs.putBytes("tcal", &tcal, sizeof tcal);
+  prefs.end();
+}
+
+// Touch is always read in the controller's native orientation (XPT2046 lib rotation 1 = landscape,
+// which matches the CYD panel). Raw -> 320x240 landscape via the calibration, then rotated to the
+// current display rotation using the same transforms the XPT2046 library applies.
+void touchToScreen(int rx, int ry, int &sx, int &sy) {
+  int lx = (int32_t)(rx - tcal.xMin) * 320 / (tcal.xMax - tcal.xMin);
+  int ly = (int32_t)(ry - tcal.yMin) * 240 / (tcal.yMax - tcal.yMin);
+  lx = constrain(lx, 0, 319);
+  ly = constrain(ly, 0, 239);
+  switch (st.rotation & 3) {
+    case 1: sx = lx; sy = ly; break;
+    case 3: sx = 319 - lx; sy = 239 - ly; break;
+    case 0: sx = 239 - ly; sy = lx; break;
+    default: sx = ly; sy = 319 - lx; break;
+  }
+}
+
+void emitLine(JsonDocument &d) {
+  serializeJson(d, Serial);
+  Serial.println();
+}
+
+// ---------- Keypad (touch mini-keyboard) ----------
+#define MAX_KP_PAGES 6
+#define MAX_KP_KEYS 24
+#define KP_HDR 22           // header bar height
+#define KP_SWIPE_PX 70      // horizontal travel that counts as a page swipe
+
+enum KpKind : uint8_t { KK_KEY, KK_ACTION, KK_MOD };
+enum KpAction : uint8_t { KA_NEXT, KA_PREV, KA_EXIT, KA_PAGE };
+enum : uint8_t { MOD_CTRL = 1, MOD_SHIFT = 2, MOD_ALT = 4, MOD_WIN = 8 };
+static const char *MOD_NAMES[] = {"ctrl", "shift", "alt", "win"};
+
+struct KpKey {
+  String label;   // shown text; "@up" "@down" "@left" "@right" "@next" "@prev" draw arrows; "\n" = 2 lines
+  String key;     // host key name / combo, e.g. "esc", "f5", "alt+f4"
+  KpKind kind = KK_KEY;
+  uint8_t action = 0, arg = 0, modBit = 0;
+  uint8_t col = 0, row = 0, w = 1, h = 1;
+  int32_t colour = -1;  // RGB565, -1 = automatic
+};
+
+struct KpPage {
+  String title;
+  uint8_t cols = 4, rows = 4, count = 0;
+  KpKey keys[MAX_KP_KEYS];
+};
+
+KpPage kpPages[MAX_KP_PAGES];
+int kpPageCount = 0;
+int kpPage = 0;
+uint8_t kpModOnce = 0, kpModLock = 0;  // one-shot / locked modifiers
+int kpPressed = -1;                    // index of the highlighted key on the current page
+String kpFlash;                        // "sent" feedback text in the header
+unsigned long kpFlashMs = 0;
+UiMode calPrevUi = UI_NORMAL;
+
+// Built-in default; cards/_keypad.json (sent by the host) overrides it and is saved to flash.
+static const char KP_DEFAULT_LAYOUT[] PROGMEM = R"JSON({"pages":[
+{"title":"BASIC","cols":4,"rows":4,"keys":[
+ {"label":"ESC","key":"esc"},{"label":"TAB","key":"tab"},{"label":"@up","key":"up"},{"label":"BKSP","key":"backspace"},
+ {"label":"ENTER","key":"enter"},{"label":"@left","key":"left"},{"label":"@down","key":"down"},{"label":"@right","key":"right"},
+ {"label":"SPACE","key":"space","w":2},{"label":"F1","key":"f1"},{"label":"F2","key":"f2"},
+ {"label":"ALT+F4","key":"alt+f4"},{"label":"ALT+TAB","key":"alt+tab"},{"label":"EXIT","action":"exit"},{"label":"@next","action":"next"}]},
+{"title":"F-KEYS","cols":4,"rows":4,"keys":[
+ "f1","f2","f3","f4","f5","f6","f7","f8","f9","f10","f11","f12",
+ {"label":"@prev","action":"prev"},{"label":"ESC","key":"esc"},{"label":"ENTER","key":"enter"},{"label":"@next","action":"next"}]},
+{"title":"NAV / MODS","cols":4,"rows":4,"keys":[
+ {"label":"INS","key":"insert"},{"label":"HOME","key":"home"},{"label":"PGUP","key":"pageup"},{"label":"WIN","key":"win"},
+ {"label":"DEL","key":"delete"},{"label":"END","key":"end"},{"label":"PGDN","key":"pagedown"},{"label":"ENTER","key":"enter"},
+ {"label":"CTRL","mod":"ctrl"},{"label":"SHIFT","mod":"shift"},{"label":"ALT","mod":"alt"},{"label":"WIN+","mod":"win"},
+ {"label":"@prev","action":"prev"},{"label":"ESC","key":"esc"},{"label":"EXIT","action":"exit"},{"label":"@next","action":"next"}]}
+]})JSON";
+
+uint8_t modBitFor(String m) {
+  m.toLowerCase();
+  if (m == "ctrl" || m == "control") return MOD_CTRL;
+  if (m == "shift") return MOD_SHIFT;
+  if (m == "alt") return MOD_ALT;
+  if (m == "win" || m == "gui" || m == "super" || m == "meta") return MOD_WIN;
+  return 0;
+}
+
+int32_t parseHexColour(const char *s) {
+  if (!s || s[0] != '#' || strlen(s) != 7) return -1;
+  uint32_t v = strtoul(s + 1, nullptr, 16);
+  return tft.color565((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+}
+
+// Parse {"pages":[{"title","cols","rows","keys":[...]}]} into kpPages. Keys flow left-to-right,
+// top-to-bottom; "w"/"h" span cells; null or {} leaves a gap. Returns false (state unchanged) on error.
+bool parseKeypadLayout(JsonVariantConst lay, String &err) {
+  JsonArrayConst pages = lay["pages"].as<JsonArrayConst>();
+  if (pages.isNull() || pages.size() == 0) { err = "layout needs a non-empty \"pages\" array"; return false; }
+  int pc = 0;
+  for (JsonVariantConst pv : pages) {
+    if (pc >= MAX_KP_PAGES) { err = "too many pages (max 6)"; break; }
+    KpPage &pg = kpPages[pc];
+    pg.title = (const char *)(pv["title"] | "");
+    pg.cols = constrain((int)(pv["cols"] | 4), 1, 6);
+    pg.rows = constrain((int)(pv["rows"] | 4), 1, 6);
+    pg.count = 0;
+    bool occ[36] = {false};
+    for (JsonVariantConst kv : pv["keys"].as<JsonArrayConst>()) {
+      KpKey k;
+      bool gap = false;
+      int w = 1, h = 1;
+      if (kv.is<const char *>()) {
+        k.key = kv.as<const char *>();
+        k.label = k.key;
+        k.label.toUpperCase();
+      } else if (kv.is<JsonObjectConst>()) {
+        w = kv["w"] | 1;
+        h = kv["h"] | 1;
+        k.label = (const char *)(kv["label"] | "");
+        k.colour = parseHexColour(kv["color"] | (const char *)nullptr);
+        String act = (const char *)(kv["action"] | "");
+        String mod = (const char *)(kv["mod"] | "");
+        k.key = (const char *)(kv["key"] | "");
+        if (act.length()) {
+          k.kind = KK_ACTION;
+          if (act == "next") k.action = KA_NEXT;
+          else if (act == "prev") k.action = KA_PREV;
+          else if (act == "exit") k.action = KA_EXIT;
+          else if (act == "page") { k.action = KA_PAGE; k.arg = kv["page"] | 0; }
+          else gap = true;
+          if (!k.label.length()) { k.label = act; k.label.toUpperCase(); }
+        } else if (mod.length()) {
+          k.kind = KK_MOD;
+          k.modBit = modBitFor(mod);
+          if (!k.modBit) gap = true;
+          if (!k.label.length()) { k.label = mod; k.label.toUpperCase(); }
+        } else if (k.key.length()) {
+          if (!k.label.length()) { k.label = k.key; k.label.toUpperCase(); }
+        } else gap = true;
+      } else gap = true;
+      w = constrain(w, 1, (int)pg.cols);
+      h = constrain(h, 1, (int)pg.rows);
+      // first free cell (row-major) where a w x h block fits
+      int fr = -1, fc = -1;
+      for (int r = 0; r + h <= pg.rows && fr < 0; r++)
+        for (int c = 0; c + w <= pg.cols && fr < 0; c++) {
+          bool ok = true;
+          for (int rr = r; rr < r + h && ok; rr++)
+            for (int cc = c; cc < c + w && ok; cc++) ok = !occ[rr * 6 + cc];
+          if (ok) { fr = r; fc = c; }
+        }
+      if (fr < 0) break;  // page full
+      for (int rr = fr; rr < fr + h; rr++)
+        for (int cc = fc; cc < fc + w; cc++) occ[rr * 6 + cc] = true;
+      if (gap || pg.count >= MAX_KP_KEYS) continue;
+      k.col = fc; k.row = fr; k.w = w; k.h = h;
+      pg.keys[pg.count++] = k;
+    }
+    pc++;
+  }
+  kpPageCount = pc;
+  if (kpPage >= kpPageCount) kpPage = 0;
+  return true;
+}
+
+void loadDefaultKeypadLayout() {
+  JsonDocument doc;
+  String err;
+  if (!deserializeJson(doc, KP_DEFAULT_LAYOUT)) parseKeypadLayout(doc.as<JsonVariantConst>(), err);
+}
+
+uint16_t kpAutoColour(const KpKey &k) {
+  if (k.kind == KK_ACTION) return k.action == KA_EXIT ? 0x5000 : 0x2945;
+  if (k.kind == KK_MOD) return 0x480F;
+  String s = k.key;
+  s.toLowerCase();
+  if (s == "esc" || s == "escape") return 0xA800;
+  if (s == "enter" || s == "return") return 0x0460;
+  if (s.indexOf('+') > 0) return 0x780A;
+  if (s == "up" || s == "down" || s == "left" || s == "right") return 0x0319;
+  if (s.length() >= 2 && s[0] == 'f' && isdigit(s[1])) return 0x02AE;
+  return 0x3186;
+}
+
+void kpCell(const KpPage &pg, const KpKey &k, int &x, int &y, int &w, int &h) {
+  int W = tft.width(), gh = tft.height() - KP_HDR;
+  x = k.col * W / pg.cols;
+  w = (k.col + k.w) * W / pg.cols - x;
+  y = KP_HDR + k.row * gh / pg.rows;
+  h = KP_HDR + (k.row + k.h) * gh / pg.rows - y;
+}
+
+void drawArrow(int cx, int cy, char dir, int s, uint16_t col) {
+  switch (dir) {
+    case 'u': tft.fillTriangle(cx, cy - s, cx - s, cy + s * 2 / 3, cx + s, cy + s * 2 / 3, col); break;
+    case 'd': tft.fillTriangle(cx, cy + s, cx - s, cy - s * 2 / 3, cx + s, cy - s * 2 / 3, col); break;
+    case 'l': tft.fillTriangle(cx - s, cy, cx + s * 2 / 3, cy - s, cx + s * 2 / 3, cy + s, col); break;
+    default: tft.fillTriangle(cx + s, cy, cx - s * 2 / 3, cy - s, cx - s * 2 / 3, cy + s, col); break;
+  }
+}
+
+void kpDrawKey(int idx, bool pressed) {
+  const KpPage &pg = kpPages[kpPage];
+  const KpKey &k = pg.keys[idx];
+  int x, y, w, h;
+  kpCell(pg, k, x, y, w, h);
+  uint16_t fill = k.colour >= 0 ? (uint16_t)k.colour : kpAutoColour(k);
+  uint16_t fg = TFT_WHITE;
+  if (k.kind == KK_MOD) {
+    if (kpModLock & k.modBit) fill = COL_RED;
+    else if (kpModOnce & k.modBit) { fill = COL_ACCENT; fg = TFT_BLACK; }
+  }
+  if (pressed) { fill = TFT_WHITE; fg = TFT_BLACK; }
+  tft.fillRect(x, y, w, h, COL_BG);
+  tft.fillRoundRect(x + 2, y + 2, w - 4, h - 4, 7, fill);
+  tft.drawRoundRect(x + 2, y + 2, w - 4, h - 4, 7, pressed ? COL_ACCENT : dimColour(TFT_WHITE, 1, 3));
+  int cx = x + w / 2, cy = y + h / 2;
+  const String &L = k.label;
+  if (L.startsWith("@")) {
+    int s = min(w, h) / 4;
+    if (L == "@up") { drawArrow(cx, cy, 'u', s, fg); return; }
+    if (L == "@down") { drawArrow(cx, cy, 'd', s, fg); return; }
+    if (L == "@left") { drawArrow(cx, cy, 'l', s, fg); return; }
+    if (L == "@right") { drawArrow(cx, cy, 'r', s, fg); return; }
+    if (L == "@next" || L == "@prev") {
+      char d = L == "@next" ? 'r' : 'l';
+      int s2 = s * 2 / 3, off = s2 / 2 + 2;
+      drawArrow(cx - off, cy, d, s2, fg);
+      drawArrow(cx + off, cy, d, s2, fg);
+      return;
+    }
+  }
+  tft.setTextColor(fg);
+  tft.setTextDatum(MC_DATUM);
+  int nl = L.indexOf('\n');
+  if (nl >= 0) {
+    tft.setFreeFont(&FreeSansBold9pt7b);
+    tft.drawString(L.substring(0, nl), cx, cy - 10);
+    tft.drawString(L.substring(nl + 1), cx, cy + 10);
+  } else {
+    tft.setFreeFont(&FreeSansBold12pt7b);
+    if (tft.textWidth(L) > w - 10 || h < 36) tft.setFreeFont(&FreeSansBold9pt7b);
+    if (tft.textWidth(L) > w - 8) tft.setTextFont(2);
+    tft.drawString(L, cx, cy);
+  }
+  tft.setTextDatum(TL_DATUM);
+}
+
+String kpModText(uint8_t mods) {
+  String s;
+  for (int i = 0; i < 4; i++)
+    if (mods & (1 << i)) { if (s.length()) s += "+"; s += MOD_NAMES[i]; }
+  s.toUpperCase();
+  return s;
+}
+
+void kpDrawHeader() {
+  int W = tft.width();
+  tft.fillRect(0, 0, W, KP_HDR, COL_DARK);
+  tft.setTextFont(2);
+  tft.setTextColor(COL_CYAN);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString(String("KEYPAD ") + kpPages[kpPage].title, 4, KP_HDR / 2);
+  tft.setTextDatum(MR_DATUM);
+  tft.setTextColor(COL_TEXT);
+  tft.drawString(String(kpPage + 1) + "/" + String(kpPageCount), W - 4, KP_HDR / 2);
+  tft.setTextDatum(MC_DATUM);
+  if (kpFlash.length()) {
+    tft.setTextColor(COL_GREEN);
+    tft.drawString(kpFlash, W * 5 / 8, KP_HDR / 2);
+  } else if (kpModOnce | kpModLock) {
+    tft.setTextColor(COL_ACCENT);
+    tft.drawString(kpModText(kpModOnce | kpModLock) + " +", W * 5 / 8, KP_HDR / 2);
+  }
+  tft.setTextDatum(TL_DATUM);
+}
+
+void drawKeypad() {
+  tft.fillScreen(COL_BG);
+  kpDrawHeader();
+  const KpPage &pg = kpPages[kpPage];
+  for (int i = 0; i < pg.count; i++) kpDrawKey(i, i == kpPressed);
+}
+
+int kpHit(int x, int y) {
+  const KpPage &pg = kpPages[kpPage];
+  for (int i = 0; i < pg.count; i++) {
+    int cx, cy, cw, ch;
+    kpCell(pg, pg.keys[i], cx, cy, cw, ch);
+    if (x >= cx && x < cx + cw && y >= cy && y < cy + ch) return i;
+  }
+  return -1;
+}
+
+void kpGotoPage(int p) {
+  kpPage = ((p % kpPageCount) + kpPageCount) % kpPageCount;
+  kpPressed = -1;
+  drawKeypad();
+}
+
+void enterKeypad(int page, bool fromTouch) {
+  if (kpPageCount == 0) loadDefaultKeypadLayout();
+  ui = UI_KEYPAD;
+  kpModOnce = kpModLock = 0;
+  kpFlash = "";
+  kpPressed = -1;
+  kpPage = constrain(page, 0, kpPageCount - 1);
+  drawKeypad();
+  if (fromTouch) {
+    JsonDocument e;
+    e["evt"] = "keypad"; e["state"] = "on"; e["source"] = "touch";
+    emitLine(e);
+  }
+}
+
+void exitKeypad(bool fromTouch) {
+  ui = UI_NORMAL;
+  kpPressed = -1;
+  drawCard();  // back to the idle playlist or the table cards
+  lastRotate = millis();
+  if (fromTouch) {
+    JsonDocument e;
+    e["evt"] = "keypad"; e["state"] = "off"; e["source"] = "touch";
+    emitLine(e);
+  }
+}
+
+void kpActivate(int idx) {
+  KpKey &k = kpPages[kpPage].keys[idx];
+  if (k.kind == KK_ACTION) {
+    switch (k.action) {
+      case KA_NEXT: kpGotoPage(kpPage + 1); break;
+      case KA_PREV: kpGotoPage(kpPage - 1); break;
+      case KA_PAGE: kpGotoPage(k.arg); break;
+      default: exitKeypad(true); break;
+    }
+    return;
+  }
+  if (k.kind == KK_MOD) {  // off -> one-shot -> locked -> off
+    if (kpModLock & k.modBit) kpModLock &= ~k.modBit;
+    else if (kpModOnce & k.modBit) { kpModOnce &= ~k.modBit; kpModLock |= k.modBit; }
+    else kpModOnce |= k.modBit;
+    kpDrawKey(idx, false);
+    kpDrawHeader();
+    return;
+  }
+  uint8_t mods = kpModOnce | kpModLock;
+  JsonDocument e;
+  e["evt"] = "key";
+  e["key"] = k.key;
+  if (mods) {
+    JsonArray a = e["mods"].to<JsonArray>();
+    for (int i = 0; i < 4; i++) if (mods & (1 << i)) a.add(MOD_NAMES[i]);
+  }
+  emitLine(e);
+  String shown = k.label.startsWith("@") ? k.key : k.label;
+  shown.replace("\n", " ");
+  shown.toUpperCase();
+  kpFlash = (mods ? kpModText(mods) + "+" : String("")) + shown;
+  kpFlashMs = millis();
+  kpDrawKey(idx, false);
+  if (kpModOnce) {  // one-shot modifiers are used up
+    kpModOnce = 0;
+    const KpPage &pg = kpPages[kpPage];
+    for (int i = 0; i < pg.count; i++) if (pg.keys[i].kind == KK_MOD) kpDrawKey(i, false);
+  }
+  kpDrawHeader();
+}
+
+void kpTick(unsigned long now) {
+  if (kpFlash.length() && now - kpFlashMs > 900) {
+    kpFlash = "";
+    kpDrawHeader();
+  }
+}
+
+// ---------- On-device touch calibration ----------
+static const int16_t CAL_PTS[4][2] = {{20, 20}, {299, 20}, {299, 219}, {20, 219}};
+struct CalRun {
+  uint8_t step = 0;
+  int32_t rx[4], ry[4];
+  unsigned long stepStart = 0;
+} cal;
+
+void calDrawTarget() {
+  tft.fillScreen(COL_BG);
+  tft.setTextColor(COL_TEXT);
+  tft.setTextDatum(MC_DATUM);
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  tft.drawString("TOUCH CALIBRATION", 160, 90);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(COL_ACCENT);
+  tft.drawString("Tap the centre of the cross (" + String(cal.step + 1) + "/4)", 160, 125);
+  tft.setTextColor(COL_DIM);
+  tft.drawString("use a stylus or fingernail", 160, 150);
+  tft.setTextDatum(TL_DATUM);
+  int x = CAL_PTS[cal.step][0], y = CAL_PTS[cal.step][1];
+  tft.drawFastHLine(x - 14, y, 29, COL_RED);
+  tft.drawFastVLine(x, y - 14, 29, COL_RED);
+  tft.drawCircle(x, y, 7, COL_YELLOW);
+}
+
+void calStart() {
+  calPrevUi = ui == UI_CAL ? calPrevUi : ui;
+  ui = UI_CAL;
+  cal.step = 0;
+  cal.stepStart = millis();
+  tft.setRotation(1);  // targets are defined in native landscape coordinates
+  calDrawTarget();
+}
+
+void calEnd(bool ok, const char *err) {
+  JsonDocument e;
+  e["evt"] = "cal";
+  e["ok"] = ok;
+  if (err) e["err"] = err;
+  e["x_min"] = tcal.xMin; e["x_max"] = tcal.xMax; e["y_min"] = tcal.yMin; e["y_max"] = tcal.yMax;
+  emitLine(e);
+  tft.fillScreen(COL_BG);
+  tft.setTextDatum(MC_DATUM);
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  tft.setTextColor(ok ? COL_GREEN : COL_RED);
+  tft.drawString(ok ? "CALIBRATED" : "CALIBRATION FAILED", 160, 110);
+  tft.setTextDatum(TL_DATUM);
+  delay(1200);
+  tft.setRotation(st.rotation);
+  ui = calPrevUi;
+  if (ui == UI_KEYPAD) drawKeypad();
+  else drawCard();
+  lastRotate = millis();
+}
+
+void calSample(int32_t rx, int32_t ry) {
+  cal.rx[cal.step] = rx;
+  cal.ry[cal.step] = ry;
+  cal.step++;
+  cal.stepStart = millis();
+  if (cal.step < 4) { calDrawTarget(); return; }
+  // left/right x from points 0,3 / 1,2 ; top/bottom y from 0,1 / 2,3; extrapolate to screen edges
+  float xl = (cal.rx[0] + cal.rx[3]) / 2.0f, xr = (cal.rx[1] + cal.rx[2]) / 2.0f;
+  float yt = (cal.ry[0] + cal.ry[1]) / 2.0f, yb = (cal.ry[2] + cal.ry[3]) / 2.0f;
+  float kx = (xr - xl) / (CAL_PTS[1][0] - CAL_PTS[0][0]), ky = (yb - yt) / (CAL_PTS[2][1] - CAL_PTS[1][1]);
+  TouchCal c;
+  c.xMin = (int16_t)lroundf(xl - CAL_PTS[0][0] * kx);
+  c.xMax = (int16_t)lroundf(c.xMin + 320 * kx);
+  c.yMin = (int16_t)lroundf(yt - CAL_PTS[0][1] * ky);
+  c.yMax = (int16_t)lroundf(c.yMin + 240 * ky);
+  if (!calValid(c)) { calEnd(false, "implausible readings (axes swapped or missed a target?)"); return; }
+  tcal = c;
+  saveCal();
+  calEnd(true, nullptr);
+}
+
+void calTick(unsigned long now) {
+  if (now - cal.stepStart > 30000UL) calEnd(false, "timeout");
+}
+
 // ---------- Serial ----------
 void reply(const char *cmd, bool ok, const char *err = nullptr, const char *extraKey = nullptr, int extraVal = 0) {
   JsonDocument r;
@@ -1063,6 +1568,34 @@ void reply(const char *cmd, bool ok, const char *err = nullptr, const char *extr
   if (extraKey) r[extraKey] = extraVal;
   serializeJson(r, Serial);
   Serial.println();
+}
+
+// Leave keypad / calibration screens (a table or idle push always wins).
+void leaveOverlay() {
+  if (ui == UI_CAL) tft.setRotation(st.rotation);
+  ui = UI_NORMAL;
+  kpPressed = -1;
+}
+
+void redrawUi() {
+  if (ui == UI_KEYPAD) drawKeypad();
+  else if (ui == UI_CAL) calDrawTarget();
+  else drawCard();
+}
+
+const char *modeName() {
+  if (ui == UI_KEYPAD) return "keypad";
+  if (ui == UI_CAL) return "calibrate";
+  return st.idle ? "idle" : "table";
+}
+
+void replyCal(const char *ack) {
+  JsonDocument r;
+  r["ack"] = ack;
+  r["ok"] = true;
+  r["x_min"] = tcal.xMin; r["x_max"] = tcal.xMax; r["y_min"] = tcal.yMin; r["y_max"] = tcal.yMax;
+  r["debug"] = touchDebug;
+  emitLine(r);
 }
 
 void handleLine(const String &line) {
@@ -1075,6 +1608,7 @@ void handleLine(const String &line) {
   const char *cmd = doc["cmd"] | "";
   if (!strcmp(cmd, "table")) {
     if (doc["ts"].is<uint32_t>()) setClock(doc["ts"].as<uint32_t>());
+    leaveOverlay();
     loadTableFromDoc(doc);
     lastTitle = st.tableTitle;
     lastTs = clockValid ? clockNow() : 0;
@@ -1100,6 +1634,7 @@ void handleLine(const String &line) {
       prefs.putUShort("autoidle", icfg.autoIdleMin);
       prefs.end();
     }
+    leaveOverlay();
     st.idle = true;
     saveIdle(true);
     drawCard();
@@ -1120,12 +1655,16 @@ void handleLine(const String &line) {
     int v = doc["value"] | -1;
     if (v < 0 || v > 3) { reply("rotation", false, "value must be 0-3"); return; }
     st.rotation = v;
-    tft.setRotation(v);
-    ts.setRotation(v);
+    if (ui != UI_CAL) tft.setRotation(v);  // calibration restores it when done
     saveSetting("rot", (uint8_t)v);
-    drawCard();
+    redrawUi();
     reply("rotation", true, nullptr, "value", v);
   } else if (!strcmp(cmd, "next")) {
+    if (ui == UI_KEYPAD) {
+      kpGotoPage(kpPage + 1);
+      reply("next", true, nullptr, "page", kpPage);
+      return;
+    }
     nextCard();
     reply("next", true, nullptr, "card", st.idle ? irt.idx : st.current);
   } else if (!strcmp(cmd, "ping")) {
@@ -1134,8 +1673,55 @@ void handleLine(const String &line) {
     r["ok"] = true;
     r["fw"] = FW_VERSION;
     r["device"] = "cyd-pinball-cards";
+    r["mode"] = modeName();
     serializeJson(r, Serial);
     Serial.println();
+  } else if (!strcmp(cmd, "keypad")) {
+    if (doc["exit"] | false) {
+      if (ui == UI_KEYPAD) exitKeypad(false);
+      reply("keypad", true);
+      return;
+    }
+    String err;
+    bool ok = true;
+    JsonVariantConst lay = doc["layout"].is<JsonObject>() ? doc["layout"].as<JsonVariantConst>() : JsonVariantConst();
+    if (lay.isNull() && doc["pages"].is<JsonArray>()) lay = doc.as<JsonVariantConst>();
+    if (!lay.isNull()) {
+      ok = parseKeypadLayout(lay, err);
+      if (ok) {
+        String saved = "{\"pages\":";  // store only the pages (not cmd/page/other keys)
+        String pagesJson;
+        serializeJson(lay["pages"], pagesJson);
+        saved += pagesJson + "}";
+        saveBlobIfChanged("kplayout", saved);
+      }
+    }
+    if (ui == UI_CAL) leaveOverlay();
+    enterKeypad(doc["page"] | 0, false);
+    JsonDocument r;
+    r["ack"] = "keypad";
+    r["ok"] = ok;
+    if (!ok) r["err"] = err;
+    r["pages"] = kpPageCount;
+    r["page"] = kpPage;
+    emitLine(r);
+  } else if (!strcmp(cmd, "cal")) {
+    if (doc["debug"].is<bool>()) touchDebug = doc["debug"].as<bool>();
+    if (doc["reset"] | false) {
+      tcal = TouchCal();
+      saveCal();
+    } else if (doc["x_min"].is<int>() || doc["x_max"].is<int>() || doc["y_min"].is<int>() || doc["y_max"].is<int>()) {
+      TouchCal c = tcal;
+      c.xMin = doc["x_min"] | (int)c.xMin; c.xMax = doc["x_max"] | (int)c.xMax;
+      c.yMin = doc["y_min"] | (int)c.yMin; c.yMax = doc["y_max"] | (int)c.yMax;
+      if (!calValid(c)) { reply("cal", false, "range too small/large (need 1000..8000 raw units per axis)"); return; }
+      tcal = c;
+      saveCal();
+    }
+    replyCal("cal");
+  } else if (!strcmp(cmd, "calibrate")) {
+    calStart();
+    reply("calibrate", true);
   } else {
     reply(cmd[0] ? cmd : "?", false, "unknown cmd");
   }
@@ -1161,14 +1747,98 @@ void pollSerial() {
 }
 
 // ---------- Touch ----------
-void pollTouch() {
-  if (ts.tirqTouched() && ts.touched()) {
-    unsigned long now = millis();
-    if (now - lastTouch > 350) {  // debounce
-      lastTouch = now;
-      nextCard();
-      lastRotate = now;  // restart auto-rotate timer after manual tap
+// A small gesture layer: press / hold / release with screen coordinates.
+//   idle + cards: tap (on release) = next card/screen; hold LONGPRESS_KEYPAD_MS = open keypad
+//   keypad: press highlights a key, release on it sends it; horizontal swipe = page change
+//   calibrate: the averaged raw position of each press is one calibration sample
+struct TouchState {
+  bool down = false, consumed = false;
+  unsigned long t0 = 0, lastSeen = 0;
+  int x0 = 0, y0 = 0, x = 0, y = 0;  // screen coordinates (current rotation)
+  int32_t sumX = 0, sumY = 0, n = 0; // raw accumulators (calibration)
+} tch;
+unsigned long lastTapMs = 0;
+
+void onTouchDown() {
+  if (ui == UI_KEYPAD) {
+    kpPressed = kpHit(tch.x0, tch.y0);
+    if (kpPressed >= 0) kpDrawKey(kpPressed, true);
+  }
+}
+
+void onTouchHeld(unsigned long now) {
+  if (ui == UI_KEYPAD) {
+    // finger slid far sideways: treat as a swipe, drop the highlight
+    if (kpPressed >= 0 && abs(tch.x - tch.x0) > KP_SWIPE_PX / 2) {
+      kpDrawKey(kpPressed, false);
+      kpPressed = -1;
     }
+  } else if (ui == UI_NORMAL && LONGPRESS_KEYPAD_MS > 0 && !tch.consumed && now - tch.t0 >= LONGPRESS_KEYPAD_MS) {
+    tch.consumed = true;
+    enterKeypad(0, true);
+  }
+}
+
+void onTouchUp(unsigned long now) {
+  if (ui == UI_CAL) {
+    if (tch.n >= 3) calSample(tch.sumX / tch.n, tch.sumY / tch.n);
+    return;
+  }
+  if (ui == UI_KEYPAD) {
+    int dx = tch.x - tch.x0, dy = tch.y - tch.y0;
+    if (tch.consumed) {  // the long-press that opened the keypad: ignore its release
+      if (kpPressed >= 0) kpDrawKey(kpPressed, false);
+      kpPressed = -1;
+      return;
+    }
+    if (abs(dx) >= KP_SWIPE_PX && abs(dx) > abs(dy)) {
+      kpGotoPage(kpPage + (dx < 0 ? 1 : -1));
+      return;
+    }
+    int idx = kpPressed;
+    kpPressed = -1;
+    if (idx >= 0) {
+      if (kpHit(tch.x, tch.y) == idx) kpActivate(idx);  // released on the same key
+      else kpDrawKey(idx, false);                        // slid off: cancel
+    }
+    return;
+  }
+  if (!tch.consumed && now - lastTapMs > 150) {
+    lastTapMs = now;
+    nextCard();
+    lastRotate = now;  // restart auto-rotate timer after manual tap
+  }
+}
+
+void pollTouch() {
+  unsigned long now = millis();
+  if (ts.touched()) {
+    TS_Point p = ts.getPoint();
+    int sx, sy;
+    touchToScreen(p.x, p.y, sx, sy);
+    if (!tch.down) {
+      tch.down = true;
+      tch.consumed = false;
+      tch.t0 = now;
+      tch.x0 = tch.x = sx;
+      tch.y0 = tch.y = sy;
+      tch.sumX = tch.sumY = tch.n = 0;
+      if (touchDebug) {
+        JsonDocument e;
+        e["evt"] = "touch"; e["raw_x"] = p.x; e["raw_y"] = p.y; e["z"] = p.z; e["x"] = sx; e["y"] = sy;
+        emitLine(e);
+      }
+      onTouchDown();
+    } else if (p.z >= 500) {  // ignore the weak, noisy samples while lifting off
+      tch.x = sx;
+      tch.y = sy;
+    }
+    if (p.z >= 600 && now - tch.t0 >= 40) { tch.sumX += p.x; tch.sumY += p.y; tch.n++; }
+    tch.lastSeen = now;
+    onTouchHeld(now);
+  } else if (tch.down && now - tch.lastSeen > 40) {  // released (debounced)
+    tch.down = false;
+    onTouchUp(now);
   }
 }
 
@@ -1189,7 +1859,20 @@ void setup() {
   String idleCfg = loadBlob("idlecfg");
   lastTitle = prefs.getString("lastT", "");
   lastTs = prefs.getULong("lastTs", 0);
+  String kpLayout = loadBlob("kplayout");
+  if (prefs.getBytesLength("tcal") == sizeof(TouchCal)) {
+    TouchCal c;
+    prefs.getBytes("tcal", &c, sizeof c);
+    if (calValid(c)) tcal = c;
+  }
   prefs.end();
+
+  loadDefaultKeypadLayout();
+  if (kpLayout.length()) {
+    JsonDocument doc;
+    String err;
+    if (!deserializeJson(doc, kpLayout)) parseKeypadLayout(doc.as<JsonVariantConst>(), err);
+  }
 
   loadDefaultIdleConfig();
   if (idleCfg.length()) {
@@ -1208,7 +1891,7 @@ void setup() {
 
   touchSpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
   ts.begin(touchSpi);
-  ts.setRotation(st.rotation);
+  ts.setRotation(1);  // always native orientation; touchToScreen() applies the display rotation
 
   if (!wasIdle && last.length()) {
     JsonDocument doc;
@@ -1227,7 +1910,11 @@ void loop() {
   pollSerial();
   pollTouch();
   unsigned long now = millis();
-  if (!st.idle) {
+  if (ui == UI_KEYPAD) {
+    kpTick(now);
+  } else if (ui == UI_CAL) {
+    calTick(now);
+  } else if (!st.idle) {
     if (st.cardCount > 1 && CARD_ROTATE_MS > 0 && now - lastRotate >= CARD_ROTATE_MS) {
       lastRotate = now;
       nextCard();
@@ -1241,5 +1928,5 @@ void loop() {
   } else {
     idleTick(now);
   }
-  delay(st.idle ? 2 : 5);
+  delay(ui == UI_NORMAL && !st.idle ? 5 : 2);
 }

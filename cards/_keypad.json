@@ -1,0 +1,31 @@
+{
+  "_comment": "Touch keypad for the CYD, sent with {\"cmd\":\"keypad\"} by cyd_daemon.py (auto, while a watched process runs) or cyd_push.py --keypad. Keys flow left-to-right, top-to-bottom in a cols x rows grid (max 6x6, max 6 pages, 24 keys/page); \"w\"/\"h\" span cells, null leaves a gap. key = host key name or combo (esc, enter, tab, backspace, space, up/down/left/right, f1-f24, pageup, pagedown, home, end, insert, delete, win, apps, printscreen, a-z, 0-9, alt+f4, ctrl+shift+esc ...). action = next | prev | exit | page (with \"page\": N). mod = ctrl | shift | alt | win (tap: one-shot, tap again: locked, third tap: off). label \"@up/@down/@left/@right/@next/@prev\" draws an arrow; \"\\n\" splits a label in two lines. Optional \"color\": \"#RRGGBB\". Keys starting with _ are ignored by the firmware; watch_processes is used by cyd_daemon.py only.",
+  "watch_processes": ["PinUpMenuSetup.exe"],
+  "pages": [
+    {
+      "title": "BASIC", "cols": 4, "rows": 4,
+      "keys": [
+        { "label": "ESC", "key": "esc" }, { "label": "TAB", "key": "tab" }, { "label": "@up", "key": "up" }, { "label": "BKSP", "key": "backspace" },
+        { "label": "ENTER", "key": "enter" }, { "label": "@left", "key": "left" }, { "label": "@down", "key": "down" }, { "label": "@right", "key": "right" },
+        { "label": "SPACE", "key": "space", "w": 2 }, { "label": "F1", "key": "f1" }, { "label": "F2", "key": "f2" },
+        { "label": "ALT+F4", "key": "alt+f4" }, { "label": "ALT+TAB", "key": "alt+tab" }, { "label": "EXIT", "action": "exit" }, { "label": "@next", "action": "next" }
+      ]
+    },
+    {
+      "title": "F-KEYS", "cols": 4, "rows": 4,
+      "keys": [
+        "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+        { "label": "@prev", "action": "prev" }, { "label": "ESC", "key": "esc" }, { "label": "ENTER", "key": "enter" }, { "label": "@next", "action": "next" }
+      ]
+    },
+    {
+      "title": "NAV / MODS", "cols": 4, "rows": 4,
+      "keys": [
+        { "label": "INS", "key": "insert" }, { "label": "HOME", "key": "home" }, { "label": "PGUP", "key": "pageup" }, { "label": "WIN", "key": "win" },
+        { "label": "DEL", "key": "delete" }, { "label": "END", "key": "end" }, { "label": "PGDN", "key": "pagedown" }, { "label": "ENTER", "key": "enter" },
+        { "label": "CTRL", "mod": "ctrl" }, { "label": "SHIFT", "mod": "shift" }, { "label": "ALT", "mod": "alt" }, { "label": "WIN+", "mod": "win" },
+        { "label": "@prev", "action": "prev" }, { "label": "ESC", "key": "esc" }, { "label": "EXIT", "action": "exit" }, { "label": "@next", "action": "next" }
+      ]
+    }
+  ]
+}
