@@ -3,7 +3,7 @@
 displays.py - multi-display support for the CYD host tools (1 to 5 boards on one machine,
 tested with 5 simulated boards; there is no hard limit in the code).
 
-* Board identity: firmware 1.3.0 answers ping/hello with id (cyd-a1b2c3 from the MAC, or a custom
+* Board identity: firmware 1.3.0+ answers ping/hello with id (cyd-a1b2c3 from the MAC, or a custom
   id), name, role, rotation and keypad. Older firmware (1.2.0) has no identity: such a board gets
   the id "port:<port name>" (e.g. port:COM5, port:ttyUSB0) and the role "all".
 * config.json "displays" maps board ids (or "port:COM5" for old firmware) to name / role /
@@ -23,12 +23,18 @@ from dataclasses import asdict, dataclass, field
 
 import serialport
 
-# Known USB-serial bridges used on CYD boards: CH340, CH9102, CP2102
+# Known USB-serial ports of the supported boards: CH340 / CH9102 / CP2102 (CYD), the ESP32-S3's
+# native USB (USB-Serial/JTAG, Waveshare ESP32-S3-Touch-LCD-7 "USB" port) and the CH343 on the
+# Waveshare board's "UART" port. Only ports that answer ping like a cards display are used.
 KNOWN_VID_PID = {
     (0x1A86, 0x7523): "CH340",
     (0x1A86, 0x55D4): "CH9102",
     (0x10C4, 0xEA60): "CP210x",
+    (0x303A, 0x1001): "ESP-USB",
+    (0x1A86, 0x55D3): "CH343",
 }
+# Board types reported by firmware >= 1.4.0 in ping/hello/ready ("board"); older firmware = CYD
+BOARD_TYPES = {"cyd": "ESP32-2432S028R (CYD) 320x240", "ws-s3-7": "Waveshare ESP32-S3-Touch-LCD-7 800x480"}
 BAUD = 115200
 GENERIC_ROLES = {"", "all", "*", "any"}   # a board with one of these roles gets the generic content
 TESTED_MAX_DISPLAYS = 5
@@ -60,6 +66,7 @@ class Board:
     legacy: bool = False          # firmware without identity (< 1.3.0)
     board_name: str = ""          # as stored on the board
     board_role: str = ""
+    hw: str = ""                  # board type from firmware >= 1.4.0: "cyd" | "ws-s3-7" ("" = older fw)
     configured: bool = False      # a config.json "displays" entry applies
     cfg: dict = field(default_factory=dict)
 
@@ -88,7 +95,8 @@ def identity_from_reply(reply: dict | None, port: str) -> dict:
     bid = str(reply.get("id") or "").strip()
     out = {"fw": reply.get("fw"), "mode": reply.get("mode") or "unknown",
            "board_name": str(reply.get("name") or ""), "board_role": str(reply.get("role") or "").strip().lower(),
-           "keypad": reply.get("keypad") is not False, "legacy": not bid}
+           "keypad": reply.get("keypad") is not False, "legacy": not bid,
+           "hw": str(reply.get("board") or "").strip().lower()}
     out["id"] = bid or legacy_id(port)
     rot = reply.get("rotation")
     out["rotation"] = int(rot) if isinstance(rot, int) else None
@@ -115,7 +123,8 @@ def make_board(port: str, reply: dict | None, displays: dict | None = None) -> B
     keypad = bool(cfg["keypad"]) if isinstance(cfg.get("keypad"), bool) else ident["keypad"]
     return Board(port=port, id=ident["id"], name=name, role=role, fw=ident["fw"], mode=ident["mode"],
                  keypad=keypad, rotation=ident["rotation"], legacy=ident["legacy"],
-                 board_name=ident["board_name"], board_role=ident["board_role"], configured=bool(cfg), cfg=cfg)
+                 board_name=ident["board_name"], board_role=ident["board_role"], hw=ident["hw"],
+                 configured=bool(cfg), cfg=cfg)
 
 
 def update_board(board: Board, reply: dict, displays: dict | None = None) -> Board:

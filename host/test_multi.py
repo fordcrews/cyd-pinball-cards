@@ -182,6 +182,61 @@ class FirmwareProtocol(unittest.TestCase):
             self.assertIn(nvs, fw)
 
 
+class WaveshareBoard(unittest.TestCase):
+    """fw 1.4.0: "board" field (cyd | ws-s3-7) and the Waveshare ESP32-S3-Touch-LCD-7 USB IDs."""
+
+    def test_new_vid_pids_detected(self):
+        saved = os.environ.pop("CYD_EXCLUDE_PORTS", None)
+        if saved is not None:
+            self.addCleanup(os.environ.__setitem__, "CYD_EXCLUDE_PORTS", saved)
+        self.assertEqual(displays.KNOWN_VID_PID[(0x303A, 0x1001)], "ESP-USB")   # ESP32-S3 native USB
+        self.assertEqual(displays.KNOWN_VID_PID[(0x1A86, 0x55D3)], "CH343")     # Waveshare "UART" port
+        self.assertIs(cyd_push.KNOWN_VID_PID, displays.KNOWN_VID_PID)
+        P = serialport.PortInfo
+        ports = [P("COM12", 0x303A, 0x1001), P("COM11", 0x1A86, 0x55D3), P("COM9", 0x1A86, 0x7523),
+                 P("COM4", 0x2341, 0x0043), P("COM5", 0x303A, 0x4001)]
+        self.assertEqual(displays.candidate_ports(None, None, ports), ["COM9", "COM11", "COM12"])
+
+    def test_board_field(self):
+        b = displays.make_board("COM12", {"ack": "ping", "ok": True, "fw": "1.4.0", "board": "WS-S3-7", "mode": "idle",
+                                          "id": "cyd-0a0b0c", "role": "center", "rotation": 1, "keypad": True})
+        self.assertEqual((b.hw, b.fw, b.id, b.role, b.legacy), ("ws-s3-7", "1.4.0", "cyd-0a0b0c", "center", False))
+        self.assertEqual(Board.from_dict(json.loads(json.dumps(b.as_dict()))).as_dict(), b.as_dict())
+        self.assertEqual(displays.make_board("COM5", {"ok": True, "fw": "1.4.0", "board": "cyd", "id": "cyd-1"}).hw, "cyd")
+        # older firmware has no "board": tolerated, hw stays empty; unknown extra keys are ignored
+        self.assertEqual(displays.make_board("COM5", {"ok": True, "fw": "1.3.0", "id": "cyd-1"}).hw, "")
+        self.assertEqual(Board.from_dict({"port": "X", "id": "y", "future_key": 1}).hw, "")
+        self.assertIn("ws-s3-7", displays.BOARD_TYPES)
+
+    def test_fake_board_reports_board(self):
+        got = []
+        b = FakeBoard(id="cyd-000777", board="ws-s3-7")
+        b.out = lambda data: got.append(json.loads(data))
+        for cmd in ("ping", "hello", "cal", "calibrate", "brightness"):
+            b.feed((json.dumps({"cmd": cmd, "value": 40}) + "\n").encode())
+        self.assertTrue(wait_until(lambda: len(got) >= 6))
+        self.assertEqual([g.get("board") for g in got[:2]], ["ws-s3-7", "ws-s3-7"])
+        self.assertEqual((got[2]["ack"], got[2]["touch"]), ("cal", "capacitive"))
+        self.assertEqual((got[3]["ack"], got[4]["evt"], got[4]["touch"]), ("calibrate", "cal", "capacitive"))
+        self.assertEqual((got[5]["ack"], got[5]["dimmable"], got[5]["backlight"]), ("brightness", False, "on"))
+        old = FakeBoard(fw="1.3.0", id="cyd-000778")
+        self.assertNotIn("board", old.identity())
+        self.assertEqual(FakeBoard().identity()["board"], "cyd")
+
+    def test_firmware_reports_board(self):
+        src = HERE.parent / "firmware" / "src"
+        fw = (src / "main.cpp").read_text(encoding="utf-8")
+        board_h = (src / "board.h").read_text(encoding="utf-8")
+        self.assertIn('r["board"] = BOARD_KIND;', fw)
+        self.assertIn('#define BOARD_KIND "cyd"', board_h)
+        self.assertIn('#define BOARD_KIND "ws-s3-7"', board_h)
+        self.assertIn('r["touch"] = "capacitive";', fw)
+        ini = (HERE.parent / "firmware" / "platformio.ini").read_text(encoding="utf-8")
+        self.assertIn("[env:cyd]", ini)
+        self.assertIn("[env:waveshare_s3_lcd7]", ini)
+        self.assertIn("-DARDUINO_USB_CDC_ON_BOOT=1", ini)
+
+
 # ---------------------------------------------------------------- unit: per-role content
 def B(role, **kw):
     return Board(port=kw.pop("port", "X"), id=kw.pop("id", f"id-{role}"), role=role, **kw)
@@ -357,6 +412,16 @@ class DirectFanout(BusCase):
         rc, _, err = self.push("--idle", "--no-daemon", "--target", "nobody")
         self.assertEqual(rc, 2)
         self.assertIn("no display matches", err)
+
+    def test_list_displays_board_type(self):
+        self.plug("FAKE1", id="cyd-aaa001", role="right")
+        self.plug("FAKE2", id="cyd-bbb002", role="center", board="ws-s3-7")
+        rc, out, _ = self.push("--list-displays", "--json", "--no-daemon")
+        self.assertEqual(rc, 0)
+        rows = {r["port"]: r for r in json.loads(out)}
+        self.assertEqual((rows["FAKE1"]["hw"], rows["FAKE2"]["hw"]), ("cyd", "ws-s3-7"))
+        rc, out, _ = self.push("--list-displays", "--no-daemon")
+        self.assertIn("1.4.0 (ws-s3-7)", out)
 
     def test_list_identify_assign(self):
         self.five()

@@ -3,7 +3,7 @@
 fake_cyd.py - simulate CYD boards running cyd-pinball-cards firmware, so cyd_daemon.py /
 cyd_push.py can be tested without hardware.
 
-* FakeBoard: the protocol (fw 1.3.0 with id/name/role/rotation/keypad, identify, config, set_id,
+* FakeBoard: the protocol (fw 1.4.0 with board type + id/name/role/rotation/keypad, identify, config, set_id,
   hello - or fw 1.2.0 without any identity, for backward-compatibility tests).
 * FakeCyd: one board on a pseudo-terminal (Linux/macOS only). link="/tmp/x/cyd-left" adds a
   symlink to the PTY, so a daemon given that path sees unplug()/re-plug like a real USB device.
@@ -38,9 +38,11 @@ class FakeBoard:
     thread; `delay` (seconds, or a dict cmd -> seconds) simulates the time a real board spends
     drawing, so timing / parallel fan-out can be tested."""
 
-    def __init__(self, fw: str = "1.3.0", id: str | None = None, name: str = "", role: str = "",
-                 rotation: int = 1, keypad: bool = True, delay=0.0, log=None, mac: str | None = None):
+    def __init__(self, fw: str = "1.4.0", id: str | None = None, name: str = "", role: str = "",
+                 rotation: int = 1, keypad: bool = True, delay=0.0, log=None, mac: str | None = None,
+                 board: str = "cyd"):
         self.fw = fw
+        self.board = board   # fw >= 1.4.0 reports it as "board" ("cyd" | "ws-s3-7")
         self.mac_id = mac or id or "cyd-" + os.urandom(3).hex()
         self.custom_id = id if (id and id != self.mac_id) else ""
         self.name, self.role, self.rotation, self.keypad = name, (role or "").lower(), rotation, keypad
@@ -65,7 +67,10 @@ class FakeBoard:
         return self.custom_id or self.mac_id
 
     def identity(self) -> dict:
-        return {"id": self.id, "name": self.name, "role": self.role, "rotation": self.rotation, "keypad": self.keypad}
+        ident = {"id": self.id, "name": self.name, "role": self.role, "rotation": self.rotation, "keypad": self.keypad}
+        if tuple(int(x) for x in self.fw.split(".")[:2]) >= (1, 4):
+            ident = {"board": self.board, **ident}
+        return ident
 
     def emit(self, obj: dict):
         self.out((json.dumps(obj, separators=(",", ":")) + "\n").encode())
@@ -125,6 +130,14 @@ class FakeBoard:
             else:
                 self.rotation = v
                 self.emit({"ack": "rotation", "ok": True, "value": v})
+        elif cmd in ("cal", "calibrate") and self.board == "ws-s3-7":
+            # GT911 capacitive touch (fw 1.4.0 on the Waveshare 7"): nothing to calibrate
+            self.emit({"ack": cmd, "ok": True, "touch": "capacitive", "note": "no calibration needed"})
+            if cmd == "calibrate":
+                self.emit({"evt": "cal", "ok": True, "touch": "capacitive"})
+        elif cmd == "brightness" and self.board == "ws-s3-7":
+            v = int(d.get("value", 0))
+            self.emit({"ack": cmd, "ok": True, "value": v, "dimmable": False, "backlight": "on" if v else "off"})
         elif cmd in ("brightness", "next", "calibrate"):
             self.emit({"ack": cmd, "ok": True})
         elif cmd == "cal":

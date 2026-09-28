@@ -953,7 +953,8 @@ def print_displays(boards: list[Board], as_json: bool = False, via: str = "") ->
         src = "port (fw < 1.3.0)" if b.legacy else "board"
         if b.configured:
             src += " + config.json"
-        rows.append((b.id, b.name or "-", b.role, b.port, b.fw or "?", b.mode, "yes" if b.keypad else "no", src))
+        fw = (b.fw or "?") + (f" ({b.hw})" if b.hw and b.hw != "cyd" else "")
+        rows.append((b.id, b.name or "-", b.role, b.port, fw, b.mode, "yes" if b.keypad else "no", src))
     widths = [max(len(str(r[i])) for r in rows) for i in range(len(rows[0]))]
     for r in rows:
         print("  ".join(str(v).ljust(w) for v, w in zip(r, widths)).rstrip())

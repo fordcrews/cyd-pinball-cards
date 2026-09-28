@@ -4,7 +4,9 @@
 
 Custom firmware and host scripts that turn an **ESP32 Cheap Yellow Display** (ESP32-2432S028R,
 2.8" 320×240 ILI9341, XPT2046 resistive touch) into a small card screen next to the player on a
-**virtual pinball** or **arcade** cabinet:
+**virtual pinball** or **arcade** cabinet. The same firmware also builds for the bigger
+**Waveshare ESP32-S3-Touch-LCD-7** (7" 800×480, capacitive touch), see
+[Waveshare ESP32-S3-Touch-LCD-7](#waveshare-esp32-s3-touch-lcd-7) (not yet tested on hardware):
 
 * **While a game runs** it shows cards for it: the table or game title, rules or instructions,
   controls / button layout, a moves list, pricing or credits. The frontend pushes them over USB
@@ -41,9 +43,11 @@ Hook paths and arguments, with their sources, and what is still **TO-VERIFY** on
 
 ```
 cyd-pinball-cards/
-├── firmware/          PlatformIO project (TFT_eSPI + XPT2046_Touchscreen + ArduinoJson)
-│   ├── platformio.ini   pins, rotation, rotate timer, brightness in build_flags
-│   └── src/main.cpp
+├── firmware/          PlatformIO project: env cyd (TFT_eSPI + XPT2046_Touchscreen) and env waveshare_s3_lcd7 (LovyanGFX)
+│   ├── platformio.ini   pins, rotation, rotate timer, brightness in build_flags (one [env] per board)
+│   ├── src/main.cpp     shared: cards, idle playlist, keypad, identity, serial protocol
+│   ├── src/board.h      board abstraction; board_cyd.cpp / board_ws_s3_lcd7.cpp implement it
+│   └── bin/             prebuilt CYD images; bin/waveshare_s3_lcd7/ = Waveshare 7" images + merged.bin
 ├── host/              host tools (Windows + Linux, Python 3)
 │   ├── cyd_push.py      push table/game cards, idle, keypad (hands off to the daemon when it runs)
 │   ├── cyd_daemon.py    keeps the serial ports open (all displays, hot-plug), turns keypad presses into key presses, optional process watch
@@ -69,7 +73,7 @@ cyd-pinball-cards/
 │   └── <system>/<rom>.json    optional per-system cards (e.g. cards/snes/sf2.json)
 ├── config.example.json  per-cabinet settings (copy to config.json)
 ├── frontends/         hook scripts + SETUP.md per frontend (popper, batocera, retrobat, retropie, es-de, emulationstation, linux)
-├── docs/              idle_preview.py / keypad_preview.py / multi_display_preview.py (Pillow mock-up renderers) + preview PNGs
+├── docs/              idle_preview.py / keypad_preview.py / multi_display_preview.py / waveshare7_preview.py (Pillow mock-up renderers) + preview PNGs
 └── README.md
 ```
 
@@ -78,6 +82,7 @@ cyd-pinball-cards/
 | Qty | Part | Notes |
 |---|---|---|
 | 1 per display | **ESP32-2432S028R "Cheap Yellow Display"** | Any 2.8" CYD with resistive touch. Micro-USB and dual USB (micro + USB-C) versions both work. See the note on the ST7789 variant below. |
+| alternative | **Waveshare ESP32-S3-Touch-LCD-7** (touch version) | 7" 800×480 instead of 2.8"; needs a good 5 V supply (~450 mA). See [its section](#waveshare-esp32-s3-touch-lcd-7). |
 | 1 per display | USB data cable (micro-USB or USB-C to USB-A) | It must be a **data** cable. Cables of 1 m or less are the most reliable inside a cabinet. |
 | optional (recommended for 3–5 displays) | Powered USB 2.0 hub | Each CYD draws roughly 100–150 mA with the backlight on full, so 5 boards need up to about 750 mA. See [USB and power](#usb-and-power). |
 | optional | 3D-printed shroud / thin bezel, M2/M3 screws | See Mounting. |
@@ -92,13 +97,14 @@ cyd-pinball-cards/
 3. Build and upload:
    ```
    cd firmware
-   pio run -t upload            # add  --upload-port COM5  if needed
+   pio run -e cyd -t upload     # add  --upload-port COM5  if needed (cyd is the default env)
    pio device monitor           # optional: see the {"ready":true,...} line (115200 baud)
    ```
    If the upload won't start, hold **BOOT**, tap **RST**, then release BOOT.
 
 ### Option B: esptool (flash a prebuilt binary without the toolchain)
-Prebuilt images (firmware 1.3.0) are in `firmware/bin/`. After your own `pio run`, they are in
+Prebuilt CYD images (firmware 1.4.0) are in `firmware/bin/` (the Waveshare 7" images are in
+`firmware/bin/waveshare_s3_lcd7/`, see [Waveshare ESP32-S3-Touch-LCD-7](#waveshare-esp32-s3-touch-lcd-7)). After your own `pio run`, they are in
 `firmware/.pio/build/cyd/`. Flash them with:
 ```
 pip install esptool
@@ -139,6 +145,105 @@ title, blue for rules, green for cost, purple for idle. The header shows a card 
 These fonts only cover **ASCII**, so avoid accented characters and symbols like `¢`. Write `25c`
 instead of `25¢`.
 
+## Waveshare ESP32-S3-Touch-LCD-7
+
+The same firmware also runs on the **Waveshare ESP32-S3-Touch-LCD-7** (7" 800×480 IPS, RGB
+parallel, GT911 capacitive touch, ESP32-S3-WROOM-1 with 8 MB octal PSRAM and 8 or 16 MB flash) as
+a second PlatformIO environment, `waveshare_s3_lcd7`. Cards, idle playlist, keypad, identity and
+the serial protocol are shared with the CYD; only the board layer differs
+(`firmware/src/board.h`, `board_cyd.cpp`, `board_ws_s3_lcd7.cpp`).
+
+> **Status: compiles, not yet tested on real hardware.** Pins, timings and the IO-expander
+> sequence are taken from Waveshare's wiki and demo code (sources below). Please report back
+> the results of the hardware checks at the end of this section.
+
+![Waveshare 7-inch mock-up](docs/waveshare-7-preview.png)
+
+*Mock-up (Pillow rendering, not a photo) of a card and the built-in 6×4 keypad page at 800×480.
+Regenerate with `python docs/waveshare7_preview.py`.*
+
+**What is different from the CYD**
+
+| | CYD (`cyd`) | Waveshare 7" (`waveshare_s3_lcd7`) |
+|---|---|---|
+| Graphics library | TFT_eSPI (SPI ILI9341) | **LovyanGFX** `Bus_RGB` + `Panel_RGB` (TFT_eSPI has no RGB-parallel support), frame buffer in PSRAM |
+| Layout | 320×240 | 800×480: every layout constant ×2, fonts ~2× (FreeSans 18/24 pt, big titles 2×-scaled bold 18/24 pt, clock Font 7/8 ×2) |
+| Rotation | 1/3 landscape, 0/2 portrait | **same numbers**: 1/3 = landscape 800×480 (default), 0/2 = portrait 480×800 |
+| Touch | XPT2046 resistive, needs calibration | GT911 capacitive: no calibration. `cal` / `calibrate` answer `{"ok":true,"touch":"capacitive","note":"no calibration needed"}` and change nothing |
+| Backlight | PWM, 0–255 | **on/off only** (CH422G EXIO2 switches the backlight boost converter). `brightness` > 0 = on, 0 = off; the ack adds `"dimmable":false,"backlight":"on"` |
+| Keypad default | 3 pages 4×4 | 2 pages **6×4** with bigger buttons (a layout sent by the host, e.g. `cards/_keypad.json`, still wins and is shown with its own grid) |
+| Serial | CH340/CH9102/CP2102 UART | native USB CDC (`303A:1001`) **and** the CH343 "UART" USB-C port (`1A86:55D3`); the firmware listens on both and answers on both |
+| `board` in ping/hello/ready | `"cyd"` | `"ws-s3-7"` |
+
+**Pins and expander** (sources: [Waveshare wiki](https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-7),
+Waveshare demo [ESP32-S3-Touch-LCD-7-Demo.zip](https://files.waveshare.com/wiki/ESP32-S3-Touch-LCD-7/ESP32-S3-Touch-LCD-7-Demo.zip)
+→ `Arduino/examples/08_DrawColorBar/waveshare_lcd_port.h` and `ESP-IDF/08_lvgl_Porting/main/waveshare_rgb_lcd_port.c`,
+Espressif's [ESP32_Display_Panel board file](https://github.com/esp-arduino-libs/ESP32_Display_Panel/blob/master/src/board/supported/waveshare/BOARD_WAVESHARE_ESP32_S3_TOUCH_LCD_7.h)
+and [CH422G driver](https://github.com/esp-arduino-libs/ESP32_IO_Expander/blob/master/src/port/esp_io_expander_ch422g.c),
+[schematic](https://files.waveshare.com/wiki/ESP32-S3-Touch-LCD-7/ESP32-S3-Touch-LCD-7-Sch.pdf)):
+* RGB: PCLK 7, DE 5, HSYNC 46, VSYNC 3; data D0–D15 = B3–B7 `14 38 18 17 10`, G2–G7 `39 0 45 48 47 21`,
+  R3–R7 `1 2 42 41 40`. 16 MHz pixel clock, HSYNC pulse/back/front 4/8/8, VSYNC 4/8/8, data on the
+  falling PCLK edge (`pclk_active_neg = 1`).
+* I2C (touch + expander): SDA 8, SCL 9 (400 kHz). GT911 at `0x5D` (its INT pin, GPIO 4, is held low
+  during the reset to select that address; touch is then polled).
+* CH422G: `0x24` = mode register (write `0x01`: EXIO0–7 outputs), `0x38` = EXIO output levels.
+  EXIO1 = TP_RST, EXIO2 = backlight enable (DISP), EXIO3 = LCD_RST, EXIO4 = SD_CS, EXIO5 = USB_SEL.
+  **USB_SEL must stay low**: high switches GPIO 19/20 from USB to the CAN transceiver. The firmware
+  writes `0x1E` (backlight on) / `0x1A` (off) exactly like Waveshare's ESP-IDF demo.
+* Flash/PSRAM: built as QIO flash + OPI PSRAM (`qio_opi`), **8 MB flash layout** (`default_8MB.csv`,
+  3.2 MB app slots), so the same image runs on the 8 MB and the 16 MB module.
+
+**Flashing**
+1. **Which USB-C port:** use the port labelled **USB** (native ESP32-S3 USB). It is used for
+   uploading *and* as the cards serial port (shows up as "USB Serial Device" / `USB JTAG/serial debug unit`,
+   VID:PID `303A:1001`; no driver needed on Windows 10/11). The **UART** port (CH343, `1A86:55D3`,
+   needs the WCH CH343 driver on older Windows) also works for flashing and for the cards protocol
+   when the UART DIP switch is on **UART1**.
+2. **Download mode if needed:** if the port does not appear or the upload doesn't start, hold
+   **BOOT**, plug in USB (or tap **RESET**), release BOOT. After flashing press **RESET** (native USB
+   uploads often don't reset the board by themselves).
+3. PlatformIO:
+   ```
+   cd firmware
+   pio run -e waveshare_s3_lcd7 -t upload            # add --upload-port COM7 if needed
+   pio device monitor -e waveshare_s3_lcd7           # {"ready":true,...,"board":"ws-s3-7",...}
+   ```
+4. Or esptool with the prebuilt single-file image (bootloader + partitions + boot_app0 + app,
+   made with `esptool merge_bin`):
+   ```
+   pip install esptool
+   esptool.py --chip esp32s3 --port COM7 --baud 921600 write_flash 0x0 firmware/bin/waveshare_s3_lcd7/merged.bin
+   ```
+   (the separate files are next to it: `bootloader.bin` @ `0x0`, `partitions.bin` @ `0x8000`,
+   `boot_app0.bin` @ `0xe000`, `firmware.bin` @ `0x10000`). A browser flasher such as
+   [ESP Web Tools / esptool-js](https://espressif.github.io/esptool-js/) also works with `merged.bin` at offset `0x0` (Chrome/Edge).
+5. The host tools need no changes: auto-detect includes both Waveshare VID:PIDs, and
+   `--list-displays` shows the board type (`1.4.0 (ws-s3-7)`). Everything else (`--target`, roles,
+   keypad, identify) works as with the CYD.
+
+**Power:** the 7" panel and its backlight draw about 450 mA at 5 V (Waveshare spec) and more at
+start-up. Use a good 5 V / 1 A+ supply or a powered hub port, a short thick USB cable, not a
+bus-powered hub shared with other displays. A brown-out shows up as a reset loop or a flickering
+panel when the backlight switches on. (The board can also run from a single 3.7 V Li-ion cell on
+the PH2.0 connector.)
+
+**Mounting:** the touch version is about 193 × 111 mm (without touch 165 × 98 mm). It fits a
+topper, the backbox side or the coin-door area rather than the lockdown bar. Capacitive touch
+works through the original cover glass; do **not** add an extra glass or acrylic layer on top (it
+stops touch unless it is very thin). Keep the PCB antenna end free of metal (Wi-Fi is not used,
+so this is only relevant if you add it), and leave the USB and BOOT/RESET side reachable.
+
+**Hardware checks still to do**
+* Panel shows a correct, stable image (colours not swapped, no horizontal drift). If the image
+  drifts or flickers, try `cfg.freq_write = 14000000` or `12000000` in `board_ws_s3_lcd7.cpp`;
+  a short glitch while NVS is written (settings saved) is a known ESP32-S3 RGB/PSRAM effect.
+* Backlight on at boot; `--brightness 0` turns it off and any other value back on.
+* GT911 found at `0x5D`; taps and long-press work in landscape **and** portrait (rotation 0/2);
+  keypad swipe works.
+* Serial on the **USB** port and on the **UART** port (DIP switch UART1), both at 115200; a
+  6 KB table push arrives complete; the board does not reset when the host opens the port.
+* Both the 8 MB and the 16 MB module boot the same image.
+
 ## Serial protocol
 
 The link runs at **115200 baud, 8N1**. Each command is **one JSON object per line**, ending in `\n`.
@@ -151,16 +256,16 @@ documents grow on the heap as needed (no fixed document size); a full idle confi
 | table | `{"cmd":"table","title":"Medieval Madness","cards":[{"type":"title","title":"NOW PLAYING","text":"Medieval Madness"},{"type":"instructions","title":"HOW TO PLAY","text":"..."},{"type":"cost","title":"PRICING","text":"1 CREDIT = 25c\n3 BALLS"}]}` | `{"ack":"table","ok":true,"cards":3}` |
 | idle (bare) | `{"cmd":"idle"}` | `{"ack":"idle","ok":true,"screens":8,"clock":false}` |
 | idle (full) | `{"cmd":"idle","ts":1790592987,"cabinet":"Crews Pinball","screens":[{"type":"marquee"},{"type":"clock"}],"selected":"Attack from Mars"}` | `{"ack":"idle","ok":true,"screens":3,"clock":true}` |
-| brightness | `{"cmd":"brightness","value":128}` (0–255) | `{"ack":"brightness","ok":true,"value":128}` |
+| brightness | `{"cmd":"brightness","value":128}` (0–255) | `{"ack":"brightness","ok":true,"value":128}` (Waveshare 7": on/off only, adds `"dimmable":false,"backlight":"on"`) |
 | rotation | `{"cmd":"rotation","value":3}` (0–3) | `{"ack":"rotation","ok":true,"value":3}` |
 | next | `{"cmd":"next"}` | `{"ack":"next","ok":true,"card":1}` |
-| ping / hello | `{"cmd":"ping"}` or `{"cmd":"hello"}` | `{"ack":"ping","ok":true,"fw":"1.3.0","device":"cyd-pinball-cards","mode":"idle","id":"cyd-a1b2c3","name":"Right palm","role":"right","rotation":1,"keypad":true}` (`mode`: idle, table, keypad, calibrate, identify). Firmware 1.2.0 answers `ping` without the identity keys. |
+| ping / hello | `{"cmd":"ping"}` or `{"cmd":"hello"}` | `{"ack":"ping","ok":true,"fw":"1.4.0","device":"cyd-pinball-cards","mode":"idle","board":"cyd","id":"cyd-a1b2c3","name":"Right palm","role":"right","rotation":1,"keypad":true}` (`mode`: idle, table, keypad, calibrate, identify). `board` (1.4.0+): `cyd` or `ws-s3-7`. Firmware 1.2.0 answers `ping` without the identity keys. |
 | identify | `{"cmd":"identify","secs":5}` (1–60, default 5) | `{"ack":"identify","ok":true,"secs":5,"id":...,"name":...,"role":...}`. The board shows a big label with its role, name, id and fw in a role colour, then returns to what it showed. A tap closes it early. |
-| config | `{"cmd":"config","name":"Right palm","role":"right","rotation":1,"keypad":true}` (every key optional; `{"cmd":"config"}` alone just reads) | `{"ack":"config","ok":true,"fw":"1.3.0","id":"cyd-a1b2c3","name":"Right palm","role":"right","rotation":1,"keypad":true}` |
+| config | `{"cmd":"config","name":"Right palm","role":"right","rotation":1,"keypad":true}` (every key optional; `{"cmd":"config"}` alone just reads) | `{"ack":"config","ok":true,"fw":"1.4.0","board":"cyd","id":"cyd-a1b2c3","name":"Right palm","role":"right","rotation":1,"keypad":true}` |
 | set_id | `{"cmd":"set_id","id":"cyd-right"}`, `{"cmd":"set_id","reset":true}` (back to the MAC id); also takes the `config` keys | same as config |
 | keypad | `{"cmd":"keypad"}` (saved/default layout) or `{"cmd":"keypad","layout":{"pages":[...]},"page":0}` | `{"ack":"keypad","ok":true,"pages":3,"page":0}` |
 | keypad exit | `{"cmd":"keypad","exit":true}` (back to the previous screen) | `{"ack":"keypad","ok":true}` |
-| cal | `{"cmd":"cal"}`, `{"cmd":"cal","x_min":200,"x_max":3700,"y_min":240,"y_max":3800}`, `{"cmd":"cal","reset":true}`, `{"cmd":"cal","debug":true}` | `{"ack":"cal","ok":true,"x_min":200,"x_max":3700,"y_min":240,"y_max":3800,"debug":false}` |
+| cal | `{"cmd":"cal"}`, `{"cmd":"cal","x_min":200,"x_max":3700,"y_min":240,"y_max":3800}`, `{"cmd":"cal","reset":true}`, `{"cmd":"cal","debug":true}` | `{"ack":"cal","ok":true,"x_min":200,"x_max":3700,"y_min":240,"y_max":3800,"debug":false}` (capacitive board: `{"ack":"cal","ok":true,"touch":"capacitive",...}`) |
 | calibrate | `{"cmd":"calibrate"}` (on-device, tap 4 crosses) | `{"ack":"calibrate","ok":true}`, later `{"evt":"cal",...}` |
 
 Events the display sends on its own (one JSON object per line, `evt` instead of `ack`):
@@ -176,7 +281,7 @@ Existing host scripts ignore lines without `ack`, so the new events don't distur
 
 * Errors come back as `{"ack":"<cmd>","ok":false,"err":"..."}`, for example on bad JSON, an unknown
   cmd or an out-of-range value.
-* On boot the device prints `{"ready":true,"device":"cyd-pinball-cards","fw":"1.3.0","id":"cyd-a1b2c3","name":"","role":"","rotation":1,"keypad":true}`.
+* On boot the device prints `{"ready":true,"device":"cyd-pinball-cards","fw":"1.4.0","board":"cyd","id":"cyd-a1b2c3","name":"","role":"","rotation":1,"keypad":true}`.
 * **Board identity (1.3.0):** `id` defaults to `cyd-` + the last 3 bytes of the ESP32's factory MAC
   (e.g. `cyd-a1b2c3`), so it is unique per board and survives reflashing. `name` (up to 32 ASCII
   characters), `role` (up to 16, stored in lower case: `right`, `left`, `top`, `bottom`, `center`
@@ -492,7 +597,9 @@ python cyd_push.py "Attack from Mars" --dry-run --target top    # preview what t
   port, 1 s ping timeout), sends each its own messages and closes the ports again.
   `--no-daemon` forces direct serial.
 * Auto-detect uses **every** port whose USB-serial chip matches by VID:PID: CH340 `1A86:7523`,
-  CH9102 `1A86:55D4` or CP210x `10C4:EA60`, and only sends to ports that answer `ping` like a CYD.
+  CH9102 `1A86:55D4` or CP210x `10C4:EA60` (CYD), ESP32-S3 native USB `303A:1001` or CH343
+  `1A86:55D3` (Waveshare 7"), and only sends to ports that answer `ping` like a CYD. Other
+  ESP32-S3 boards also use `303A:1001`; they are skipped because they don't answer the ping.
   Arcade control encoders and light-gun adapters sometimes use the same chips: put their ports in
   `"exclude_ports"` (or `--exclude-port`, env `CYD_EXCLUDE_PORTS=COM9;COM10`), or list the CYD ports
   in `"port"` / `--port`.
@@ -601,7 +708,7 @@ send to every display they find.
 pricing, right = instructions, top = controls. Regenerate with `python docs/multi_display_preview.py`.*
 
 ### Set up
-1. Flash firmware **1.3.0** on every board (`firmware/bin/`). Plug them in, ideally through a powered hub.
+1. Flash firmware **1.3.0 or newer** (1.4.0 in `firmware/bin/`) on every board. Plug them in, ideally through a powered hub.
 2. `python cyd_push.py --list-displays` shows each board with its id (from the ESP32 MAC, e.g.
    `cyd-a1b2c3`), name, role, port and firmware.
 3. `python cyd_push.py --identify` – each display shows a big label (role, name, id) for 5 s, so

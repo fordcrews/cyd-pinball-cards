@@ -436,6 +436,7 @@ class Daemon:
                 self.links[port] = lk
                 self._warned_wait = False
             self.log(f"display {board.label()} connected, fw {board.fw or '?'} mode {board.mode}"
+                     + (f" board {board.hw}" if board.hw else "")
                      + (" (no identity: firmware < 1.3.0, role 'all')" if board.legacy else ""))
             if board.fw and _ver(str(board.fw)) < (1, 2, 0):
                 self.log("warning: firmware older than 1.2.0 has no keypad; flash firmware/bin/firmware.bin")
@@ -542,6 +543,10 @@ class Daemon:
                 lk.submit(lambda: self.send_to(lk, {"cmd": "keypad", "exit": True}, "keypad not enabled here"))
             elif state == "off" and self.setup_running:
                 self.manual_exit = True   # respect the user's EXIT until setup is reopened
+        elif evt == "cal" and obj.get("touch") == "capacitive":
+            self.log(f"{who} has capacitive touch: no calibration needed")
+            if b is not None:
+                b.mode = "unknown"
         elif evt == "cal":
             self.log(f"calibration on {who} {'saved' if obj.get('ok') else 'failed: ' + str(obj.get('err'))}: "
                      f"x {obj.get('x_min')}..{obj.get('x_max')}  y {obj.get('y_min')}..{obj.get('y_max')}")

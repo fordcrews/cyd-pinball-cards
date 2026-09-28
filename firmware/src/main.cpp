@@ -1,5 +1,7 @@
 // CYD Pinball Cards - companion card display for a virtual pinball cabinet
-// Board: ESP32-2432S028R (Cheap Yellow Display)
+// Boards: ESP32-2432S028R (Cheap Yellow Display, env cyd) and Waveshare ESP32-S3-Touch-LCD-7
+// (7" 800x480, env waveshare_s3_lcd7). Board-specific code (display driver, touch, backlight,
+// serial ports) is in board.h / board_cyd.cpp / board_ws_s3_lcd7.cpp; this file is shared.
 //
 // Serial protocol (115200 baud, newline-delimited JSON, one object per line):
 //   {"cmd":"table","title":"Medieval Madness","ts":<local epoch s, optional>,"cards":[{"type":"instructions","title":"Rules","text":"..."}, ...]}
@@ -9,7 +11,7 @@
 //   {"cmd":"brightness","value":0-255}
 //   {"cmd":"rotation","value":0-3}
 //   {"cmd":"next"}        next card / next idle screen / next keypad page
-//   {"cmd":"ping"}  |  {"cmd":"hello"}   reply includes fw, mode and the board identity (id, name, role)
+//   {"cmd":"ping"}  |  {"cmd":"hello"}   reply includes fw, mode, board ("cyd" | "ws-s3-7") and the identity (id, name, role)
 //   {"cmd":"identify"[,"secs":5]}   big on-screen label (role / name / id) for a few seconds
 //   {"cmd":"config"[,"name":"Right palm"][,"role":"right"][,"rotation":0-3][,"keypad":true|false]}
 //   {"cmd":"set_id"[,"id":"cyd-right"|"reset":true][,"name":..][,"role":..]}   same as config, plus the id
@@ -19,22 +21,21 @@
 //   {"cmd":"cal"}  |  {"cmd":"cal","x_min":200,"x_max":3700,"y_min":240,"y_max":3800}  |
 //   {"cmd":"cal","reset":true}  |  {"cmd":"cal","debug":true|false}      touch calibration values
 //   {"cmd":"calibrate"}   on-device 4-point touch calibration (tap the crosshairs)
+//                         (capacitive GT911 board: cal/calibrate are no-ops that report "touch":"capacitive")
 // Events (device -> host, unsolicited):
 //   {"evt":"key","key":"alt+f4"[,"mods":["ctrl","shift","alt","win"]]}   keypad button released
 //   {"evt":"keypad","state":"on"|"off","source":"touch"}   keypad opened (long-press) / EXIT tapped
 //   {"evt":"cal","ok":true,"x_min":..,...}   calibration finished (or "ok":false,"err":...)
 //   {"evt":"touch","raw_x":..,"raw_y":..,"x":..,"y":..}   only while cal debug is on
 // Replies: {"ack":"<cmd>","ok":true[, ...]} or {"ack":"<cmd>","ok":false,"err":"..."}
-// Boot line: {"ready":true,"device":"cyd-pinball-cards","fw":"1.3.0","id":"cyd-a1b2c3","name":"","role":""}
+// Boot line: {"ready":true,"device":"cyd-pinball-cards","fw":"1.4.0","board":"cyd","id":"cyd-a1b2c3","name":"","role":""}
 //
 // "ts" is the host's LOCAL wall-clock time as seconds since 1970-01-01 00:00 (i.e. local time
 // encoded as if it were UTC). The ESP32 has no RTC, so the clock only runs after a host sent it,
 // and it is advanced locally with millis().
 
 #include <Arduino.h>
-#include <SPI.h>
-#include <TFT_eSPI.h>
-#include <XPT2046_Touchscreen.h>
+#include "board.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
 
@@ -75,16 +76,12 @@
 #define IDENTIFY_MS 5000
 #endif
 
-#define FW_VERSION "1.3.0"
-#define BL_CHANNEL 0
+#define FW_VERSION "1.4.0"
 #define MAX_CARDS 8
 #define MAX_IDLE_SCREENS 12
 #define MAX_LINE 6144         // longest accepted JSON line (bytes)
 #define RX_BUFFER (MAX_LINE + 512)  // UART RX ring buffer: a whole line fits even while drawing
 
-TFT_eSPI tft;
-SPIClass touchSpi(VSPI);
-XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
 Preferences prefs;
 
 // ---------- Colours (high contrast) ----------
@@ -178,6 +175,43 @@ struct Identity {
 
 String boardId() { return ident.customId.length() ? ident.customId : ident.macId; }
 
+
+// ---------- Fonts ----------
+// Logical font sizes; the CYD uses them as-is, the 800x480 board uses ~2x larger faces
+// (18/24 pt FreeFonts natively, the big bold titles as 2x-scaled 18/24 pt).
+enum UiFont : uint8_t { F_S9, F_S12, F_SB9, F_SB12, F_SB18, F_SB24, F_SMALL, F_CLOCK7, F_CLOCK8 };
+
+void useFont(UiFont f) {
+#if UI_SCALE == 1
+  tft.setTextSize(1);
+  switch (f) {
+    case F_S9: tft.setFreeFont(&FreeSans9pt7b); break;
+    case F_S12: tft.setFreeFont(&FreeSans12pt7b); break;
+    case F_SB9: tft.setFreeFont(&FreeSansBold9pt7b); break;
+    case F_SB12: tft.setFreeFont(&FreeSansBold12pt7b); break;
+    case F_SB18: tft.setFreeFont(&FreeSansBold18pt7b); break;
+    case F_SB24: tft.setFreeFont(&FreeSansBold24pt7b); break;
+    case F_SMALL: tft.setTextFont(2); break;
+    case F_CLOCK7: tft.setTextFont(7); break;
+    default: tft.setTextFont(8); break;
+  }
+#else
+  uint8_t size = 1;
+  switch (f) {
+    case F_S9: tft.setFont(&FreeSans18pt7b); break;
+    case F_S12: tft.setFont(&FreeSans24pt7b); break;
+    case F_SB9: tft.setFont(&FreeSansBold18pt7b); break;
+    case F_SB12: tft.setFont(&FreeSansBold24pt7b); break;
+    case F_SB18: tft.setFont(&FreeSansBold18pt7b); size = 2; break;
+    case F_SB24: tft.setFont(&FreeSansBold24pt7b); size = 2; break;
+    case F_SMALL: tft.setTextFont(4); break;
+    case F_CLOCK7: tft.setTextFont(7); size = 2; break;
+    default: tft.setTextFont(8); size = 2; break;
+  }
+  tft.setTextSize(size);
+#endif
+}
+
 // ---------- Helpers ----------
 uint16_t headerColourFor(const String &type) {
   if (type == "title") return TFT_RED;
@@ -189,7 +223,7 @@ uint16_t headerColourFor(const String &type) {
 
 void setBrightness(uint8_t v) {
   st.brightness = v;
-  ledcWrite(BL_CHANNEL, v);
+  boardSetBacklight(v);
 }
 
 // Word-wrap text inside a box using the currently selected font.
@@ -278,12 +312,12 @@ int wrapLines(const String &text, int w, String *out, int maxLines) {
 
 // Picks the largest font where the text fits the box.
 void drawFittedText(const String &text, int x, int y, int w, int h, uint16_t colour) {
-  const GFXfont *fonts[] = {&FreeSansBold18pt7b, &FreeSansBold12pt7b, &FreeSans12pt7b, &FreeSans9pt7b};
-  const int lineHs[] = {34, 26, 26, 20};
+  UiFont fonts[] = {F_SB18, F_SB12, F_S12, F_S9};
+  const int lineHs[] = {S(34), S(26), S(26), S(20)};
   tft.setTextColor(colour, COL_BG);
   tft.setTextDatum(TL_DATUM);
   for (int f = 0; f < 4; f++) {
-    tft.setFreeFont(fonts[f]);
+    useFont(fonts[f]);
     int usedH = drawWrapped(text, x, y, w, y + h, lineHs[f], true) - y;
     if (usedH <= h || f == 3) {
       drawWrapped(text, x, y, w, y + h, lineHs[f]);
@@ -296,12 +330,12 @@ void drawFittedText(const String &text, int x, int y, int w, int h, uint16_t col
 // vertical centre is cy. Returns the font height step used.
 int drawCenteredFit(const String &text, int cx, int cy, int w, int h, uint16_t colour, int maxFont = 0,
                     uint16_t shadow = 0) {
-  const GFXfont *fonts[] = {&FreeSansBold24pt7b, &FreeSansBold18pt7b, &FreeSansBold12pt7b, &FreeSans9pt7b};
-  const int lineHs[] = {46, 36, 28, 20};
+  UiFont fonts[] = {F_SB24, F_SB18, F_SB12, F_S9};
+  const int lineHs[] = {S(46), S(36), S(28), S(20)};
   String lines[6];
   int f = maxFont, n = 0;
   for (; f < 4; f++) {
-    tft.setFreeFont(fonts[f]);
+    useFont(fonts[f]);
     n = wrapLines(text, w, lines, 6);
     bool wordSplit = false;  // avoid breaking words mid-way when a smaller font would avoid it
     int ws = 0;
@@ -315,13 +349,13 @@ int drawCenteredFit(const String &text, int cx, int cy, int w, int h, uint16_t c
     if (f == 3) break;
   }
   if (f > 3) f = 3;
-  tft.setFreeFont(fonts[f]);
+  useFont(fonts[f]);
   tft.setTextDatum(MC_DATUM);
   int y = cy - (n * lineHs[f]) / 2 + lineHs[f] / 2;
   for (int i = 0; i < n; i++) {
     if (shadow) {
       tft.setTextColor(shadow);
-      tft.drawString(lines[i], cx + 2, y + 2);
+      tft.drawString(lines[i], cx + S(2), y + S(2));
     }
     tft.setTextColor(colour);
     tft.drawString(lines[i], cx, y);
@@ -333,18 +367,18 @@ int drawCenteredFit(const String &text, int cx, int cy, int w, int h, uint16_t c
 
 void drawHeader(const String &label, uint16_t colour) {
   int W = tft.width();
-  tft.fillRect(0, 0, W, 36, colour);
+  tft.fillRect(0, 0, W, S(36), colour);
   tft.setTextColor(TFT_WHITE, colour);
-  tft.setFreeFont(&FreeSansBold12pt7b);
+  useFont(F_SB12);
   tft.setTextDatum(ML_DATUM);
   String s = label;
-  while (s.length() > 1 && tft.textWidth(s) > W - 60) s.remove(s.length() - 1);
-  tft.drawString(s, 8, 18);
+  while (s.length() > 1 && tft.textWidth(s) > W - S(60)) s.remove(s.length() - 1);
+  tft.drawString(s, S(8), S(18));
   // page indicator
   if (!st.idle && st.cardCount > 1) {
-    tft.setTextFont(2);
+    useFont(F_SMALL);
     tft.setTextDatum(MR_DATUM);
-    tft.drawString(String(st.current + 1) + "/" + String(st.cardCount), W - 8, 18);
+    tft.drawString(String(st.current + 1) + "/" + String(st.cardCount), W - S(8), S(18));
   }
   tft.setTextDatum(TL_DATUM);
 }
@@ -495,38 +529,39 @@ bool screenUsable(const IdleScreen &s) {
 // Title line used by the text-style idle screens: coloured text + underline, shifted with content.
 int drawIdleTitle(const String &label, uint16_t colour) {
   int W = tft.width();
-  if (!label.length()) return 10 + irt.oy;
-  tft.setFreeFont(&FreeSansBold18pt7b);
+  if (!label.length()) return S(10) + irt.oy;
+  useFont(F_SB18);
   String s = label;
-  if (tft.textWidth(s) > W - 24) tft.setFreeFont(&FreeSansBold12pt7b);
-  while (s.length() > 1 && tft.textWidth(s) > W - 24) s.remove(s.length() - 1);
+  if (tft.textWidth(s) > W - S(24)) useFont(F_SB12);
+  while (s.length() > 1 && tft.textWidth(s) > W - S(24)) s.remove(s.length() - 1);
   tft.setTextColor(colour);
   tft.setTextDatum(TC_DATUM);
-  int y = 10 + irt.oy;
+  int y = S(10) + irt.oy;
   tft.drawString(s, W / 2 + irt.ox, y);
   int tw = tft.textWidth(s);
-  tft.fillRect(W / 2 + irt.ox - tw / 2, y + 36, tw, 3, colour);
+  tft.fillRect(W / 2 + irt.ox - tw / 2, y + S(36), tw, S(3), colour);
   tft.setTextDatum(TL_DATUM);
-  return y + 46;
+  return y + S(46);
 }
 
 // ---- marquee: cabinet name with chasing bulbs ----
 int bulbCount() {
   int W = tft.width(), H = tft.height();
-  return 2 * ((W - 12) / 20) + 2 * ((H - 12) / 20);
+  return 2 * ((W - S(12)) / S(20)) + 2 * ((H - S(12)) / S(20));
 }
 
 void bulbPos(int i, int &x, int &y) {
   int W = tft.width(), H = tft.height();
-  int nx = (W - 12) / 20, ny = (H - 12) / 20;
-  int stepX = (W - 12) / nx, stepY = (H - 12) / ny;
-  if (i < nx) { x = 6 + i * stepX; y = 6; return; }
+  int nx = (W - S(12)) / S(20), ny = (H - S(12)) / S(20);
+  int stepX = (W - S(12)) / nx, stepY = (H - S(12)) / ny;
+  const int e0 = S(6), e1 = S(7) - (UI_SCALE - 1);  // bulb centre distance from the edges
+  if (i < nx) { x = e0 + i * stepX; y = e0; return; }
   i -= nx;
-  if (i < ny) { x = W - 7; y = 6 + i * stepY; return; }
+  if (i < ny) { x = W - e1; y = e0 + i * stepY; return; }
   i -= ny;
-  if (i < nx) { x = W - 7 - i * stepX; y = H - 7; return; }
+  if (i < nx) { x = W - e1 - i * stepX; y = H - e1; return; }
   i -= nx;
-  x = 6; y = H - 7 - i * stepY;
+  x = e0; y = H - e1 - i * stepY;
 }
 
 void drawBulbs() {
@@ -535,7 +570,7 @@ void drawBulbs() {
     int x, y;
     bulbPos(i, x, y);
     bool lit = ((i + irt.phase) % 3) == 0;
-    tft.fillCircle(x, y, 4, lit ? COL_GOLD : 0x4100);
+    tft.fillCircle(x, y, S(4), lit ? COL_GOLD : 0x4100);
   }
 }
 
@@ -543,18 +578,20 @@ void drawMarquee(const IdleScreen &s) {
   int W = tft.width(), H = tft.height();
   drawBulbs();
   // inner frame
-  tft.drawRoundRect(16, 16, W - 32, H - 32, 8, COL_RED);
-  tft.drawRoundRect(18, 18, W - 36, H - 36, 7, 0x7800);
+  for (int k = 0; k < UI_SCALE; k++) {
+    tft.drawRoundRect(S(16) + k, S(16) + k, W - S(32) - 2 * k, H - S(32) - 2 * k, S(8), COL_RED);
+    tft.drawRoundRect(S(18) + k, S(18) + k, W - S(36) - 2 * k, H - S(36) - 2 * k, S(7), 0x7800);
+  }
   String name = s.title.length() ? s.title : icfg.cabinet;
   String sub = s.text.length() ? s.text : icfg.subtitle;
-  int cx = W / 2 + irt.ox, cy = H / 2 - 14 + irt.oy;
-  drawCenteredFit(name, cx, cy, W - 56, H - 110, COL_GOLD, 0, COL_RED);
+  int cx = W / 2 + irt.ox, cy = H / 2 - S(14) + irt.oy;
+  drawCenteredFit(name, cx, cy, W - S(56), H - S(110), COL_GOLD, 0, COL_RED);
   if (sub.length()) {
-    tft.setFreeFont(&FreeSansBold12pt7b);
-    if (tft.textWidth(sub) > W - 56) tft.setFreeFont(&FreeSans9pt7b);
+    useFont(F_SB12);
+    if (tft.textWidth(sub) > W - S(56)) useFont(F_S9);
     tft.setTextColor(COL_CYAN);
     tft.setTextDatum(MC_DATUM);
-    tft.drawString(sub, cx, H - 52 + irt.oy);
+    tft.drawString(sub, cx, H - S(52) + irt.oy);
     tft.setTextDatum(TL_DATUM);
   }
 }
@@ -567,14 +604,14 @@ void tickMarquee() {
 // ---- choose: "Pick a table" prompt with sweeping lane arrows ----
 void drawChevrons() {
   int W = tft.width(), H = tft.height();
-  const int n = 7, cw = 26;
-  int x0 = W / 2 - (n * cw) / 2 + irt.ox, y = H - 44 + irt.oy;
+  const int n = 7, cw = S(26);
+  int x0 = W / 2 - (n * cw) / 2 + irt.ox, y = H - S(44) + irt.oy;
   int lit = irt.phase % (n + 3);
   for (int i = 0; i < n; i++) {
     uint16_t c = (i == lit) ? COL_ACCENT : (i == lit - 1 ? 0x7A00 : COL_DARK);
     int x = x0 + i * cw;
-    tft.fillTriangle(x, y - 12, x + 16, y, x, y + 12, c);
-    tft.fillTriangle(x, y - 6, x + 8, y, x, y + 6, COL_BG);
+    tft.fillTriangle(x, y - S(12), x + S(16), y, x, y + S(12), c);
+    tft.fillTriangle(x, y - S(6), x + S(8), y, x, y + S(6), COL_BG);
   }
 }
 
@@ -582,9 +619,9 @@ void drawChoose(const IdleScreen &s) {
   int W = tft.width(), H = tft.height();
   String title = s.title.length() ? s.title : "PICK A TABLE";
   String text = s.text.length() ? s.text : "Now choosing...";
-  drawCenteredFit(title, W / 2 + irt.ox, 70 + irt.oy, W - 30, 100, COL_ACCENT, 0);
+  drawCenteredFit(title, W / 2 + irt.ox, S(70) + irt.oy, W - S(30), S(100), COL_ACCENT, 0);
   tft.setTextColor(COL_TEXT);
-  drawCenteredFit(text, W / 2 + irt.ox, 142 + irt.oy, W - 30, 50, COL_TEXT, 2);
+  drawCenteredFit(text, W / 2 + irt.ox, S(142) + irt.oy, W - S(30), S(50), COL_TEXT, 2);
   drawChevrons();
 }
 
@@ -601,20 +638,20 @@ void drawClockTime(bool full) {
   char hh[4], mm[4];
   snprintf(hh, sizeof hh, icfg.h24 ? "%02d" : "%d", hr);
   snprintf(mm, sizeof mm, "%02d", c.mi);
-  uint8_t font = 8;
-  tft.setTextFont(font);
+  UiFont font = F_CLOCK8;
+  useFont(font);
   int wDigits = tft.textWidth("00"), wColon = tft.textWidth(":");
-  int ampmW = icfg.h24 ? 0 : 44;
-  if (2 * wDigits + wColon + ampmW > W - 20) {
-    font = 7;
-    tft.setTextFont(font);
+  int ampmW = icfg.h24 ? 0 : S(44);
+  if (2 * wDigits + wColon + ampmW > W - S(20)) {
+    font = F_CLOCK7;
+    useFont(font);
     wDigits = tft.textWidth("00");
     wColon = tft.textWidth(":");
   }
-  int fh = tft.fontHeight(font);
+  int fh = tft.fontHeight();
   int total = 2 * wDigits + wColon + ampmW;
   int x0 = W / 2 - total / 2 + irt.ox;
-  int y = 30 + irt.oy;
+  int y = S(30) + irt.oy;
   int colonX = x0 + wDigits;
   if (full || c.mi != irt.lastMinute) {
     tft.setTextColor(COL_TEXT, COL_BG);
@@ -625,33 +662,33 @@ void drawClockTime(bool full) {
     tft.drawString(mm, colonX + wColon, y);
     tft.setTextPadding(0);
     if (!icfg.h24) {
-      tft.setFreeFont(&FreeSansBold12pt7b);
+      useFont(F_SB12);
       tft.setTextColor(COL_ACCENT, COL_BG);
       tft.setTextPadding(ampmW);
-      tft.drawString(c.h < 12 ? "AM" : "PM", colonX + wColon + wDigits + 6, y + fh - 26);
+      tft.drawString(c.h < 12 ? "AM" : "PM", colonX + wColon + wDigits + S(6), y + fh - S(26));
       tft.setTextPadding(0);
     }
     if (full || c.mi != irt.lastMinute) {
       // date lines
       int H = tft.height();
-      tft.fillRect(0, y + fh + 6, W, H - (y + fh + 6), COL_BG);
+      tft.fillRect(0, y + fh + S(6), W, H - (y + fh + S(6)), COL_BG);
       tft.setTextDatum(TC_DATUM);
-      tft.setFreeFont(&FreeSansBold18pt7b);
+      useFont(F_SB18);
       tft.setTextColor(COL_ACCENT);
-      tft.drawString(WDAYS[c.wd], W / 2 + irt.ox, y + fh + 14);
+      tft.drawString(WDAYS[c.wd], W / 2 + irt.ox, y + fh + S(14));
       char date[32];
       snprintf(date, sizeof date, "%s %d, %d", MONTHS[c.mo - 1], c.d, c.y);
-      tft.setFreeFont(&FreeSansBold12pt7b);
+      useFont(F_SB12);
       tft.setTextColor(COL_TEXT);
-      tft.drawString(date, W / 2 + irt.ox, y + fh + 56);
-      tft.setFreeFont(&FreeSans9pt7b);
+      tft.drawString(date, W / 2 + irt.ox, y + fh + S(56));
+      useFont(F_S9);
       tft.setTextColor(COL_DIM);
-      tft.drawString(icfg.cabinet, W / 2 + irt.ox, y + fh + 90);
+      tft.drawString(icfg.cabinet, W / 2 + irt.ox, y + fh + S(90));
       tft.setTextDatum(TL_DATUM);
     }
     irt.lastMinute = c.mi;
   }
-  tft.setTextFont(font);
+  useFont(font);
   tft.setTextColor(irt.colonOn ? COL_TEXT : COL_BG, COL_BG);
   tft.drawString(":", colonX, y);
 }
@@ -671,24 +708,24 @@ void tickClock() {
 void drawRules(const IdleScreen &s, const char *defTitle, uint16_t titleCol) {
   int W = tft.width(), H = tft.height();
   int top = drawIdleTitle(s.title.length() ? s.title : defTitle, titleCol);
-  const int pad = 14;
+  const int pad = S(14);
   tft.setTextColor(COL_TEXT, COL_BG);
   tft.setTextDatum(TL_DATUM);
-  int x = pad + irt.ox, w = W - 2 * pad, maxY = H - 8;
-  tft.setFreeFont(&FreeSansBold12pt7b);
-  int need = drawWrapped(s.text, x, top + 4, w, maxY, 28, true);
+  int x = pad + irt.ox, w = W - 2 * pad, maxY = H - S(8);
+  useFont(F_SB12);
+  int need = drawWrapped(s.text, x, top + S(4), w, maxY, S(28), true);
   if (need > maxY) {
-    tft.setFreeFont(&FreeSans12pt7b);
-    need = drawWrapped(s.text, x, top + 4, w, maxY, 25, true);
+    useFont(F_S12);
+    need = drawWrapped(s.text, x, top + S(4), w, maxY, S(25), true);
     if (need > maxY) {
-      tft.setFreeFont(&FreeSans9pt7b);
-      drawWrapped(s.text, x, top + 2, w, maxY, 20);
+      useFont(F_S9);
+      drawWrapped(s.text, x, top + S(2), w, maxY, S(20));
       return;
     }
-    drawWrapped(s.text, x, top + 4, w, maxY, 25);
+    drawWrapped(s.text, x, top + S(4), w, maxY, S(25));
     return;
   }
-  drawWrapped(s.text, x, top + 4, w, maxY, 28);
+  drawWrapped(s.text, x, top + S(4), w, maxY, S(28));
 }
 
 void drawPricing(const IdleScreen &s) {
@@ -697,9 +734,9 @@ void drawPricing(const IdleScreen &s) {
   String text = s.text.length() ? s.text : "FREE PLAY";
   int lines = 1;
   for (char ch : text) if (ch == '\n') lines++;
-  const GFXfont *big = lines <= 3 ? &FreeSansBold24pt7b : &FreeSansBold12pt7b;
-  int lh = lines <= 3 ? 50 : 30;
-  if (lines == 3) { big = &FreeSansBold18pt7b; lh = 42; }
+  UiFont big = lines <= 3 ? F_SB24 : F_SB12;
+  int lh = lines <= 3 ? S(50) : S(30);
+  if (lines == 3) { big = F_SB18; lh = S(42); }
   int y = top + (H - top - lines * lh) / 2 + lh / 2;
   tft.setTextColor(COL_YELLOW);
   tft.setTextDatum(MC_DATUM);
@@ -707,10 +744,10 @@ void drawPricing(const IdleScreen &s) {
   for (int i = 0; i < lines; i++) {
     int nl = text.indexOf('\n', s0);
     String line = text.substring(s0, nl < 0 ? text.length() : nl);
-    tft.setFreeFont(big);
-    if (tft.textWidth(line) > W - 24) tft.setFreeFont(&FreeSansBold18pt7b);
-    if (tft.textWidth(line) > W - 24) tft.setFreeFont(&FreeSansBold12pt7b);
-    if (tft.textWidth(line) > W - 24) tft.setFreeFont(&FreeSans9pt7b);
+    useFont(big);
+    if (tft.textWidth(line) > W - S(24)) useFont(F_SB18);
+    if (tft.textWidth(line) > W - S(24)) useFont(F_SB12);
+    if (tft.textWidth(line) > W - S(24)) useFont(F_S9);
     tft.drawString(line, W / 2 + irt.ox, y);
     y += lh;
     s0 = nl + 1;
@@ -721,13 +758,14 @@ void drawPricing(const IdleScreen &s) {
 // ---- animation: bouncing pinball with trail, or starfield ----
 #define TRAIL 12
 #define TRAIL_EVERY 3
-#define BALL_R 9
+#define BALL_R S(9)
+#define BALL_SPEED (3.2f * UI_SCALE)
 float ballX, ballY, ballVX, ballVY;
 int16_t trailX[TRAIL], trailY[TRAIL];
 int trailN = 0;
 uint16_t ballHue = 0;
 
-#define STARS 70
+#define STARS (70 * UI_SCALE)
 struct Star { float x, y, z; int16_t px, py; };
 Star stars[STARS];
 
@@ -764,15 +802,15 @@ void drawAnim(const IdleScreen &s) {
     ballX = random(BALL_R + 2, W - BALL_R - 2);
     ballY = random(BALL_R + 2, H - BALL_R - 2);
     float a = random(20, 70) * 0.01745f + (random(4) * 1.5708f);
-    ballVX = 3.2f * cosf(a);
-    ballVY = 3.2f * sinf(a);
+    ballVX = BALL_SPEED * cosf(a);
+    ballVY = BALL_SPEED * sinf(a);
     trailN = 0;
   }
   if (s.text.length()) {  // optional small caption, dim, bottom
-    tft.setFreeFont(&FreeSans9pt7b);
+    useFont(F_S9);
     tft.setTextColor(COL_DIM);
     tft.setTextDatum(BC_DATUM);
-    tft.drawString(s.text, W / 2 + irt.ox, H - 4);
+    tft.drawString(s.text, W / 2 + irt.ox, H - S(4));
     tft.setTextDatum(TL_DATUM);
   }
 }
@@ -783,13 +821,13 @@ void tickAnim(const IdleScreen &s) {
     int cx = W / 2, cy = H / 2;
     for (int i = 0; i < STARS; i++) {
       Star &p = stars[i];
-      if (p.px >= 0) tft.drawRect(p.px, p.py, 2, 2, COL_BG);
+      if (p.px >= 0) tft.fillRect(p.px, p.py, S(2), S(2), COL_BG);
       p.z -= 0.012f;
       if (p.z <= 0.05f) { resetStar(p, false); continue; }
       int sx = cx + (int)(p.x / p.z * cx), sy = cy + (int)(p.y / p.z * cy);
-      if (sx < 0 || sx >= W - 1 || sy < 0 || sy >= H - 1) { resetStar(p, false); continue; }
+      if (sx < 0 || sx >= W - S(1) || sy < 0 || sy >= H - S(1)) { resetStar(p, false); continue; }
       uint8_t v = (uint8_t)constrain((int)((1.0f - p.z) * 255), 40, 255);
-      tft.fillRect(sx, sy, 2, 2, tft.color565(v, v, v));
+      tft.fillRect(sx, sy, S(2), S(2), tft.color565(v, v, v));
       p.px = sx; p.py = sy;
     }
     return;
@@ -799,11 +837,11 @@ void tickAnim(const IdleScreen &s) {
   if (ballX < BALL_R) { ballX = BALL_R; ballVX = fabsf(ballVX); }
   if (ballX > W - 1 - BALL_R) { ballX = W - 1 - BALL_R; ballVX = -fabsf(ballVX); }
   if (ballY < BALL_R) { ballY = BALL_R; ballVY = fabsf(ballVY); }
-  if (ballY > H - 1 - BALL_R - 20) {  // keep the bottom caption row clear
-    ballY = H - 1 - BALL_R - 20; ballVY = -fabsf(ballVY);
+  if (ballY > H - 1 - BALL_R - S(20)) {  // keep the bottom caption row clear
+    ballY = H - 1 - BALL_R - S(20); ballVY = -fabsf(ballVY);
     ballVX += random(-30, 31) / 100.0f;  // small nudge so the path keeps changing
     float sp = sqrtf(ballVX * ballVX + ballVY * ballVY);
-    ballVX *= 3.2f / sp; ballVY *= 3.2f / sp;
+    ballVX *= BALL_SPEED / sp; ballVY *= BALL_SPEED / sp;
   }
   // Trail: a new trail point every TRAIL_EVERY frames (longer comet tail); between samples only
   // the head moves. Erase what moves, then redraw the trail oldest -> newest.
@@ -819,14 +857,14 @@ void tickAnim(const IdleScreen &s) {
   trailX[0] = (int16_t)ballX; trailY[0] = (int16_t)ballY;
   uint16_t tc = hueColour(ballHue);
   for (int i = trailN - 1; i >= 1; i--) {
-    int r = 2 + (BALL_R - 3) * (TRAIL - i) / TRAIL;
-    if (push) tft.fillCircle(trailX[i], trailY[i], r + 1, COL_BG);  // it just shrank
+    int r = S(2) + (BALL_R - S(3)) * (TRAIL - i) / TRAIL;
+    if (push) tft.fillCircle(trailX[i], trailY[i], r + S(1), COL_BG);  // it just shrank
     tft.fillCircle(trailX[i], trailY[i], r, dimColour(tc, TRAIL - i, TRAIL + 2));
   }
   // steel ball with highlight
   tft.fillCircle(trailX[0], trailY[0], BALL_R, 0xC618);
   tft.drawCircle(trailX[0], trailY[0], BALL_R, 0x7BEF);
-  tft.fillCircle(trailX[0] - 3, trailY[0] - 3, 3, TFT_WHITE);
+  tft.fillCircle(trailX[0] - S(3), trailY[0] - S(3), S(3), TFT_WHITE);
 }
 
 // ---- last played / up next ----
@@ -861,19 +899,19 @@ String agoText(uint32_t t) {
 void drawTitledBig(const String &label, uint16_t labelCol, const String &big, const String &l1, const String &l2) {
   int W = tft.width(), H = tft.height();
   int top = drawIdleTitle(label, labelCol);
-  int bottomH = (l1.length() ? 28 : 0) + (l2.length() ? 24 : 0);
-  int boxH = H - top - bottomH - 10;
-  drawCenteredFit(big, W / 2 + irt.ox, top + boxH / 2 + 2, W - 28, boxH, COL_ACCENT, 1);
-  int y = H - bottomH - 6 + irt.oy / 2;
+  int bottomH = (l1.length() ? S(28) : 0) + (l2.length() ? S(24) : 0);
+  int boxH = H - top - bottomH - S(10);
+  drawCenteredFit(big, W / 2 + irt.ox, top + boxH / 2 + S(2), W - S(28), boxH, COL_ACCENT, 1);
+  int y = H - bottomH - S(6) + irt.oy / 2;
   tft.setTextDatum(TC_DATUM);
   if (l1.length()) {
-    tft.setFreeFont(&FreeSansBold12pt7b);
+    useFont(F_SB12);
     tft.setTextColor(COL_TEXT);
     tft.drawString(l1, W / 2 + irt.ox, y);
-    y += 28;
+    y += S(28);
   }
   if (l2.length()) {
-    tft.setFreeFont(&FreeSans9pt7b);
+    useFont(F_S9);
     tft.setTextColor(COL_DIM);
     tft.drawString(l2, W / 2 + irt.ox, y);
   }
@@ -898,8 +936,8 @@ const IdleScreen *curScreen() {
 
 void drawIdleScreen() {
   const IdleScreen &s = *curScreen();
-  irt.ox = SHIFTS[irt.cycle % (sizeof SHIFTS / sizeof SHIFTS[0])][0];
-  irt.oy = SHIFTS[irt.cycle % (sizeof SHIFTS / sizeof SHIFTS[0])][1];
+  irt.ox = S(SHIFTS[irt.cycle % (sizeof SHIFTS / sizeof SHIFTS[0])][0]);
+  irt.oy = S(SHIFTS[irt.cycle % (sizeof SHIFTS / sizeof SHIFTS[0])][1]);
   irt.phase = 0;
   tft.fillScreen(COL_BG);
   switch (s.type) {
@@ -974,29 +1012,29 @@ void drawCard() {
   String hdr = c.title.length() ? c.title : st.tableTitle;
   drawHeader(hdr, headerColourFor(c.type));
 
-  const int pad = 8, top = 44;
+  const int pad = S(8), top = S(44);
   if (c.type == "title") {
     // Big title, wrapped with the largest font that fits
     String t = c.text.length() ? c.text : st.tableTitle;
-    drawFittedText(t, pad, top + 6, W - 2 * pad, H - top - 12, COL_ACCENT);
+    drawFittedText(t, pad, top + S(6), W - 2 * pad, H - top - S(12), COL_ACCENT);
   } else if (c.type == "cost") {
     // Cost card: each line of text as a big row, e.g. "1 CREDIT = 25c\n3 BALLS"
     tft.setTextColor(TFT_YELLOW, COL_BG);
     tft.setTextDatum(MC_DATUM);
     int lines = 1;
     for (char ch : c.text) if (ch == '\n') lines++;
-    tft.setFreeFont(lines <= 3 ? &FreeSansBold18pt7b : &FreeSansBold12pt7b);
-    int lh = lines <= 3 ? 44 : 30;
+    useFont(lines <= 3 ? F_SB18 : F_SB12);
+    int lh = lines <= 3 ? S(44) : S(30);
     int y = top + (H - top - lines * lh) / 2 + lh / 2;
     int s = 0;
     for (int i = 0; i < lines; i++) {
       int nl = c.text.indexOf('\n', s);
       String line = c.text.substring(s, nl < 0 ? c.text.length() : nl);
       // shrink font for this line if it is too wide
-      if (tft.textWidth(line) > W - 2 * pad) tft.setFreeFont(&FreeSansBold12pt7b);
-      if (tft.textWidth(line) > W - 2 * pad) tft.setFreeFont(&FreeSans9pt7b);
+      if (tft.textWidth(line) > W - 2 * pad) useFont(F_SB12);
+      if (tft.textWidth(line) > W - 2 * pad) useFont(F_S9);
       tft.drawString(line, W / 2, y);
-      tft.setFreeFont(lines <= 3 ? &FreeSansBold18pt7b : &FreeSansBold12pt7b);
+      useFont(lines <= 3 ? F_SB18 : F_SB12);
       y += lh;
       s = nl + 1;
     }
@@ -1007,13 +1045,13 @@ void drawCard() {
     tft.setTextDatum(TL_DATUM);
     int len = c.text.length();
     if (len < 160) {
-      tft.setFreeFont(&FreeSansBold12pt7b);
-      drawWrapped(c.text, pad, top + 4, W - 2 * pad, H - 4, 27);
+      useFont(F_SB12);
+      drawWrapped(c.text, pad, top + S(4), W - 2 * pad, H - S(4), S(27));
     } else {
-      tft.setFreeFont(&FreeSans12pt7b);
-      int need = drawWrapped(c.text, pad, top + 4, W - 2 * pad, H - 4, 25, true);
-      if (need > H - 4) tft.setFreeFont(&FreeSans9pt7b);  // long rules: smaller font
-      drawWrapped(c.text, pad, top + 4, W - 2 * pad, H - 4, need > H - 4 ? 20 : 25);
+      useFont(F_S12);
+      int need = drawWrapped(c.text, pad, top + S(4), W - 2 * pad, H - S(4), S(25), true);
+      if (need > H - S(4)) useFont(F_S9);  // long rules: smaller font
+      drawWrapped(c.text, pad, top + S(4), W - 2 * pad, H - S(4), need > H - S(4) ? S(20) : S(25));
     }
   }
 }
@@ -1145,15 +1183,15 @@ void touchToScreen(int rx, int ry, int &sx, int &sy) {
 }
 
 void emitLine(JsonDocument &d) {
-  serializeJson(d, Serial);
-  Serial.println();
+  serializeJson(d, HOST);
+  HOST.println();
 }
 
 // ---------- Keypad (touch mini-keyboard) ----------
 #define MAX_KP_PAGES 6
 #define MAX_KP_KEYS 24
-#define KP_HDR 22           // header bar height
-#define KP_SWIPE_PX 70      // horizontal travel that counts as a page swipe
+#define KP_HDR S(22)        // header bar height
+#define KP_SWIPE_PX S(70)   // horizontal travel that counts as a page swipe
 
 enum KpKind : uint8_t { KK_KEY, KK_ACTION, KK_MOD };
 enum KpAction : uint8_t { KA_NEXT, KA_PREV, KA_EXIT, KA_PAGE };
@@ -1185,6 +1223,7 @@ unsigned long kpFlashMs = 0;
 UiMode calPrevUi = UI_NORMAL;
 
 // Built-in default; cards/_keypad.json (sent by the host) overrides it and is saved to flash.
+#if UI_SCALE == 1
 static const char KP_DEFAULT_LAYOUT[] PROGMEM = R"JSON({"pages":[
 {"title":"BASIC","cols":4,"rows":4,"keys":[
  {"label":"ESC","key":"esc"},{"label":"TAB","key":"tab"},{"label":"@up","key":"up"},{"label":"BKSP","key":"backspace"},
@@ -1200,6 +1239,20 @@ static const char KP_DEFAULT_LAYOUT[] PROGMEM = R"JSON({"pages":[
  {"label":"CTRL","mod":"ctrl"},{"label":"SHIFT","mod":"shift"},{"label":"ALT","mod":"alt"},{"label":"WIN+","mod":"win"},
  {"label":"@prev","action":"prev"},{"label":"ESC","key":"esc"},{"label":"EXIT","action":"exit"},{"label":"@next","action":"next"}]}
 ]})JSON";
+#else
+// 800x480: two 6x4 pages with bigger, more numerous buttons (~130x100 px each in landscape)
+static const char KP_DEFAULT_LAYOUT[] PROGMEM = R"JSON({"pages":[
+{"title":"MAIN","cols":6,"rows":4,"keys":[
+ {"label":"ESC","key":"esc"},{"label":"TAB","key":"tab"},{"label":"F1","key":"f1"},{"label":"@up","key":"up"},{"label":"BKSP","key":"backspace"},{"label":"DEL","key":"delete"},
+ {"label":"ENTER","key":"enter"},{"label":"ALT+TAB","key":"alt+tab"},{"label":"@left","key":"left"},{"label":"@down","key":"down"},{"label":"@right","key":"right"},{"label":"ALT+F4","key":"alt+f4"},
+ {"label":"SPACE","key":"space","w":2},{"label":"F2","key":"f2"},{"label":"F3","key":"f3"},{"label":"F4","key":"f4"},{"label":"F5","key":"f5"},
+ {"label":"CTRL","mod":"ctrl"},{"label":"SHIFT","mod":"shift"},{"label":"ALT","mod":"alt"},{"label":"WIN","key":"win"},{"label":"EXIT","action":"exit"},{"label":"@next","action":"next"}]},
+{"title":"F-KEYS / NAV","cols":6,"rows":4,"keys":[
+ "f1","f2","f3","f4","f5","f6","f7","f8","f9","f10","f11","f12",
+ {"label":"INS","key":"insert"},{"label":"HOME","key":"home"},{"label":"PGUP","key":"pageup"},{"label":"END","key":"end"},{"label":"PGDN","key":"pagedown"},{"label":"WIN+","mod":"win"},
+ {"label":"@prev","action":"prev"},{"label":"ESC","key":"esc"},{"label":"ENTER","key":"enter"},{"label":"CTRL","mod":"ctrl"},{"label":"EXIT","action":"exit"},{"label":"@next","action":"next"}]}
+]})JSON";
+#endif
 
 uint8_t modBitFor(String m) {
   m.toLowerCase();
@@ -1337,8 +1390,8 @@ void kpDrawKey(int idx, bool pressed) {
   }
   if (pressed) { fill = TFT_WHITE; fg = TFT_BLACK; }
   tft.fillRect(x, y, w, h, COL_BG);
-  tft.fillRoundRect(x + 2, y + 2, w - 4, h - 4, 7, fill);
-  tft.drawRoundRect(x + 2, y + 2, w - 4, h - 4, 7, pressed ? COL_ACCENT : dimColour(TFT_WHITE, 1, 3));
+  tft.fillRoundRect(x + S(2), y + S(2), w - S(4), h - S(4), S(7), fill);
+  tft.drawRoundRect(x + S(2), y + S(2), w - S(4), h - S(4), S(7), pressed ? COL_ACCENT : dimColour(TFT_WHITE, 1, 3));
   int cx = x + w / 2, cy = y + h / 2;
   const String &L = k.label;
   if (L.startsWith("@")) {
@@ -1349,7 +1402,7 @@ void kpDrawKey(int idx, bool pressed) {
     if (L == "@right") { drawArrow(cx, cy, 'r', s, fg); return; }
     if (L == "@next" || L == "@prev") {
       char d = L == "@next" ? 'r' : 'l';
-      int s2 = s * 2 / 3, off = s2 / 2 + 2;
+      int s2 = s * 2 / 3, off = s2 / 2 + S(2);
       drawArrow(cx - off, cy, d, s2, fg);
       drawArrow(cx + off, cy, d, s2, fg);
       return;
@@ -1359,13 +1412,13 @@ void kpDrawKey(int idx, bool pressed) {
   tft.setTextDatum(MC_DATUM);
   int nl = L.indexOf('\n');
   if (nl >= 0) {
-    tft.setFreeFont(&FreeSansBold9pt7b);
-    tft.drawString(L.substring(0, nl), cx, cy - 10);
-    tft.drawString(L.substring(nl + 1), cx, cy + 10);
+    useFont(F_SB9);
+    tft.drawString(L.substring(0, nl), cx, cy - S(10));
+    tft.drawString(L.substring(nl + 1), cx, cy + S(10));
   } else {
-    tft.setFreeFont(&FreeSansBold12pt7b);
-    if (tft.textWidth(L) > w - 10 || h < 36) tft.setFreeFont(&FreeSansBold9pt7b);
-    if (tft.textWidth(L) > w - 8) tft.setTextFont(2);
+    useFont(F_SB12);
+    if (tft.textWidth(L) > w - S(10) || h < S(36)) useFont(F_SB9);
+    if (tft.textWidth(L) > w - S(8)) useFont(F_SMALL);
     tft.drawString(L, cx, cy);
   }
   tft.setTextDatum(TL_DATUM);
@@ -1382,13 +1435,13 @@ String kpModText(uint8_t mods) {
 void kpDrawHeader() {
   int W = tft.width();
   tft.fillRect(0, 0, W, KP_HDR, COL_DARK);
-  tft.setTextFont(2);
+  useFont(F_SMALL);
   tft.setTextColor(COL_CYAN);
   tft.setTextDatum(ML_DATUM);
-  tft.drawString(String("KEYPAD ") + kpPages[kpPage].title, 4, KP_HDR / 2);
+  tft.drawString(String("KEYPAD ") + kpPages[kpPage].title, S(4), KP_HDR / 2);
   tft.setTextDatum(MR_DATUM);
   tft.setTextColor(COL_TEXT);
-  tft.drawString(String(kpPage + 1) + "/" + String(kpPageCount), W - 4, KP_HDR / 2);
+  tft.drawString(String(kpPage + 1) + "/" + String(kpPageCount), W - S(4), KP_HDR / 2);
   tft.setTextDatum(MC_DATUM);
   if (kpFlash.length()) {
     tft.setTextColor(COL_GREEN);
@@ -1511,9 +1564,9 @@ void calDrawTarget() {
   tft.fillScreen(COL_BG);
   tft.setTextColor(COL_TEXT);
   tft.setTextDatum(MC_DATUM);
-  tft.setFreeFont(&FreeSansBold12pt7b);
+  useFont(F_SB12);
   tft.drawString("TOUCH CALIBRATION", 160, 90);
-  tft.setFreeFont(&FreeSans9pt7b);
+  useFont(F_S9);
   tft.setTextColor(COL_ACCENT);
   tft.drawString("Tap the centre of the cross (" + String(cal.step + 1) + "/4)", 160, 125);
   tft.setTextColor(COL_DIM);
@@ -1530,7 +1583,7 @@ void calStart() {
   ui = UI_CAL;
   cal.step = 0;
   cal.stepStart = millis();
-  tft.setRotation(1);  // targets are defined in native landscape coordinates
+  boardSetRotation(1);  // targets are defined in native landscape coordinates
   calDrawTarget();
 }
 
@@ -1543,12 +1596,12 @@ void calEnd(bool ok, const char *err) {
   emitLine(e);
   tft.fillScreen(COL_BG);
   tft.setTextDatum(MC_DATUM);
-  tft.setFreeFont(&FreeSansBold12pt7b);
+  useFont(F_SB12);
   tft.setTextColor(ok ? COL_GREEN : COL_RED);
   tft.drawString(ok ? "CALIBRATED" : "CALIBRATION FAILED", 160, 110);
   tft.setTextDatum(TL_DATUM);
   delay(1200);
-  tft.setRotation(st.rotation);
+  boardSetRotation(st.rotation);
   ui = calPrevUi;
   if (ui == UI_KEYPAD) drawKeypad();
   else drawCard();
@@ -1602,20 +1655,20 @@ void drawIdentify() {
   int W = tft.width(), H = tft.height();
   uint16_t col = roleColour(ident.role);
   tft.fillScreen(COL_BG);
-  for (int i = 0; i < 8; i++) tft.drawRect(i, i, W - 2 * i, H - 2 * i, col);
+  for (int i = 0; i < S(8); i++) tft.drawRect(i, i, W - 2 * i, H - 2 * i, col);
   tft.setTextDatum(MC_DATUM);
-  tft.setFreeFont(&FreeSans9pt7b);
+  useFont(F_S9);
   tft.setTextColor(COL_DIM);
-  tft.drawString("THIS DISPLAY IS", W / 2, 24);
+  tft.drawString("THIS DISPLAY IS", W / 2, S(24));
   String r = ident.role.length() ? ident.role : String("no role");
   r.toUpperCase();
-  drawCenteredFit(r, W / 2, H * 40 / 100, W - 36, H * 36 / 100, col, 0, COL_DARK);
+  drawCenteredFit(r, W / 2, H * 40 / 100, W - S(36), H * 36 / 100, col, 0, COL_DARK);
   String n = ident.name.length() ? ident.name : String("(no name set)");
-  drawCenteredFit(n, W / 2, H * 69 / 100, W - 36, 36, COL_TEXT, 2);
-  tft.setFreeFont(&FreeSans9pt7b);
+  drawCenteredFit(n, W / 2, H * 69 / 100, W - S(36), S(36), COL_TEXT, 2);
+  useFont(F_S9);
   tft.setTextColor(COL_ACCENT);
   tft.setTextDatum(MC_DATUM);
-  tft.drawString(boardId() + "   fw " FW_VERSION, W / 2, H - 28);
+  tft.drawString(boardId() + "   fw " FW_VERSION, W / 2, H - S(28));
   tft.setTextDatum(TL_DATUM);
 }
 
@@ -1676,7 +1729,7 @@ bool applyIdentity(JsonDocument &doc, bool allowId, String &err) {
   prefs.end();
   if (hasRot && rot != st.rotation) {
     st.rotation = rot;
-    if (ui != UI_CAL) tft.setRotation(rot);
+    if (ui != UI_CAL) boardSetRotation(rot);
     if (ui == UI_IDENT) drawIdentify();
     else if (ui == UI_KEYPAD) drawKeypad();
     else if (ui == UI_NORMAL) drawCard();
@@ -1687,6 +1740,7 @@ bool applyIdentity(JsonDocument &doc, bool allowId, String &err) {
 }
 
 void addIdentity(JsonDocument &r) {
+  r["board"] = BOARD_KIND;  // fw 1.4.0: "cyd" | "ws-s3-7"
   r["id"] = boardId();
   r["name"] = ident.name;
   r["role"] = ident.role;
@@ -1701,13 +1755,13 @@ void reply(const char *cmd, bool ok, const char *err = nullptr, const char *extr
   r["ok"] = ok;
   if (err) r["err"] = err;
   if (extraKey) r[extraKey] = extraVal;
-  serializeJson(r, Serial);
-  Serial.println();
+  serializeJson(r, HOST);
+  HOST.println();
 }
 
 // Leave keypad / calibration screens (a table or idle push always wins).
 void leaveOverlay() {
-  if (ui == UI_CAL) tft.setRotation(st.rotation);
+  if (ui == UI_CAL) boardSetRotation(st.rotation);
   ui = UI_NORMAL;
   kpPressed = -1;
 }
@@ -1780,19 +1834,29 @@ void handleLine(const String &line) {
     r["ok"] = true;
     r["screens"] = icfg.count;
     r["clock"] = clockValid;
-    serializeJson(r, Serial);
-    Serial.println();
+    serializeJson(r, HOST);
+    HOST.println();
   } else if (!strcmp(cmd, "brightness")) {
     int v = doc["value"] | -1;
     if (v < 0 || v > 255) { reply("brightness", false, "value must be 0-255"); return; }
     setBrightness((uint8_t)v);
     saveSetting("bright", (uint8_t)v);
+#if BACKLIGHT_DIMMABLE
     reply("brightness", true, nullptr, "value", v);
+#else
+    JsonDocument r;  // on/off backlight: any value > 0 = on
+    r["ack"] = "brightness";
+    r["ok"] = true;
+    r["value"] = v;
+    r["dimmable"] = false;
+    r["backlight"] = v ? "on" : "off";
+    emitLine(r);
+#endif
   } else if (!strcmp(cmd, "rotation")) {
     int v = doc["value"] | -1;
     if (v < 0 || v > 3) { reply("rotation", false, "value must be 0-3"); return; }
     st.rotation = v;
-    if (ui != UI_CAL) tft.setRotation(v);  // calibration restores it when done
+    if (ui != UI_CAL) boardSetRotation(v);  // calibration restores it when done
     saveSetting("rot", (uint8_t)v);
     redrawUi();
     reply("rotation", true, nullptr, "value", v);
@@ -1867,6 +1931,16 @@ void handleLine(const String &line) {
     emitLine(r);
   } else if (!strcmp(cmd, "cal")) {
     if (doc["debug"].is<bool>()) touchDebug = doc["debug"].as<bool>();
+#if TOUCH_CAPACITIVE
+    JsonDocument r;  // GT911: factory-calibrated, nothing to set or save
+    r["ack"] = "cal";
+    r["ok"] = true;
+    r["touch"] = "capacitive";
+    r["note"] = "no calibration needed";
+    r["debug"] = touchDebug;
+    emitLine(r);
+    return;
+#endif
     if (doc["reset"] | false) {
       tcal = TouchCal();
       saveCal();
@@ -1880,6 +1954,18 @@ void handleLine(const String &line) {
     }
     replyCal("cal");
   } else if (!strcmp(cmd, "calibrate")) {
+#if TOUCH_CAPACITIVE
+    JsonDocument r;
+    r["ack"] = "calibrate";
+    r["ok"] = true;
+    r["touch"] = "capacitive";
+    r["note"] = "no calibration needed";
+    emitLine(r);
+    JsonDocument e;  // also close the host's "calibrating" state right away
+    e["evt"] = "cal"; e["ok"] = true; e["touch"] = "capacitive";
+    emitLine(e);
+    return;
+#endif
     if (ui == UI_IDENT) ui = identPrevUi;
     calStart();
     reply("calibrate", true);
@@ -1889,8 +1975,8 @@ void handleLine(const String &line) {
 }
 
 void pollSerial() {
-  while (Serial.available()) {
-    char ch = (char)Serial.read();
+  while (HOST.available()) {
+    char ch = (char)HOST.read();
     if (ch == '\r') continue;
     if (ch == '\n') {
       if (rxOverflow) {
@@ -1978,10 +2064,12 @@ void onTouchUp(unsigned long now) {
 
 void pollTouch() {
   unsigned long now = millis();
-  if (ts.touched()) {
-    TS_Point p = ts.getPoint();
-    int sx, sy;
-    touchToScreen(p.x, p.y, sx, sy);
+  TouchSample p;
+  if (boardReadTouch(p)) {
+    int sx = p.x, sy = p.y;
+#if !TOUCH_CAPACITIVE
+    touchToScreen(p.rawX, p.rawY, sx, sy);  // resistive: raw -> screen via the calibration
+#endif
     if (!tch.down) {
       tch.down = true;
       tch.consumed = false;
@@ -1991,7 +2079,7 @@ void pollTouch() {
       tch.sumX = tch.sumY = tch.n = 0;
       if (touchDebug) {
         JsonDocument e;
-        e["evt"] = "touch"; e["raw_x"] = p.x; e["raw_y"] = p.y; e["z"] = p.z; e["x"] = sx; e["y"] = sy;
+        e["evt"] = "touch"; e["raw_x"] = p.rawX; e["raw_y"] = p.rawY; e["z"] = p.z; e["x"] = sx; e["y"] = sy;
         emitLine(e);
       }
       onTouchDown();
@@ -1999,7 +2087,7 @@ void pollTouch() {
       tch.x = sx;
       tch.y = sy;
     }
-    if (p.z >= 600 && now - tch.t0 >= 40) { tch.sumX += p.x; tch.sumY += p.y; tch.n++; }
+    if (p.z >= 600 && now - tch.t0 >= 40) { tch.sumX += p.rawX; tch.sumY += p.rawY; tch.n++; }
     tch.lastSeen = now;
     onTouchHeld(now);
   } else if (tch.down && now - tch.lastSeen > 40) {  // released (debounced)
@@ -2010,10 +2098,8 @@ void pollTouch() {
 
 // ---------- Setup / loop ----------
 void setup() {
-  // Big RX ring buffer (must be set before begin): a full 6 KB line can arrive while a screen
-  // is being drawn without overflowing the default 256-byte UART buffer.
-  Serial.setRxBufferSize(RX_BUFFER);
-  Serial.begin(115200);
+  // Big RX ring buffer (set before begin): a full 6 KB line can arrive while a screen is drawn
+  boardBeginSerial(RX_BUFFER);
   rxLine.reserve(1024);
   randomSeed(esp_random());
 
@@ -2057,18 +2143,9 @@ void setup() {
     if (!deserializeJson(doc, idleCfg)) applyIdleConfig(doc);
   }
 
-  // Backlight PWM (Arduino-ESP32 core 2.x API)
-  ledcSetup(BL_CHANNEL, 5000, 8);
-  ledcAttachPin(TFT_BL, BL_CHANNEL);
-  setBrightness(st.brightness);
-
-  tft.init();
-  tft.setRotation(st.rotation);
-  tft.fillScreen(COL_BG);
-
-  touchSpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
-  ts.begin(touchSpi);
-  ts.setRotation(1);  // always native orientation; touchToScreen() applies the display rotation
+  // Display, backlight and touch controller (board.h): CYD = PWM backlight, TFT_eSPI, XPT2046;
+  // Waveshare 7" = CH422G resets + backlight switch, LovyanGFX RGB panel, GT911
+  boardInitDisplay(st.rotation, st.brightness);
 
   if (!wasIdle && last.length()) {
     JsonDocument doc;

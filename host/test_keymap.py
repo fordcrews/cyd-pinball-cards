@@ -214,6 +214,21 @@ class Layout(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertEqual(json.loads(m.group(1))["pages"], self.cfg["pages"])
 
+    def test_firmware_large_default_layout(self):
+        """The 800x480 board (UI_SCALE > 1) has its own built-in 6x4 default with the same keys."""
+        fw = (HERE.parent / "firmware" / "src" / "main.cpp").read_text(encoding="utf-8")
+        blocks = re.findall(r'R"JSON\((.*?)\)JSON"', fw, re.S)
+        self.assertEqual(len(blocks), 2)
+        pages = json.loads(blocks[1])["pages"]
+        self.assertTrue(all((p["cols"], p["rows"]) == (6, 4) for p in pages))
+        self.assertTrue(all(len(p["keys"]) <= 24 for p in pages))
+        keys = {str(k if isinstance(k, str) else k.get("key") or k.get("mod") or k.get("action")).lower()
+                for pg in pages for k in pg["keys"] if k}
+        need = {"esc", "enter", "tab", "up", "down", "left", "right", "backspace", "space", "alt+f4",
+                "pageup", "pagedown", "home", "end", "delete", "ctrl", "shift", "alt", "win", "next", "exit"}
+        need |= {f"f{n}" for n in range(1, 13)}
+        self.assertEqual(need - keys, set())
+
     def test_required_keys_present(self):
         keys = {str(k if isinstance(k, str) else k.get("key") or k.get("mod") or k.get("action")).lower()
                 for pg in self.cfg["pages"] for k in pg["keys"] if k}
