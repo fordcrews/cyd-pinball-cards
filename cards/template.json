@@ -1,0 +1,10 @@
+{
+  "title": "Table Name Here",
+  "match": ["Table Name Here (Manufacturer Year)", "Alternate Name"],
+  "cards": [
+    { "type": "title", "title": "NOW PLAYING", "text": "Table Name Here" },
+    { "type": "instructions", "title": "HOW TO PLAY", "text": "Short rules text. Keep it to 2-4 sentences per card so it stays readable at arm's length.\nUse \\n for a new paragraph." },
+    { "type": "instructions", "title": "WIZARD MODE", "text": "Optional second rules card." },
+    { "type": "cost", "title": "PRICING", "text": "1 CREDIT = 25c\n3 BALLS\nEXTRA BALL AT 1M" }
+  ]
+}

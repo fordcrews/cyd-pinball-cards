@@ -1,0 +1,9 @@
+{
+  "title": "The Addams Family",
+  "match": ["The Addams Family (Bally 1992)", "Addams Family", "TAF"],
+  "cards": [
+    { "type": "title", "title": "NOW PLAYING", "text": "The Addams Family" },
+    { "type": "instructions", "title": "HOW TO PLAY", "text": "Shoot the Electric Chair and swamp to light Mansion rooms. Complete the Mansion to reach Tour the Mansion.\nUse Thing Flips from the Bear Kick ramp and lock balls in the Bookcase and Vault for multiball." },
+    { "type": "cost", "title": "PRICING", "text": "2 CREDITS = 50c\n3 BALLS" }
+  ]
+}

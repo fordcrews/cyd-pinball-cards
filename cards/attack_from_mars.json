@@ -1,0 +1,9 @@
+{
+  "title": "Attack from Mars",
+  "match": ["Attack from Mars (Bally 1995)", "AFM"],
+  "cards": [
+    { "type": "title", "title": "NOW PLAYING", "text": "Attack from Mars" },
+    { "type": "instructions", "title": "HOW TO PLAY", "text": "Hit the Martian saucer to damage it, then shoot the saucer to destroy it. Each destroyed saucer is a country saved.\nLight Martian Attack, Stroke of Luck and Total Annihilation for huge scores." },
+    { "type": "cost", "title": "PRICING", "text": "1 CREDIT = 25c\n3 BALLS\nREPLAY AT 2 BILLION" }
+  ]
+}

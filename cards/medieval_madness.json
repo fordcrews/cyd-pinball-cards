@@ -1,0 +1,10 @@
+{
+  "title": "Medieval Madness",
+  "match": ["Medieval Madness (Williams 1997)", "MM"],
+  "cards": [
+    { "type": "title", "title": "NOW PLAYING", "text": "Medieval Madness" },
+    { "type": "instructions", "title": "HOW TO PLAY", "text": "Raise the drawbridge and hit the castle gate to smash it open. Shoot through the open gate to destroy the castle.\nLight and play the modes to rescue the princess, fight trolls and defeat the dragon." },
+    { "type": "instructions", "title": "TIPS", "text": "Hit the trolls when they pop up. Destroy castles to build toward Royal Madness. The catapult and Merlin's magic give extra awards." },
+    { "type": "cost", "title": "PRICING", "text": "1 CREDIT = 25c\n3 BALLS" }
+  ]
+}

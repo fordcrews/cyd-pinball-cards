@@ -1,0 +1,7 @@
+{
+  "title": "{{TITLE}}",
+  "cards": [
+    { "type": "title", "title": "NOW PLAYING", "text": "{{TITLE}}" },
+    { "type": "cost", "title": "PRICING", "text": "1 CREDIT = 25c\n3 BALLS" }
+  ]
+}
