@@ -1,0 +1,12 @@
+{
+  "title": "Street Fighter II",
+  "roms": ["sf2", "sf2ua", "sf2ub", "sf2uc", "sf2j", "sf2ce", "sf2hf", "sf2t"],
+  "match": ["Street Fighter II: The World Warrior", "Street Fighter II - The World Warrior"],
+  "systems": ["mame", "fbneo", "arcade", "cps1"],
+  "cards": [
+    { "type": "title", "title": "NOW PLAYING", "text": "Street Fighter II" },
+    { "type": "controls", "title": "CONTROLS", "text": "Stick: walk, jump, crouch. Hold away from the opponent to block.\nTop row: light / medium / heavy PUNCH\nBottom row: light / medium / heavy KICK" },
+    { "type": "moves", "title": "MOTIONS", "text": "QCF: down, down-forward, forward\nDP: forward, down, down-forward\nCharge: hold back 2 s, then forward\nSpecials = motion + punch or kick" },
+    { "type": "credits", "title": "CREDITS", "text": "1 COIN = 1 CREDIT\n2P: PRESS START\nTO CHALLENGE" }
+  ]
+}

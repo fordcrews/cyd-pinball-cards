@@ -1,0 +1,43 @@
+#!/bin/bash
+# CYD cabinet display - Batocera service: starts cyd_daemon (touch keypad -> key presses via
+# /dev/uinput) and shows the idle playlist at boot.
+# Install (no .sh extension!):
+#   cp cyd /userdata/system/services/cyd && chmod +x /userdata/system/services/cyd
+#   batocera-services enable cyd && batocera-services start cyd
+# or toggle it in EmulationStation: System settings > Services.
+# (https://wiki.batocera.org/launch_a_script, "services")
+CYD_HOME="${CYD_HOME:-/userdata/system/cyd-pinball-cards}"
+PIDFILE=/var/run/cyd_daemon.pid
+LOGDIR=/userdata/system/logs
+LOG="$LOGDIR/cyd_daemon.log"
+PY="$(command -v python3 || command -v python)"
+export CYD_DEFAULT_PROFILE=arcade
+
+running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+
+case "$1" in
+  start)
+    mkdir -p "$LOGDIR"
+    modprobe uinput 2>/dev/null            # usually built in; harmless if it is
+    if running; then
+      echo "cyd_daemon already running (pid $(cat "$PIDFILE"))"
+    else
+      nohup "$PY" "$CYD_HOME/host/cyd_daemon.py" --log "$LOG" </dev/null >/dev/null 2>&1 &
+      echo $! > "$PIDFILE"
+      echo "cyd_daemon started (pid $!)"
+    fi
+    # idle playlist + current time once the daemon owns the port
+    ( sleep 5; "$PY" "$CYD_HOME/host/cyd_push.py" --idle -q >>"$LOG" 2>&1 ) </dev/null >/dev/null 2>&1 &
+    ;;
+  stop)
+    if running; then kill "$(cat "$PIDFILE")"; echo "cyd_daemon stopped"; fi
+    rm -f "$PIDFILE"
+    ;;
+  status)
+    if running; then echo "running (pid $(cat "$PIDFILE"))"; else echo "stopped"; fi
+    ;;
+  *)
+    echo "usage: $0 start|stop|status"
+    ;;
+esac
+exit 0

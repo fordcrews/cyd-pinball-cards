@@ -1,31 +1,50 @@
 #!/usr/bin/env python3
-"""
-cyd_push.py - push per-table "cards" to an ESP32 Cheap Yellow Display (CYD)
-running the cyd-pinball-cards firmware.
+r"""
+cyd_push.py - push cards to an ESP32 Cheap Yellow Display (CYD) running the cyd-pinball-cards
+firmware: table/game cards, the idle/attract playlist, the touch keypad. Windows and Linux.
 
-Examples (Windows):
-  python cyd_push.py "Medieval Madness (Williams 1997)"
-  python cyd_push.py medieval_madness.json
-  python cyd_push.py --idle                      (attract playlist from cards/_idle.json + current time)
-  python cyd_push.py --idle --dry-run
+Examples:
+  python cyd_push.py "Medieval Madness (Williams 1997)"        pinball table (PinUP Popper [GAMENAME])
+  python cyd_push.py --rom /userdata/roms/mame/mslug.zip        arcade/console game (system from the path)
+  python cyd_push.py --rom "C:\RetroBat\roms\fbneo\sf2.zip" --game-name "Street Fighter II"
+  python cyd_push.py --rom sf2 --system mame
+  python cyd_push.py --idle                      (attract playlist for the profile + current time)
+  python cyd_push.py --idle --profile arcade     (cards/_idle_arcade.json)
+  python cyd_push.py --idle --rom mslug          (attract playlist + "Up next: Metal Slug")
   python cyd_push.py --browsing "[GAMENAME]"     (attract playlist + "Up next: <table>" screen)
   python cyd_push.py --brightness 128
-  python cyd_push.py "Attack from Mars" --port COM5
+  python cyd_push.py "Attack from Mars" --port COM5          (Linux: --port /dev/ttyUSB0)
   python cyd_push.py "Attack from Mars" --dry-run
   python cyd_push.py --list-ports
-  python cyd_push.py --keypad                    (touch keypad from cards/_keypad.json)
+  python cyd_push.py --show-config               (which config.json / profile / files are used)
+  python cyd_push.py --keypad                    (touch keypad for the profile)
   python cyd_push.py --calibrate                 (on-device touch calibration)
   python cyd_push.py --cal show | reset | 200,3700,240,3800
   python cyd_push.py --ping
 
-Table lookup order (in the cards directory):
+Pinball table lookup (positional name, in the cards directory):
   1. exact filename (with or without .json)
   2. a file whose "match" list or "title" equals the given name (case-insensitive)
   3. normalised name (lowercase, punctuation stripped, "(Manufacturer Year)" removed)
   4. substring match on normalised names
-  5. otherwise _default.json if present, else a generated title-only card
+  5. otherwise the profile's default card (_default.json), else a generated title-only card
 
-If cyd_daemon.py is running it owns the COM port; cyd_push then hands its messages to the daemon
+Arcade/console lookup (--rom, or the positional name with --profile arcade):
+  The ROM may be a full path in any frontend's style (quoted, ES-escaped "Metal\ Slug.zip",
+  Windows or POSIX); path and extension are stripped. The system comes from --system, else from
+  the folder after "roms" in the path (/userdata/roms/mame/x.zip -> mame).
+  1. cards/<rom>.json, or a card whose "roms" list contains the ROM name (honouring an optional
+     "systems" list)
+  2. cards/<system>/<rom>.json (also the canonical system id from cards/_systems.json)
+  3. a card whose title/"match" equals --game-name (normalised, no substring guessing)
+  4. pinball systems (vpinball, fpinball, ...): the pinball lookup above
+  5. cards/_default_arcade.json filled with the game name (pretty-printed ROM name if the frontend
+     gives none), the system's display name and its controls text from cards/_systems.json
+
+Settings come from the command line, else config.json (see config.example.json: profile, cabinet
+name, card/idle/keypad files, serial port, watched processes), else the profile defaults.
+
+If cyd_daemon.py is running it owns the serial port; cyd_push then hands its messages to the daemon
 over 127.0.0.1 (port 47291, env CYD_DAEMON_PORT) and falls back to direct serial when no daemon
 answers. --no-daemon forces direct serial.
 """
@@ -40,7 +59,11 @@ import socket
 import sys
 import time
 import unicodedata
+from dataclasses import dataclass, field
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import serialport  # noqa: E402  (pyserial, or a termios fallback on Linux)
 
 # Known USB-serial bridges used on CYD boards: CH340, CH9102, CP2102
 KNOWN_VID_PID = {
@@ -81,6 +104,110 @@ def log(msg: str, quiet: bool = False) -> None:
         print(msg, file=sys.stderr)
 
 
+# ---------------------------------------------------------------- profiles + config.json
+PROFILES = {
+    "pinball": {"idle": "_idle.json", "keypad": "_keypad.json", "default_card": "_default.json"},
+    "arcade": {"idle": "_idle_arcade.json", "keypad": "_keypad_arcade.json", "default_card": "_default_arcade.json"},
+}
+DEFAULT_PROFILE = "pinball"
+
+
+def find_host_config(path: Path | None = None) -> Path | None:
+    """--config PATH, else env CYD_CONFIG, else config.json next to the script / exe or one folder up."""
+    if path:
+        return path
+    env = os.environ.get("CYD_CONFIG")
+    if env:
+        return Path(env)
+    here = script_dir()
+    for cand in (here / "config.json", here.parent / "config.json"):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def load_host_config(path: Path | None = None) -> tuple[dict, Path | None]:
+    cand = find_host_config(path)
+    if cand is None:
+        return {}, None
+    try:
+        data = load_json(cand)
+        if not isinstance(data, dict):
+            raise ValueError("top level must be an object")
+        return data, cand
+    except (OSError, ValueError) as e:  # json.JSONDecodeError is a ValueError
+        log(f"warning: ignoring config {cand}: {e}")
+        return {}, None
+
+
+@dataclass
+class Settings:
+    profile: str = DEFAULT_PROFILE
+    cards_dir: Path = field(default_factory=lambda: default_cards_dir())
+    idle_path: Path | None = None
+    keypad_path: Path | None = None
+    default_card: str = "_default.json"
+    cabinet: str | None = None
+    subtitle: str | None = None
+    ports: list = field(default_factory=list)
+    watch: list | None = None          # None: take watch_processes from the keypad file
+    key_backend: str = "auto"
+    key_hold_ms: int | None = None
+    config_src: Path | None = None
+    config: dict = field(default_factory=dict)
+
+
+def _cfg_path(value, cards_dir: Path, base: Path | None) -> Path | None:
+    """Config file references: absolute, else relative to cards_dir, else to config.json's folder."""
+    if not value:
+        return None
+    p = Path(str(value)).expanduser()
+    if p.is_absolute():
+        return p
+    for root in (cards_dir, base):
+        if root is not None and (root / p).is_file():
+            return root / p
+    return cards_dir / p
+
+
+def resolve_settings(args) -> Settings:
+    """Command line > config.json > env CYD_DEFAULT_PROFILE (set by the frontend scripts) > pinball."""
+    cfg, src = load_host_config(getattr(args, "config", None))
+    base = src.parent if src else None
+    s = Settings(config=cfg, config_src=src)
+    prof = (getattr(args, "profile", None) or cfg.get("profile")
+            or os.environ.get("CYD_DEFAULT_PROFILE") or DEFAULT_PROFILE)
+    prof = str(prof).lower()
+    if prof not in PROFILES:
+        log(f"warning: unknown profile '{prof}' (use {', '.join(PROFILES)}); using {DEFAULT_PROFILE}")
+        prof = DEFAULT_PROFILE
+    s.profile = prof
+    if getattr(args, "cards_dir", None):
+        s.cards_dir = args.cards_dir
+    elif cfg.get("cards_dir"):
+        p = Path(str(cfg["cards_dir"])).expanduser()
+        s.cards_dir = p if p.is_absolute() or base is None else base / p
+    defaults = PROFILES[prof]
+    s.idle_path = (getattr(args, "idle_config", None) or _cfg_path(cfg.get("idle_config"), s.cards_dir, base)
+                   or s.cards_dir / defaults["idle"])
+    s.keypad_path = (getattr(args, "keypad_config", None) or _cfg_path(cfg.get("keypad_config"), s.cards_dir, base)
+                     or s.cards_dir / defaults["keypad"])
+    s.default_card = str(cfg.get("default_card") or defaults["default_card"])
+    s.cabinet = getattr(args, "cabinet", None) or cfg.get("cabinet") or None
+    s.subtitle = cfg.get("subtitle") or None
+    port = getattr(args, "port", None)
+    if port:
+        s.ports = list(port)
+    elif cfg.get("port"):
+        s.ports = list(cfg["port"]) if isinstance(cfg["port"], list) else [str(cfg["port"])]
+    w = cfg.get("watch_processes")
+    s.watch = [str(x) for x in w] if isinstance(w, list) else None
+    s.key_backend = str(cfg.get("key_backend") or "auto")
+    if cfg.get("key_hold_ms") is not None:
+        s.key_hold_ms = int(cfg["key_hold_ms"])
+    return s
+
+
 # ---------------------------------------------------------------- lookup
 def normalise(name: str) -> str:
     name = Path(name).stem if name.lower().endswith(".json") else name
@@ -96,9 +223,29 @@ def load_json(path: Path) -> dict:
         return json.load(f)
 
 
-def find_table(name: str, cards_dir: Path) -> tuple[dict, Path | None]:
-    files = sorted(p for p in cards_dir.glob("*.json")
-                   if not p.name.startswith("_") and p.name.lower() != "template.json")
+def fill_placeholders(obj, values: dict):
+    """Replace {{KEY}} in every string of a card structure (no JSON re-parsing, so any
+    characters in the values are safe)."""
+    if isinstance(obj, str):
+        for k, v in values.items():
+            obj = obj.replace("{{" + k + "}}", str(v))
+        return obj
+    if isinstance(obj, list):
+        return [fill_placeholders(x, values) for x in obj]
+    if isinstance(obj, dict):
+        return {k: fill_placeholders(v, values) for k, v in obj.items()}
+    return obj
+
+
+def card_files(folder: Path) -> list[Path]:
+    if not folder.is_dir():
+        return []
+    return sorted(p for p in folder.glob("*.json")
+                  if not p.name.startswith("_") and p.name.lower() != "template.json")
+
+
+def find_table(name: str, cards_dir: Path, default_name: str = "_default.json") -> tuple[dict, Path | None]:
+    files = card_files(cards_dir)
 
     # 1. explicit path or filename
     direct = Path(name)
@@ -136,11 +283,13 @@ def find_table(name: str, cards_dir: Path) -> tuple[dict, Path | None]:
         if len(want) >= 4 and any(len(k) >= 4 and (k in want or want in k) for k in keys):
             return d, p
     # 5. fallback
-    default = cards_dir / "_default.json"
+    default = cards_dir / default_name
+    if not default.is_file():
+        default = cards_dir / "_default.json"
     title = re.sub(r"\s*\([^)]*\)\s*", " ", Path(name).stem).strip() or name
     if default.is_file():
-        d = load_json(default)
-        d = json.loads(json.dumps(d).replace("{{TITLE}}", title.replace('"', "'")))
+        d = fill_placeholders(load_json(default), {"TITLE": title, "SYSTEM": "", "CONTROLS": "", "ROM": name})
+        d["cards"] = [c for c in d.get("cards", []) if not isinstance(c, dict) or str(c.get("text", "")).strip()]
         d.setdefault("title", title)
         return d, default
     return {"title": title, "cards": [{"type": "title", "title": "NOW PLAYING", "text": title}]}, None
@@ -163,22 +312,35 @@ def to_ascii(text: str) -> str:
     return text
 
 
+# Card types the host accepts -> the type the firmware draws (1.2.0 knows title, instructions/rules
+# and cost; anything else gets a plain grey header). Arcade cards read better with these colours.
+CARD_TYPE_MAP = {
+    "controls": "instructions", "buttons": "instructions", "howto": "instructions",
+    "moves": "rules", "moveslist": "rules", "move_list": "rules", "specials": "rules", "tips": "rules",
+    "credits": "cost", "credit": "cost", "coins": "cost", "price": "cost", "pricing": "cost",
+}
+
+
 def build_table_msg(data: dict, with_clock: bool = True) -> dict:
     cards = []
     for c in data.get("cards", [])[:8]:
+        if not isinstance(c, dict):
+            continue
+        typ = str(c.get("type", "instructions")).lower()
         cards.append({
-            "type": str(c.get("type", "instructions")),
-            "title": str(c.get("title", "")),
-            "text": str(c.get("text", "")),
+            "type": CARD_TYPE_MAP.get(typ, typ),
+            "title": to_ascii(c.get("title", "")),
+            "text": to_ascii(c.get("text", "")),
         })
-    msg = {"cmd": "table", "title": str(data.get("title", "")), "cards": cards}
+    msg = {"cmd": "table", "title": to_ascii(data.get("title", "")), "cards": cards}
     if with_clock:
         msg["ts"] = local_epoch()  # lets the display remember *when* this table was last played
     return msg
 
 
 def load_idle_config(cards_dir: Path, path: Path | None = None) -> tuple[dict, Path | None]:
-    """Load cards/_idle.json (or an explicit path). Missing file -> {} (firmware defaults)."""
+    """Load cards/_idle.json (or an explicit path, e.g. cards/_idle_arcade.json).
+    Missing file -> {} (firmware defaults)."""
     cand = path or (cards_dir / "_idle.json")
     if cand.is_file():
         try:
@@ -190,11 +352,18 @@ def load_idle_config(cards_dir: Path, path: Path | None = None) -> tuple[dict, P
     return {}, None
 
 
-def build_idle_msg(cfg: dict, selected: str | None = None, with_clock: bool = True) -> dict:
-    """Turn an _idle.json dict into a compact {"cmd":"idle",...} line for the firmware."""
+def build_idle_msg(cfg: dict, selected: str | None = None, with_clock: bool = True,
+                   cabinet: str | None = None, subtitle: str | None = None) -> dict:
+    """Turn an _idle.json dict into a compact {"cmd":"idle",...} line for the firmware.
+    cabinet/subtitle (from config.json or --cabinet) override the file's values."""
     msg: dict = {"cmd": "idle"}
     if with_clock:
         msg["ts"] = local_epoch()
+    cfg = dict(cfg)
+    if cabinet:
+        cfg["cabinet"] = cabinet
+    if subtitle:
+        cfg["subtitle"] = subtitle
     for key in ("cabinet", "subtitle"):
         if key in cfg:
             msg[key] = to_ascii(cfg[key])
@@ -305,6 +474,193 @@ def parse_cal_arg(value: str) -> dict:
     return {"cmd": "cal", "x_min": nums[0], "x_max": nums[1], "y_min": nums[2], "y_max": nums[3]}
 
 
+# ---------------------------------------------------------------- arcade / console ROM lookup
+PINBALL_SYSTEMS = {"vpinball", "vpx", "fpinball", "futurepinball", "pinball", "visualpinball", "zaccariapinball"}
+_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,5}$")
+
+
+@dataclass
+class RomInfo:
+    raw: str
+    path: str          # cleaned path (quotes/escapes removed)
+    stem: str          # file name without folder and extension, e.g. "mslug"
+    system: str | None  # folder after "roms" in the path, e.g. "mame"
+
+
+def clean_rom_arg(value: str) -> str:
+    r"""Undo frontend quoting: surrounding (doubled) quotes, and EmulationStation's backslash
+    escapes on POSIX paths ("/userdata/roms/mame/Metal\ Slug.zip")."""
+    v = str(value).strip()
+    while len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1].strip()
+    v = v.strip('"')
+    if "/" in v and not re.match(r"^[A-Za-z]:\\", v):
+        v = re.sub(r"\\(.)", r"\1", v)            # POSIX path: \X -> X
+    return v
+
+
+def parse_rom(value: str) -> RomInfo:
+    path = clean_rom_arg(value)
+    parts = [p for p in re.split(r"[\\/]+", path) if p]
+    name = parts[-1] if parts else path
+    stem = _EXT_RE.sub("", name)     # ".zip", ".7z", ".chd", ".vpx"; "Dr. Mario" keeps its name
+    system = None
+    lower = [p.lower() for p in parts]
+    for i, p in enumerate(lower[:-1]):
+        if p == "roms" and i + 1 < len(parts) - 1:
+            system = lower[i + 1]                 # .../roms/<system>/[subdir/]game.zip
+    return RomInfo(raw=str(value), path=path, stem=stem.strip(), system=system)
+
+
+def load_systems(cards_dir: Path) -> dict:
+    p = cards_dir / "_systems.json"
+    if p.is_file():
+        try:
+            d = load_json(p)
+            if isinstance(d, dict):
+                return d
+        except (OSError, ValueError) as e:
+            log(f"warning: ignoring {p}: {e}")
+    return {"systems": {}, "aliases": {}, "controls_by_kind": {}}
+
+
+def canon_system(system: str | None, systems: dict) -> str | None:
+    if not system:
+        return None
+    s = str(system).strip().lower()
+    return str(systems.get("aliases", {}).get(s, s)).lower()
+
+
+def system_info(system: str | None, systems: dict) -> dict:
+    """{'id','name','kind','controls'} for a system id (unknown ids get a generic entry)."""
+    cid = canon_system(system, systems)
+    entry = dict(systems.get("systems", {}).get(cid or "", {})) if cid else {}
+    kind = entry.get("kind") or ("arcade" if cid is None else "console")
+    controls = entry.get("controls")
+    if controls is None:
+        controls = systems.get("controls_by_kind", {}).get(kind, "")
+    name = entry.get("name") or (cid.upper() if cid and len(cid) <= 4 else (cid or "").title())
+    return {"id": cid, "name": name, "kind": kind, "controls": controls}
+
+
+def pretty_rom_name(stem: str) -> str:
+    """'mslug' -> 'MSLUG', 'street_fighter_ii' -> 'Street Fighter II', 'Metal Slug (World)' ->
+    'Metal Slug'. Short MAME-style set names are upper-cased (there is no name database here;
+    frontends pass the real game name, which wins)."""
+    s = re.sub(r"\s*[\(\[][^)\]]*[\)\]]", "", stem).strip() or stem
+    s = s.replace("_", " ").replace(".", " ").strip()
+    s = " ".join(s.split())
+    m = re.match(r"^(.*), (The|A|An)\b(.*)$", s)      # "Legend of Zelda, The" -> "The Legend of Zelda"
+    if m:
+        s = f"{m.group(2)} {m.group(1)}{m.group(3)}"
+    if " " not in s and s.isalnum() and s.lower() == s and len(s) <= 8:
+        return s.upper()
+    if s.lower() == s:
+        words = []
+        for w in s.split():
+            words.append(w.upper() if re.fullmatch(r"[ivx]+|\d+[a-z]*", w) else w.capitalize())
+        return " ".join(words)
+    return s
+
+
+def _card_allows_system(d: dict, sys_ids: set) -> bool:
+    allowed = d.get("systems")
+    if not allowed or not sys_ids:
+        return True
+    return bool({str(x).lower() for x in allowed} & sys_ids)
+
+
+def find_rom_card(rom: str, cards_dir: Path, system: str | None = None, game_name: str | None = None,
+                  rom_name: str | None = None, default_name: str = "_default_arcade.json"
+                  ) -> tuple[dict, Path | None, dict]:
+    """Card for an arcade/console game. Returns (card data, source file or None, info) where info
+    has rom, system (id), system_name, title and how it matched."""
+    systems = load_systems(cards_dir)
+    info = parse_rom(rom)
+    stem = (rom_name or "").strip() or info.stem
+    raw_sys = (system or "").strip().lower() or info.system
+    if raw_sys is None:   # no roms/ folder in the path: accept the parent folder if it is a known system
+        parts = [p for p in re.split(r"[\\/]+", info.path) if p]
+        if len(parts) >= 2:
+            cand = parts[-2].lower()
+            if cand in systems.get("systems", {}) or cand in systems.get("aliases", {}):
+                raw_sys = cand
+    sysd = system_info(raw_sys, systems)
+    sys_ids = {x for x in (raw_sys, sysd["id"]) if x}
+    key = stem.lower()
+    out = {"rom": stem, "system": sysd["id"], "system_name": sysd["name"] if raw_sys else "",
+           "match": None}
+
+    def result(d: dict, src: Path | None, how: str):
+        out["match"] = how
+        out["title"] = str(d.get("title") or game_name or pretty_rom_name(stem))
+        return d, src, out
+
+    loaded = []
+    for p in card_files(cards_dir):
+        try:
+            loaded.append((p, load_json(p)))
+        except (OSError, ValueError) as e:
+            log(f"warning: skipping {p.name}: {e}")
+    # 1. cards/<rom>.json or "roms": [...]
+    if key:
+        for p, d in loaded:
+            if p.stem.lower() == key and _card_allows_system(d, sys_ids):
+                return result(d, p, "rom file")
+        for p, d in loaded:
+            roms = [str(r).lower() for r in d.get("roms", [])]
+            if key in roms and _card_allows_system(d, sys_ids):
+                return result(d, p, "roms list")
+    # 2. cards/<system>/<rom>.json
+    for sid in [s for s in (raw_sys, sysd["id"]) if s]:
+        folder = cards_dir / sid
+        for p in card_files(folder):
+            try:
+                d = load_json(p)
+            except (OSError, ValueError):
+                continue
+            if p.stem.lower() == key or key in [str(r).lower() for r in d.get("roms", [])]:
+                return result(d, p, f"{sid}/ folder")
+    # 3. game name from the frontend == card title / match alias
+    if game_name:
+        want = normalise(game_name)
+        for p, d in loaded:
+            keys = {normalise(d.get("title", ""))} | {normalise(a) for a in d.get("match", [])}
+            if want and want in keys and _card_allows_system(d, sys_ids):
+                return result(d, p, "game name")
+    # 4. pinball systems behave like PinUP Popper tables
+    if sys_ids & PINBALL_SYSTEMS or sysd["kind"] == "pinball":
+        d, src = find_table(game_name or stem, cards_dir)
+        if src is not None and not src.name.startswith("_"):
+            return result(d, src, "pinball table")
+    # 5. default arcade card
+    title = (game_name or "").strip() or pretty_rom_name(stem)
+    values = {"TITLE": title, "SYSTEM": out["system_name"], "CONTROLS": sysd["controls"] or "", "ROM": stem}
+    default = cards_dir / default_name
+    if default.is_file():
+        d = fill_placeholders(load_json(default), values)
+        d["cards"] = [c for c in d.get("cards", []) if not isinstance(c, dict) or str(c.get("text", "")).strip()]
+        d["title"] = d.get("title") or title
+        out["match"] = "default"
+        out["title"] = title
+        return d, default, out
+    d = {"title": title, "cards": [{"type": "title", "title": "NOW PLAYING", "text": title}]}
+    if out["system_name"]:
+        d["cards"].append({"type": "instructions", "title": "SYSTEM", "text": out["system_name"]})
+    out["match"] = "generated"
+    out["title"] = title
+    return d, None, out
+
+
+def rel_name(src: Path | None, cards_dir: Path) -> str:
+    if src is None:
+        return "(generated card)"
+    try:
+        return src.relative_to(cards_dir).as_posix()
+    except ValueError:
+        return str(src)
+
+
 def pretty_table_name(name: str, cards_dir: Path) -> str:
     """Title for the "Up next" screen: the card file's title if one matches, else the cleaned name."""
     data, src = find_table(name, cards_dir)
@@ -315,15 +671,20 @@ def pretty_table_name(name: str, cards_dir: Path) -> str:
 
 # ---------------------------------------------------------------- serial
 def list_ports():
-    from serial.tools import list_ports as lp
-    return list(lp.comports())
+    return serialport.list_ports()
 
 
 def find_port(side: str | None = None) -> str | None:
     """Return the first port matching a known CYD USB bridge.
     If side is given, prefer a port whose serial number matches the env var
     CYD_SERIAL_<SIDE> (e.g. CYD_SERIAL_RIGHT)."""
-    ports = [p for p in list_ports() if (p.vid, p.pid) in KNOWN_VID_PID]
+    allp = list_ports()
+    ports = [p for p in allp if (p.vid, p.pid) in KNOWN_VID_PID]
+    if not ports and sys.platform.startswith("linux"):
+        # no VID/PID info at all (sysfs not readable): a single ttyUSB/ttyACM is taken as the CYD
+        unknown = [p for p in allp if p.vid is None and re.search(r"tty(USB|ACM)\d+$", p.device)]
+        if len(unknown) == 1:
+            return unknown[0].device
     if side:
         want = os.environ.get(f"CYD_SERIAL_{side.upper()}")
         if want:
@@ -334,19 +695,9 @@ def find_port(side: str | None = None) -> str | None:
 
 
 def open_serial(port: str, timeout: float = 0.2):
-    """Open the CYD port with DTR/RTS held low so opening it does not reset the ESP32."""
-    import serial
-    ser = serial.Serial()
-    ser.port = port
-    ser.baudrate = BAUD
-    ser.timeout = timeout
-    try:
-        ser.dtr = False
-        ser.rts = False
-    except (OSError, serial.SerialException):  # some virtual ports (PTYs) have no modem lines
-        pass
-    ser.open()
-    return ser
+    """Open the CYD port with DTR/RTS held low so opening it does not reset the ESP32
+    (pyserial when installed, else the termios fallback on Linux)."""
+    return serialport.open_serial(port, BAUD, timeout)
 
 
 # ---------------------------------------------------------------- daemon hand-off
@@ -401,59 +752,109 @@ def send(port: str, messages: list[dict], timeout: float, quiet: bool) -> bool:
 
 
 # ---------------------------------------------------------------- main
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Push pinball table cards to a CYD display.")
-    ap.add_argument("table", nargs="?", help="table name (e.g. Popper [GAMENAME]) or JSON filename")
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="Push pinball/arcade cards to a CYD display (Windows and Linux).")
+    ap.add_argument("table", nargs="?",
+                    help="pinball table name (e.g. Popper [GAMENAME]) or JSON filename; with --profile arcade a ROM")
+    ap.add_argument("--rom", metavar="PATH_OR_NAME",
+                    help="arcade/console game: ROM path or name as the frontend passes it (path/extension are stripped)")
+    ap.add_argument("--system", help="system id (mame, fbneo, snes, ...); default: folder after 'roms' in the ROM path")
+    ap.add_argument("--game-name", metavar="NAME", help="game name from the frontend (shown when no card matches)")
+    ap.add_argument("--rom-name", metavar="NAME",
+                    help="ROM file name without extension (ES %%rom_name%%), used instead of the one in --rom")
+    ap.add_argument("--profile", choices=sorted(PROFILES), help="pinball (default) or arcade: picks the idle/keypad/default files")
+    ap.add_argument("--config", type=Path, default=None,
+                    help="host config JSON (default: env CYD_CONFIG, else config.json next to host/ or the kit root)")
+    ap.add_argument("--cabinet", help="cabinet name on the idle screens (overrides the idle file / config.json)")
+    ap.add_argument("--show-config", action="store_true", help="print the resolved settings and exit")
     ap.add_argument("--idle", action="store_true",
-                    help="show the idle/attract playlist (config from cards/_idle.json, plus current time)")
+                    help="show the idle/attract playlist (profile's idle file, plus current time)")
     ap.add_argument("--browsing", metavar="TABLE",
                     help="idle playlist plus an 'Up next: TABLE' screen (for a Popper selection hook, if you have one)")
-    ap.add_argument("--idle-config", type=Path, default=None, help="idle config JSON (default: cards/_idle.json)")
+    ap.add_argument("--idle-config", type=Path, default=None,
+                    help="idle config JSON (default: cards/_idle.json, arcade profile: cards/_idle_arcade.json)")
     ap.add_argument("--bare-idle", action="store_true",
                     help='send only {"cmd":"idle"} (keeps the config already saved on the display)')
     ap.add_argument("--no-clock", action="store_true", help="do not send the PC's local time")
     ap.add_argument("--brightness", type=int, metavar="0-255", help="set backlight brightness")
     ap.add_argument("--port", action="append",
-                    help="COM port (repeatable, e.g. --port COM5 --port COM6 for two displays)")
+                    help="serial port (repeatable: --port COM5 --port COM6; Linux: /dev/ttyUSB0)")
     ap.add_argument("--side", help="pick port by env var CYD_SERIAL_<SIDE> serial number (e.g. right, left)")
-    ap.add_argument("--cards-dir", type=Path, default=None, help="folder with table JSON files")
+    ap.add_argument("--cards-dir", type=Path, default=None, help="folder with card JSON files")
     ap.add_argument("--dry-run", action="store_true", help="print the JSON that would be sent; no serial I/O")
     ap.add_argument("--list-ports", action="store_true", help="list serial ports and exit")
-    ap.add_argument("--keypad", action="store_true", help="open the touch keypad (layout from cards/_keypad.json)")
-    ap.add_argument("--keypad-config", type=Path, default=None, help="keypad layout JSON (default: cards/_keypad.json)")
+    ap.add_argument("--keypad", action="store_true", help="open the touch keypad (layout from the profile's keypad file)")
+    ap.add_argument("--keypad-config", type=Path, default=None,
+                    help="keypad layout JSON (default: cards/_keypad.json, arcade profile: cards/_keypad_arcade.json)")
     ap.add_argument("--keypad-page", type=int, default=None, help="open the keypad on this page (0-based)")
     ap.add_argument("--calibrate", action="store_true", help="start the on-device touch calibration (tap 4 crosses)")
     ap.add_argument("--cal", metavar="VALUES",
                     help="touch calibration: show | reset | debug | nodebug | x_min,x_max,y_min,y_max")
     ap.add_argument("--ping", action="store_true", help="ask the display for its firmware version and mode")
-    ap.add_argument("--no-daemon", action="store_true", help="never hand off to cyd_daemon; open the COM port directly")
+    ap.add_argument("--no-daemon", action="store_true", help="never hand off to cyd_daemon; open the port directly")
     ap.add_argument("--timeout", type=float, default=3.0, help="seconds to wait for each ack")
     ap.add_argument("-q", "--quiet", action="store_true")
+    return ap
+
+
+def main(argv=None) -> int:
+    ap = build_parser()
     args = ap.parse_args(argv)
+    st = resolve_settings(args)
+    cards_dir = st.cards_dir
+
+    if args.show_config:
+        print(json.dumps({
+            "config": str(st.config_src) if st.config_src else None, "profile": st.profile,
+            "cards_dir": str(cards_dir), "idle_config": str(st.idle_path), "keypad_config": str(st.keypad_path),
+            "default_card": st.default_card, "cabinet": st.cabinet, "ports": st.ports or "auto-detect",
+            "watch_processes": st.watch, "key_backend": st.key_backend, "serial": serialport.backend_name(),
+        }, indent=2))
+        return 0
 
     if args.list_ports:
-        for p in list_ports():
+        try:
+            ports = list_ports()
+        except RuntimeError as e:
+            log(f"error: {e}")
+            return 2
+        for p in ports:
             tag = KNOWN_VID_PID.get((p.vid, p.pid), "")
             vp = f"{p.vid:04X}:{p.pid:04X}" if p.vid is not None else "----:----"
-            print(f"{p.device:10} {vp}  {tag:7} serial={p.serial_number}  {p.description}")
+            print(f"{p.device:14} {vp}  {tag:7} serial={p.serial_number}  {p.description}")
         return 0
+
+    rom = args.rom
+    if rom is None and args.table and st.profile == "arcade":
+        rom = args.table
 
     messages: list[dict] = []
     if args.brightness is not None:
         if not 0 <= args.brightness <= 255:
             ap.error("--brightness must be 0-255")
         messages.append({"cmd": "brightness", "value": args.brightness})
-    cards_dir = args.cards_dir or default_cards_dir()
     if args.bare_idle:
         messages.append({"cmd": "idle"})
     elif args.idle or args.browsing:
-        cfg, src = load_idle_config(cards_dir, args.idle_config)
-        selected = pretty_table_name(args.browsing, cards_dir) if args.browsing else None
-        log(f"idle config -> {src if src else '(none: firmware defaults)'}"
+        cfg, src = load_idle_config(cards_dir, st.idle_path)
+        selected = None
+        if args.browsing:
+            selected = pretty_table_name(args.browsing, cards_dir)
+        elif rom:
+            selected = find_rom_card(rom, cards_dir, args.system, args.game_name, args.rom_name,
+                                     st.default_card if st.profile == "arcade" else "_default_arcade.json")[2]["title"]
+        log(f"idle config -> {src if src else '(none: firmware defaults)'} [profile {st.profile}]"
             + (f"; up next: {selected}" if selected else ""), args.quiet)
-        messages.append(build_idle_msg(cfg, selected, with_clock=not args.no_clock))
+        messages.append(build_idle_msg(cfg, selected, with_clock=not args.no_clock,
+                                       cabinet=st.cabinet, subtitle=st.subtitle))
+    elif rom:
+        default = st.default_card if st.profile == "arcade" else "_default_arcade.json"
+        data, src, info = find_rom_card(rom, cards_dir, args.system, args.game_name, args.rom_name, default)
+        log(f"rom '{info['rom']}' system={info['system'] or '?'} -> {rel_name(src, cards_dir)} ({info['match']})",
+            args.quiet)
+        messages.append(build_table_msg(data, with_clock=not args.no_clock))
     elif args.table:
-        data, src = find_table(args.table, cards_dir)
+        data, src = find_table(args.table, cards_dir, st.default_card)
         log(f"table '{args.table}' -> {src.name if src else '(generated title card)'}", args.quiet)
         messages.append(build_table_msg(data, with_clock=not args.no_clock))
     if args.cal is not None:
@@ -464,13 +865,13 @@ def main(argv=None) -> int:
     if args.calibrate:
         messages.append({"cmd": "calibrate"})
     if args.keypad:
-        kcfg, ksrc = load_keypad_config(cards_dir, args.keypad_config)
+        kcfg, ksrc = load_keypad_config(cards_dir, st.keypad_path)
         log(f"keypad layout -> {ksrc if ksrc else '(none: firmware default layout)'}", args.quiet)
         messages.append(build_keypad_msg(kcfg, args.keypad_page))
     if args.ping:
         messages.append({"cmd": "ping"})
     if not messages:
-        ap.error("give a table name, --idle, --browsing, --keypad, --calibrate, --cal, --ping or --brightness")
+        ap.error("give a table name, --rom, --idle, --browsing, --keypad, --calibrate, --cal, --ping or --brightness")
 
     too_big = False
     for m in messages:
@@ -491,12 +892,12 @@ def main(argv=None) -> int:
     if too_big:
         return 1
 
-    ports = args.port or []
+    ports = list(st.ports)
     rc = 0
     if not args.no_daemon:
-        st = daemon_request({"op": "status"}, timeout=2.0)
-        if st and st.get("connected"):
-            dport = str(st.get("port") or "")
+        dst = daemon_request({"op": "status"}, timeout=2.0)
+        if dst and dst.get("connected"):
+            dport = str(dst.get("port") or "")
             if not ports or any(p.lower() == dport.lower() for p in ports):
                 r = daemon_request({"op": "send", "messages": messages, "timeout": args.timeout},
                                    timeout=args.timeout * len(messages) + 3)
@@ -511,13 +912,17 @@ def main(argv=None) -> int:
                     ports = [p for p in ports if p.lower() != dport.lower()]
                     if not ports:
                         return rc
-        elif st:
-            log(f"daemon running but not connected to a display ({st.get('port') or 'no port'}); trying directly",
+        elif dst:
+            log(f"daemon running but not connected to a display ({dst.get('port') or 'no port'}); trying directly",
                 args.quiet)
     if not ports:
-        p = find_port(args.side)
+        try:
+            p = find_port(args.side)
+        except RuntimeError as e:   # no pyserial on Windows
+            log(f"error: {e}")
+            return 2
         if not p:
-            log("error: no CYD found (CH340/CH9102/CP210x). Use --port COMx or --list-ports.")
+            log("error: no CYD found (CH340/CH9102/CP210x). Use --port (COMx or /dev/ttyUSBx) or --list-ports.")
             return 2
         ports = [p]
 
@@ -525,7 +930,7 @@ def main(argv=None) -> int:
         try:
             if not send(port, messages, args.timeout, args.quiet):
                 rc = 1
-        except Exception as e:  # serial errors must never break a Popper launch
+        except Exception as e:  # serial errors must never break a frontend's launch
             log(f"error on {port}: {e}")
             rc = 1
     return rc

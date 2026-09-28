@@ -1,0 +1,19 @@
+{
+  "_comment": "Arcade idle/attract playlist: cyd_push.py --idle --profile arcade (or \"profile\": \"arcade\" in config.json). Same format as _idle.json. Keys starting with _ are ignored. ASCII text only. Durations are seconds. The cabinet name can also be set in config.json (\"cabinet\") without editing this file.",
+  "cabinet": "Crews Arcade",
+  "subtitle": "ARCADE CLASSICS",
+  "duration": 10,
+  "clock_24h": false,
+  "auto_idle_min": 0,
+  "screens": [
+    { "type": "marquee", "duration": 12 },
+    { "type": "choose", "title": "PICK A GAME", "text": "Insert coin...", "duration": 10 },
+    { "type": "clock", "duration": 10 },
+    { "type": "rules", "title": "HOUSE RULES", "text": "Winner stays on.\nNo drinks on the control panel.\nLet the next player in.", "duration": 12 },
+    { "type": "pricing", "title": "PRICING", "text": "FREE PLAY\nPRESS 1P START", "duration": 8 },
+    { "type": "anim", "style": "stars", "duration": 20 },
+    { "type": "last_played", "title": "LAST PLAYED", "duration": 8 },
+    { "type": "anim", "style": "pinball", "duration": 15, "enabled": false },
+    { "type": "up_next", "title": "UP NEXT", "text": "Press 1P START", "duration": 10 }
+  ]
+}

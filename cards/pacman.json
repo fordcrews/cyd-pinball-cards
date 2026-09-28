@@ -1,0 +1,12 @@
+{
+  "title": "Pac-Man",
+  "roms": ["pacman", "puckman", "pacmanf"],
+  "match": ["Pac-Man (Midway)", "Puck Man"],
+  "systems": ["mame", "fbneo", "arcade"],
+  "cards": [
+    { "type": "title", "title": "NOW PLAYING", "text": "Pac-Man" },
+    { "type": "controls", "title": "CONTROLS", "text": "Joystick only: steer through the maze.\nNo buttons needed. Push the stick early to take a corner." },
+    { "type": "instructions", "title": "HOW TO PLAY", "text": "Clear every dot to finish the board.\nA power pellet turns the ghosts blue for a moment: eat them for rising points.\nGrab the bonus fruit." },
+    { "type": "credits", "title": "CREDITS", "text": "1 COIN = 1 CREDIT\n2 PLAYERS TAKE TURNS" }
+  ]
+}

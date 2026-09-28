@@ -1,0 +1,42 @@
+{
+  "_comment": "Arcade touch keypad: cyd_push.py --keypad --profile arcade, or long-press the display. Same format as _keypad.json. Keys are MAME and RetroArch default keyboard bindings (MAME docs 'Default Keyboard Controls'; RetroArch retroarch.cfg defaults). Frontends can rebind them (Batocera and RetroBat generate emulator configs), so check on your cabinet. Controller hotkey combos and their keyboard equivalents: HOTKEY/SELECT+START = exit -> ESC (RetroArch input_exit_emulator; MAME exit). HOTKEY+X/menu -> F1 (RetroArch menu) or TAB (MAME menu). Save/load state -> F2/F4 (RetroArch), F6/F7 (MAME, then pick a slot), Shift+F6/Shift+F7 (MAME quick save/load). Pause -> P (RetroArch), F5 (current MAME; old MAME builds used P). watch_processes is empty: on arcade cabinets open the keypad by long-press (2 s) instead of a process watch.",
+  "watch_processes": [],
+  "pages": [
+    {
+      "title": "ARCADE", "cols": 4, "rows": 4,
+      "keys": [
+        { "label": "COIN\n5", "key": "5", "color": "#806000" }, { "label": "1P\nSTART", "key": "1", "color": "#006000" }, { "label": "2P\nSTART", "key": "2", "color": "#006000" }, { "label": "COIN 2\n6", "key": "6", "color": "#806000" },
+        { "label": "ESC\nEXIT", "key": "esc" }, { "label": "@up", "key": "up" }, { "label": "TAB\nMENU", "key": "tab" }, { "label": "ENTER", "key": "enter" },
+        { "label": "@left", "key": "left" }, { "label": "@down", "key": "down" }, { "label": "@right", "key": "right" }, { "label": "SVC\n9", "key": "9" },
+        { "label": "PAUSE\nF5", "key": "f5" }, { "label": "RESET\nF3", "key": "f3" }, { "label": "EXIT", "action": "exit" }, { "label": "@next", "action": "next" }
+      ]
+    },
+    {
+      "title": "MAME", "cols": 4, "rows": 4,
+      "keys": [
+        { "label": "SERVICE\nF2", "key": "f2" }, { "label": "RESET\nF3", "key": "f3" }, { "label": "HARD\nRESET", "key": "shift+f3" }, { "label": "PAUSE\nF5", "key": "f5" },
+        { "label": "SAVE\nF6", "key": "f6" }, { "label": "LOAD\nF7", "key": "f7" }, { "label": "QSAVE\nSH+F6", "key": "shift+f6" }, { "label": "QLOAD\nSH+F7", "key": "shift+f7" },
+        { "label": "THROT\nF10", "key": "f10" }, { "label": "FPS\nF11", "key": "f11" }, { "label": "SNAP\nF12", "key": "f12" }, { "label": "TAB\nMENU", "key": "tab" },
+        { "label": "@prev", "action": "prev" }, { "label": "ESC", "key": "esc" }, { "label": "EXIT", "action": "exit" }, { "label": "@next", "action": "next" }
+      ]
+    },
+    {
+      "title": "RETROARCH", "cols": 4, "rows": 4,
+      "keys": [
+        { "label": "MENU\nF1", "key": "f1" }, { "label": "SAVE\nF2", "key": "f2" }, { "label": "LOAD\nF4", "key": "f4" }, { "label": "QUIT\nESC", "key": "esc" },
+        { "label": "SLOT-\nF6", "key": "f6" }, { "label": "SLOT+\nF7", "key": "f7" }, { "label": "PAUSE\nP", "key": "p" }, { "label": "RESET\nH", "key": "h" },
+        { "label": "FFWD\nSPACE", "key": "space" }, { "label": "SHOT\nF8", "key": "f8" }, { "label": "FULL\nF", "key": "f" }, { "label": "ENTER", "key": "enter" },
+        { "label": "@prev", "action": "prev" }, { "label": "@up", "key": "up" }, { "label": "EXIT", "action": "exit" }, { "label": "@next", "action": "next" }
+      ]
+    },
+    {
+      "title": "NAV", "cols": 4, "rows": 4,
+      "keys": [
+        { "label": "ESC", "key": "esc" }, { "label": "TAB", "key": "tab" }, { "label": "@up", "key": "up" }, { "label": "BKSP", "key": "backspace" },
+        { "label": "ENTER", "key": "enter" }, { "label": "@left", "key": "left" }, { "label": "@down", "key": "down" }, { "label": "@right", "key": "right" },
+        { "label": "SPACE", "key": "space" }, { "label": "ALT+\nENTER", "key": "alt+enter" }, { "label": "ALT+F4", "key": "alt+f4" }, { "label": "CTRL", "mod": "ctrl" },
+        { "label": "@prev", "action": "prev" }, { "label": "SHIFT", "mod": "shift" }, { "label": "EXIT", "action": "exit" }, { "label": "@next", "action": "next" }
+      ]
+    }
+  ]
+}

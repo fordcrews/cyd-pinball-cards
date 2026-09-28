@@ -1,0 +1,10 @@
+{
+  "_comment": "Used by cyd_push.py --rom when no card matches. {{TITLE}} = game name from the frontend (else the pretty-printed ROM name), {{SYSTEM}} = system display name, {{CONTROLS}} = controls text for the system (cards/_systems.json), {{ROM}} = ROM name. Cards whose text ends up empty are dropped.",
+  "title": "{{TITLE}}",
+  "cards": [
+    { "type": "title", "title": "NOW PLAYING", "text": "{{TITLE}}" },
+    { "type": "instructions", "title": "SYSTEM", "text": "{{SYSTEM}}" },
+    { "type": "controls", "title": "CONTROLS", "text": "{{CONTROLS}}" },
+    { "type": "credits", "title": "CREDITS", "text": "FREE PLAY\nPRESS 1P START" }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy to config.json (kit root or host/) and edit; config.json is git-ignored. Every key is optional; command-line flags win. profile: pinball (PinUP Popper) or arcade (Batocera, RetroBat, RetroPie, ES-DE). cabinet/subtitle override the idle file. idle_config/keypad_config/default_card: file names in cards/ (or paths). port: COM5, /dev/ttyUSB0 or a list; omit to auto-detect. watch_processes: programs that open the keypad while running (omit to use the keypad file's list, [] for none). key_backend: auto | sendinput | evdev | uinput | dry-run. key_hold_ms: how long keypad keys are held (default 40).",
+  "profile": "arcade",
+  "cabinet": "Crews Arcade",
+  "subtitle": "ARCADE CLASSICS",
+  "idle_config": "_idle_arcade.json",
+  "keypad_config": "_keypad_arcade.json",
+  "default_card": "_default_arcade.json",
+  "watch_processes": [],
+  "key_backend": "auto",
+  "key_hold_ms": 40
+}

@@ -1,0 +1,6 @@
+# CYD cabinet display - lets members of the "input" group create the virtual keypad keyboard.
+# Install:  sudo cp 99-cyd-uinput.rules /etc/udev/rules.d/
+#           echo uinput | sudo tee /etc/modules-load.d/uinput.conf
+#           sudo usermod -aG input pi          (then reboot)
+# Not needed if cyd_daemon.py runs as root. Serial access needs the "dialout" group (pi has it).
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"

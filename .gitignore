@@ -16,3 +16,6 @@ build/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Per-cabinet host config (copy config.example.json)
+config.json

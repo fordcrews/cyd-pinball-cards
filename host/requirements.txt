@@ -1,2 +1,4 @@
-pyserial>=3.5
-psutil>=5.9      # cyd_daemon.py process watch (optional: falls back to tasklist)
+pyserial>=3.5    # Windows: required. Linux: optional (built-in termios fallback in serialport.py)
+psutil>=5.9      # optional: cyd_daemon.py process watch (falls back to /proc on Linux, tasklist on Windows)
+# evdev          # optional, Linux only: key injection via python-evdev (else the built-in /dev/uinput writer).
+#                # Prefer the distro package: sudo apt install python3-evdev

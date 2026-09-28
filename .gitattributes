@@ -1,3 +1,7 @@
 * text=auto
 *.bin binary
 *.bat text eol=crlf
+*.sh text eol=lf
+frontends/batocera/cyd text eol=lf
+*.rules text eol=lf
+*.service text eol=lf

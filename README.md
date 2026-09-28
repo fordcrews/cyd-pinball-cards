@@ -1,35 +1,69 @@
-# CYD Pinball Cards
+# CYD Cabinet Cards – a companion display for pinball and arcade cabinets
 
-This is custom firmware and a host script that turn an **ESP32 Cheap Yellow Display**
-(ESP32-2432S028R, 2.8" 320×240 ILI9341, XPT2046 resistive touch) into a small card screen that sits
-beside the palm rest of a virtual pinball cabinet. It shows the table title, rules/instruction
-cards, a pricing card and, while no table is running, an idle/attract playlist (cabinet marquee,
-"pick a table" prompt, clock, house rules, pricing, a burn-in-safe animation, last played table). PinUP Popper pushes the cards over USB serial
-when a VPX table launches. While Popper's setup program is open, the display turns into a **touch
-keypad** (Esc, Enter, arrows, F1–F12, Alt+F4, modifiers...) for the keys a cabinet doesn't have. The idea comes from Pixelcade Sidekick, but everything here is written
-from scratch and needs no Pixelcade software or license.
+*(repository name: `cyd-pinball-cards`)*
+
+Custom firmware and host scripts that turn an **ESP32 Cheap Yellow Display** (ESP32-2432S028R,
+2.8" 320×240 ILI9341, XPT2046 resistive touch) into a small card screen next to the player on a
+**virtual pinball** or **arcade** cabinet:
+
+* **While a game runs** it shows cards for it: the table or game title, rules or instructions,
+  controls / button layout, a moves list, pricing or credits. The frontend pushes them over USB
+  serial when the game launches (PinUP Popper, Batocera, RetroBat, RetroPie, ES-DE, or anything
+  that can run a command).
+* **While nothing runs** it plays an idle/attract playlist: cabinet marquee, "pick a table/game"
+  prompt, clock, house rules, pricing, a burn-in-safe animation, last played game. There is a
+  pinball profile and an arcade profile.
+* **On demand** it becomes a **touch keypad** (Esc, Enter, arrows, F-keys, coin/start, MAME and
+  RetroArch hotkeys, Alt+F4...) for the keys a cabinet doesn't have. Keys are injected with
+  `SendInput` on Windows and a virtual `/dev/uinput` keyboard on Linux.
+
+The idea comes from Pixelcade Sidekick, but everything here is written from scratch and needs no
+Pixelcade software or license. The host scripts run on **Windows and Linux** with Python 3 and no
+required packages on Linux (pyserial, python-evdev and psutil are used when present).
+
+## Supported frontends
+
+| Frontend | OS | Game start → cards | Game end → idle | Keypad daemon at boot | Setup |
+|---|---|---|---|---|---|
+| PinUP Popper (VPX) | Windows | VPX Launch Script | VPX Close Script | Startup folder / Task Scheduler | [frontends/popper](frontends/popper/POPPER_SETUP.md) |
+| Batocera | Linux | `/userdata/system/scripts/` (`gameStart`) | same script (`gameStop`) | service in `/userdata/system/services/` (v43+), `custom.sh` (≤ v42) | [frontends/batocera](frontends/batocera/SETUP.md) |
+| RetroBat | Windows | ES `scripts\game-start\` | ES `scripts\game-end\` | ES `scripts\start\` | [frontends/retrobat](frontends/retrobat/SETUP.md) |
+| RetroPie | Raspberry Pi OS / Linux | `runcommand-onstart.sh` | `runcommand-onend.sh` | `autostart.sh` | [frontends/retropie](frontends/retropie/SETUP.md) |
+| ES-DE | Linux, Windows | `~/ES-DE/scripts/game-start/` | `scripts/game-end/` | `scripts/startup/` or systemd | [frontends/es-de](frontends/es-de/SETUP.md) |
+| Other EmulationStation forks | Linux, Windows | `scripts/game-start/` | `scripts/game-end/` | – | [frontends/emulationstation](frontends/emulationstation/SETUP.md) |
+| Anything else (LaunchBox, Attract-Mode, Pegasus...) | Windows, Linux | run `cyd_push.py --rom ...` | run `cyd_push.py --idle` | Startup folder / systemd user unit | [generic](frontends/emulationstation/SETUP.md#generic-linux-and-windows-frontends) |
+
+Hook paths and arguments, with their sources, and what is still **TO-VERIFY** on real hardware:
+[frontends/README.md](frontends/README.md).
 
 ```
 cyd-pinball-cards/
 ├── firmware/          PlatformIO project (TFT_eSPI + XPT2046_Touchscreen + ArduinoJson)
 │   ├── platformio.ini   pins, rotation, rotate timer, brightness in build_flags
 │   └── src/main.cpp
-├── host/              Windows tools
-│   ├── cyd_push.py      push cards / idle / keypad (hands off to the daemon when it runs)
-│   ├── cyd_daemon.py    keeps the COM port open, turns keypad presses into key presses, watches for Popper setup
-│   ├── keymap.py        key names -> Windows virtual keys + SendInput injector
-│   ├── test_keymap.py   unit tests (python -m unittest test_keymap.py)
+├── host/              host tools (Windows + Linux, Python 3)
+│   ├── cyd_push.py      push table/game cards, idle, keypad (hands off to the daemon when it runs)
+│   ├── cyd_daemon.py    keeps the serial port open, turns keypad presses into key presses, optional process watch
+│   ├── keymap.py        key names -> Windows VK + Linux KEY_* codes; SendInput / evdev / uinput injectors
+│   ├── serialport.py    pyserial when installed, else a termios + sysfs fallback (Linux)
+│   ├── test_keymap.py   unit tests: key codes (both backends), injectors, keypad layouts, process watch
+│   ├── test_arcade.py   unit + end-to-end tests: ROM parsing per frontend, card matching, profiles, fake display
 │   ├── fake_cyd.py      PTY device simulator for testing without hardware (Linux/macOS)
 │   └── requirements.txt
-├── cards/             one JSON per table
+├── cards/             one JSON per table or game
 │   ├── template.json
-│   ├── _default.json    used when no table matches ({{TITLE}} is filled in)
-│   ├── _idle.json       idle/attract playlist config (cabinet name, screens, texts, durations)
-│   ├── _keypad.json     touch keypad layout + process names that open it
-│   ├── medieval_madness.json
-│   ├── attack_from_mars.json
-│   └── the_addams_family.json
-├── popper/            PinUP Popper launch/close script snippets + setup notes
+│   ├── _default.json          pinball: used when no table matches ({{TITLE}} is filled in)
+│   ├── _default_arcade.json   arcade: used when no game matches ({{TITLE}}, {{SYSTEM}}, {{CONTROLS}})
+│   ├── _systems.json          system ids -> display names, kinds, default controls text, aliases
+│   ├── _idle.json             pinball idle/attract playlist ("Crews Pinball")
+│   ├── _idle_arcade.json      arcade idle/attract playlist ("Crews Arcade")
+│   ├── _keypad.json           pinball touch keypad + process names that open it
+│   ├── _keypad_arcade.json    arcade touch keypad (coin/start, MAME, RetroArch, NAV pages)
+│   ├── medieval_madness.json, attack_from_mars.json, the_addams_family.json   (pinball)
+│   ├── sf2.json, mslug.json, pacman.json                                      (arcade)
+│   └── <system>/<rom>.json    optional per-system cards (e.g. cards/snes/sf2.json)
+├── config.example.json  per-cabinet settings (copy to config.json)
+├── frontends/         hook scripts + SETUP.md per frontend (popper, batocera, retrobat, retropie, es-de, emulationstation, linux)
 ├── docs/              idle_preview.py / keypad_preview.py (Pillow mock-up renderers) + preview PNGs
 └── README.md
 ```
@@ -149,6 +183,8 @@ Existing host scripts ignore lines without `ack`, so the new events don't distur
   * `instructions` (or `rules`): word-wrapped paragraphs. `\n` starts a new paragraph.
   * `cost`: each line centred in large yellow text.
   * Anything else is drawn like instructions with a grey header.
+  * `cyd_push.py` also accepts arcade-style types in card files and sends the nearest firmware type:
+    `controls` / `buttons` → `instructions`, `moves` / `tips` → `rules`, `credits` / `pricing` → `cost`.
 * Tapping the screen (on release) moves to the next card and restarts the auto-rotate timer.
   Holding it for 2 s opens the touch keypad.
 
@@ -214,10 +250,11 @@ N minutes after the last table push, the display cycles through a playlist of at
 
 ![Idle screen previews](docs/idle-previews.png)
 
-## Touch keypad (for PinUP Popper's setup tool)
+## Touch keypad
 
-A pinball cabinet has no keyboard, but Popper's setup/config program needs Esc, Enter, arrows,
-F-keys and so on. While that program is open, the CYD becomes a touch **mini-keyboard**:
+A cabinet has no keyboard, but PinUP Popper's setup program, MAME's menus, RetroArch hotkeys and
+frontend settings need Esc, Enter, arrows, F-keys and so on. The CYD becomes a touch
+**mini-keyboard**: automatically while a watched program runs (Popper's setup), or by long-press.
 
 ![Keypad previews](docs/keypad-previews.png)
 
@@ -225,9 +262,17 @@ F-keys and so on. While that program is open, the CYD becomes a touch **mini-key
 
 **How it works.** The CYD's ESP32 talks to the PC through a CH340/CP2102 USB-serial chip, so it
 **cannot** act as a USB keyboard. Instead, the display sends each key over the serial link as JSON,
-for example `{"evt":"key","key":"alt+f4"}`, and `host/cyd_daemon.py` on the PC presses that key in
-the foreground window with the Windows `SendInput` API. The daemon uses Python's built-in ctypes
-and needs no admin rights and no keyboard library.
+for example `{"evt":"key","key":"alt+f4"}`, and `host/cyd_daemon.py` on the PC presses that key:
+* **Windows:** in the foreground window with the `SendInput` API (Python's built-in ctypes; no
+  admin rights, no keyboard library).
+* **Linux:** on a virtual keyboard called `cyd-keypad` created through `/dev/uinput`, so every
+  program sees it (EmulationStation, RetroArch, MAME, X11 or Wayland or the console). It uses
+  python-evdev when installed and otherwise a built-in writer that needs only the standard library
+  (so it runs on Batocera without pip). It needs write access to `/dev/uinput`: root has it
+  (Batocera); on Raspberry Pi OS and desktop distros add the udev rule in
+  `frontends/retropie/99-cyd-uinput.rules`. Without access the daemon logs keys instead of pressing them.
+* Each key is held for 40 ms (`--key-hold-ms`, `"key_hold_ms"` in config.json) so emulators that
+  poll the keyboard once per frame don't miss it.
 
 **Default pages** (4×4 grid of 80×54 px cells, about 76×50 px buttons, in landscape):
 
@@ -249,7 +294,26 @@ and needs no admin rights and no keyboard library.
   `LONGPRESS_KEYPAD_MS=0` in build_flags to turn this off.
 * Keys are single taps (press + release). There is no auto-repeat when you hold a key.
 
-### Auto-switching with Popper's setup program
+**Arcade preset** (`cards/_keypad_arcade.json`, used with the arcade profile):
+
+![Arcade keypad previews](docs/keypad-arcade-previews.png)
+
+| Page | Keys |
+|---|---|
+| 1 ARCADE | COIN (5), 1P START (1), 2P START (2), COIN 2 (6) / ESC, ↑, TAB (MAME menu), ENTER / ←, ↓, →, SERVICE 1 (9) / PAUSE (F5), RESET (F3), EXIT, ▶▶ |
+| 2 MAME | F2 service mode, F3 reset, Shift+F3 hard reset, F5 pause / F6 save state, F7 load state, Shift+F6 quick save, Shift+F7 quick load / F10 throttle, F11 FPS, F12 snapshot, TAB / ◀◀, ESC, EXIT, ▶▶ |
+| 3 RETROARCH | F1 menu, F2 save state, F4 load state, ESC quit / F6 slot −, F7 slot +, P pause, H reset / Space fast-forward, F8 screenshot, F fullscreen, ENTER / ◀◀, ↑, EXIT, ▶▶ |
+| 4 NAV | ESC, TAB, ↑, BKSP / ENTER, ←, ↓, → / SPACE, ALT+ENTER, ALT+F4, CTRL / ◀◀, SHIFT, EXIT, ▶▶ |
+
+The keys are the **defaults** from the [MAME docs](https://docs.mamedev.org/usingmame/defaultkeys.html)
+(current MAME pauses with **F5**; P was the old default) and RetroArch's
+[`retroarch.cfg`](https://github.com/libretro/RetroArch/blob/master/retroarch.cfg). Controller hotkey
+combos have keyboard equivalents: HOTKEY/SELECT+START (exit) = ESC, the RetroArch menu = F1, MAME's
+menu = TAB, save/load state = F2/F4 (RetroArch) or F6/F7 (MAME). Frontends such as Batocera and
+RetroBat write their own emulator configs, so check the keys on your cabinet and edit the file.
+The arcade preset has `"watch_processes": []`: open it with a long-press.
+
+### Auto-switching with Popper's setup program (pinball profile)
 `cyd_daemon.py` checks the running processes every 1.5 s:
 * When a watched program starts, it sends `{"cmd":"keypad",...}` with the layout from `cards/_keypad.json`.
 * When the program exits, it sends the full idle playlist (`cards/_idle.json` plus the PC's time),
@@ -268,13 +332,17 @@ setup open, look in Task Manager → Details. Change the name with `"watch_proce
 ### Running the daemon
 ```
 cd host
-pip install -r requirements.txt            # pyserial, psutil
-python cyd_daemon.py                       # auto-detects the CYD; Ctrl+C to quit
+pip install -r requirements.txt            # Windows: pyserial (+ psutil); optional on Linux
+python cyd_daemon.py                       # auto-detects the CYD; settings from config.json; Ctrl+C to quit
 python cyd_daemon.py --port COM5 -v        # verbose: shows every key and the window it went to
+python cyd_daemon.py --profile arcade      # arcade idle playlist + arcade keypad
 python cyd_daemon.py --dry-run             # log keys instead of pressing them
 python cyd_daemon.py --no-watch            # manual keypad only (long-press, or cyd_push.py --keypad)
 python cyd_daemon.py --log C:\cyd-pinball-cards\daemon.log
+python3 cyd_daemon.py --port /dev/ttyUSB0 --key-backend uinput -v    # Linux; backends: auto sendinput evdev uinput dry-run
 ```
+On Linux, start it from the frontend's boot hook (Batocera service, RetroPie `autostart.sh`, ES-DE
+`startup` script) or the systemd user unit in `frontends/linux/`; see the frontend's SETUP.md.
 * It's a plain console app with no tray icon. Only one program can open a COM port, so the daemon
   keeps the port open. It also listens on **127.0.0.1:47291** (env `CYD_DAEMON_PORT`), and
   `cyd_push.py` automatically passes its table/idle commands to it. With no daemon running,
@@ -354,7 +422,7 @@ register off-target:
   it, so after `{"cmd":"rotation"}` you don't need to calibrate again.
 
 
-## Host tool (Windows)
+## Host tools (Windows and Linux)
 
 ```
 cd host
@@ -372,19 +440,40 @@ python cyd_push.py --keypad                                     # open the touch
 python cyd_push.py --calibrate                                  # on-device touch calibration
 python cyd_push.py --cal show                                   # show / set touch calibration values
 python cyd_push.py --ping                                       # firmware version + current mode
+python cyd_push.py --rom /userdata/roms/mame/mslug.zip          # arcade game: card by ROM name, system from the path
+python cyd_push.py --rom "C:\RetroBat\roms\fbneo\sf2ce.zip" --game-name "Street Fighter II' CE"
+python cyd_push.py --rom kof98 --system mame --dry-run          # no card yet: _default_arcade.json
+python cyd_push.py --idle --profile arcade                      # arcade idle playlist (cards\_idle_arcade.json)
+python cyd_push.py --idle --rom mslug                           # idle playlist with "UP NEXT: Metal Slug"
+python cyd_push.py --show-config                                # which config.json, profile, files and serial backend are used
 ```
+* **Linux:** the same commands with `python3` and ports like `/dev/ttyUSB0` (CH340/CP210x) or
+  `/dev/ttyACM0` (CH9102 on some kernels). pyserial is optional there: without it the kit uses
+  termios, and `--list-ports` reads the VID:PID from sysfs. pyserial is pure Python, so you can also
+  unzip the `pyserial-*.whl` from PyPI and copy its `serial` folder into `host/` (no pip needed).
+  Your user needs the `dialout` group (root on Batocera has access).
+* **Profiles:** `pinball` (default) uses `_idle.json`, `_keypad.json`, `_default.json`;
+  `arcade` uses `_idle_arcade.json`, `_keypad_arcade.json`, `_default_arcade.json`. Pick one with
+  `--profile`, or `"profile"` in config.json. The frontend scripts set `CYD_DEFAULT_PROFILE=arcade`,
+  which applies only when neither is set. With the arcade profile a plain name is looked up as a ROM
+  (`cyd_push.py sf2`).
+* **config.json** (copy `config.example.json` into the kit root or `host/`; `--config PATH` or env
+  `CYD_CONFIG` for another place) sets per cabinet, without editing scripts: `profile`, `cabinet`
+  and `subtitle` (override the idle file), `idle_config`, `keypad_config`, `default_card`, `port`,
+  `watch_processes`, `key_backend`, `key_hold_ms`. Command-line flags win over it.
 * If `cyd_daemon.py` is running, `cyd_push.py` sends through it (the log shows `(via daemon)`).
   Otherwise it opens the COM port itself. `--no-daemon` forces direct serial.
 * Auto-detect looks for the CYD's USB-serial chip by VID:PID: CH340 `1A86:7523`, CH9102
-  `1A86:55D4` or CP210x `10C4:EA60`. It uses the first match. Use `--port` whenever another
-  device with the same chip is plugged in.
+  `1A86:55D4` or CP210x `10C4:EA60`. It uses the first match. Use `--port` (or `"port"` in
+  config.json) whenever another device with the same chip is plugged in – arcade control encoders
+  and light-gun adapters sometimes use the same chips.
 * The cards folder is `cards\` next to the script (or next to the exe), or `..\cards\`. You can
   override it with `--cards-dir`.
 * `table` and `idle` messages include the PC's local time (`ts`) so the clock and "last played"
   screens work. `--no-clock` leaves it out. `--idle-config PATH` uses another idle config file.
 * The tool refuses to send a message longer than the firmware's 6144-byte line limit.
 * Exit codes: 0 ok, 1 no ack / error, 2 no device found. Serial errors never raise, so the
-  script can't break a Popper launch.
+  script can't break a frontend's game launch.
 
 ### Building a standalone exe (so the cabinet needs no Python)
 ```
@@ -411,8 +500,41 @@ though the Popper snippets already run it in the background with `START /B`.
 
 Tables with no file get `cards/_default.json`, a title card plus a default pricing card.
 
-## Popper integration
-See **`popper/POPPER_SETUP.md`**. In short, add
+## Adding cards for an arcade or console game
+
+1. Name the file after the ROM: `cards/mslug.json` for `mslug.zip`. Several ROM sets can share one
+   card with `"roms": ["sf2", "sf2ua", "sf2ce"]`. For a card that should only apply on one system,
+   put it in a system folder, `cards/snes/<rom>.json`, or add `"systems": ["mame", "fbneo", "arcade"]`.
+2. Lookup order for `--rom`: `cards/<rom>.json` or a `"roms"` list (respecting `"systems"`), then
+   `cards/<system>/<rom>.json`, then a card whose `title`/`match` equals the frontend's game name,
+   then (for `vpinball`/`fpinball`) the pinball table lookup, then `cards/_default_arcade.json`.
+   There is no substring guessing for ROMs (`mslug2` never gets the `mslug` card).
+3. Card types that read well on arcade cabinets: `title`, `controls` (button layout), `moves`
+   (moves list / motions), `instructions`/`tips`, `credits` (cost). Up to 8 cards; about 150
+   characters per card; ASCII only (write motions as text, e.g. `QCF + punch`).
+4. `cards/_systems.json` maps system ids to display names (`mame` → "Arcade (MAME)", `snes` →
+   "Super Nintendo"), maps other frontends' ids onto them (`mame-libretro`, `fba`, `genesis`...), and
+   holds the default controls text per kind (arcade, console, computer, pinball) that
+   `_default_arcade.json` shows as `{{CONTROLS}}`.
+5. With no card the display shows the frontend's game name, or the ROM name pretty-printed
+   (`mslug` → `MSLUG`, `street_fighter_ii` → `Street Fighter II`), plus the system and its controls.
+6. Test: `python cyd_push.py --rom /path/to/roms/mame/sf2.zip --dry-run` shows which file matched.
+
+The example cards (`sf2.json`, `mslug.json`, `pacman.json`) are original text written for this kit
+(controls and general play tips), with no artwork.
+
+## Arcade idle playlist
+`cards/_idle_arcade.json` has the same format as `_idle.json` (above): marquee "Crews Arcade",
+"PICK A GAME / Insert coin...", clock, house rules, "FREE PLAY / PRESS 1P START", starfield, last
+played, up next. Change the cabinet name there or with `"cabinet"` in config.json.
+
+![Arcade idle previews](docs/idle-arcade-previews.png)
+
+## Frontend integration
+See **[frontends/README.md](frontends/README.md)** and the SETUP.md in each folder.
+
+### PinUP Popper
+See **`frontends/popper/POPPER_SETUP.md`**. In short, add
 `START "" /B ...\cyd_push.exe "[GAMENAME]" -q` to the VPX emulator **Launch Script** and
 `START "" /B ...\cyd_push.exe --idle -q` to its **Close Script**. The exact menu path is marked
 to-verify in that file, as are the optional hooks for showing idle when Popper starts and for the
@@ -457,4 +579,5 @@ to-verify in that file, as are the optional hooks for showing idle when Popper s
 
 ## License
 This kit is yours to use and change. It uses TFT_eSPI (FreeBSD/MIT-style), XPT2046_Touchscreen (MIT),
-ArduinoJson (MIT), pyserial (BSD) and psutil (BSD). It contains no Pixelcade code or assets.
+ArduinoJson (MIT), and optionally pyserial (BSD), psutil (BSD) and python-evdev (BSD). It contains no
+Pixelcade code or assets, and no game artwork.

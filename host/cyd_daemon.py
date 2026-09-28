@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """
-cyd_daemon.py - background helper for the CYD pinball cards display (console app, no tray icon).
+cyd_daemon.py - background helper for the CYD cabinet display (console app, no tray icon).
+Runs on Windows (PinUP Popper, RetroBat, ...) and Linux (Batocera, RetroPie, ...).
 
-  * Holds the display's COM port (a COM port can only be opened by one program at a time).
-  * Turns {"evt":"key",...} lines from the display's touch keypad into real key presses in the
-    foreground window with SendInput (ctypes; no admin rights, no extra packages).
-  * Watches for PinUP Popper's setup/config program and opens the keypad on the display while it
-    runs, then returns the display to the idle playlist when it closes.
-  * Listens on 127.0.0.1:47291 so cyd_push.py (Popper launch/close scripts) can still send table
-    and idle messages while the daemon owns the port. cyd_push falls back to direct serial when
-    no daemon is running, so nothing breaks if you never start this.
+  * Holds the display's serial port (a port can only be opened by one program at a time).
+  * Turns {"evt":"key",...} lines from the display's touch keypad into real key presses:
+    Windows SendInput into the foreground window (ctypes, no admin rights, no extra packages);
+    Linux a virtual "cyd-keypad" keyboard on /dev/uinput (python-evdev if installed, else a
+    built-in writer; needs write access to /dev/uinput, which root has).
+  * Optionally watches for configuration programs (PinUP Popper's setup tool by default) and
+    opens the keypad on the display while one runs, then returns to the idle playlist.
+  * Listens on 127.0.0.1:47291 so cyd_push.py (frontend launch/exit scripts) can still send
+    card and idle messages while the daemon owns the port. cyd_push falls back to direct serial
+    when no daemon is running, so nothing breaks if you never start this.
 
 Examples:
-  python cyd_daemon.py                          auto-detect the CYD, watch PinUpMenuSetup.exe
-  python cyd_daemon.py --port COM5 -v
+  python cyd_daemon.py                          auto-detect the CYD, settings from config.json
+  python cyd_daemon.py --profile arcade         arcade idle playlist + arcade keypad, no process watch
+  python cyd_daemon.py --port COM5 -v           (Linux: --port /dev/ttyUSB0)
   python cyd_daemon.py --watch PinUpMenuSetup.exe --watch "PinUP Popper Config.exe"
   python cyd_daemon.py --dry-run                log key presses instead of injecting them
+  python cyd_daemon.py --key-backend uinput     force the built-in Linux uinput writer
   python cyd_daemon.py --no-watch               manual keypad only (long-press on the display, or
                                                 cyd_push.py --keypad)
 
-The watched process names come from --watch, else "watch_processes" in cards/_keypad.json, else
-the built-in default below. TO-VERIFY on your cabinet: open Task Manager > Details while Popper's
-setup is open and check the exact exe name.
+The watched process names come from --watch, else "watch_processes" in config.json, else
+"watch_processes" in the profile's keypad file (an empty list turns watching off), else the
+built-in default below. TO-VERIFY on your cabinet: with the tool open, check the exact process
+name (Windows: Task Manager > Details; Linux: ps -e).
 
 The daemon never accepts keystrokes over the network socket: keys only come from the display.
 """
@@ -29,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import socket
 import socketserver
@@ -43,6 +50,7 @@ import cyd_push  # noqa: E402  (shared config loading / message builders / port 
 import keymap    # noqa: E402
 
 DEFAULT_WATCH = ["PinUpMenuSetup.exe"]   # PinUP Popper setup/config tool (TO-VERIFY on your install)
+                                         # (pinball profile only; the arcade keypad file sets [])
 RECONNECT_S = 3.0
 
 
@@ -78,8 +86,38 @@ class Logger:
 
 
 # ---------------------------------------------------------------- process watcher
+def proc_scan(proc_root: str = "/proc") -> set[str]:
+    """Linux without psutil: process names from /proc/<pid>/comm (truncated to 15 chars by the
+    kernel) plus the base names of argv[0] and argv[1] (so 'python3 foo.py' and wine 'Foo.exe'
+    are found too)."""
+    names: set[str] = set()
+    try:
+        pids = [d for d in os.listdir(proc_root) if d.isdigit()]
+    except OSError:
+        return names
+    for pid in pids:
+        base = os.path.join(proc_root, pid)
+        try:
+            with open(os.path.join(base, "comm"), "rb") as f:
+                comm = f.read().decode("utf-8", "replace").strip()
+            if comm:
+                names.add(comm.lower())
+            with open(os.path.join(base, "cmdline"), "rb") as f:
+                argv = [a for a in f.read().split(b"\0") if a][:2]
+            for a in argv:
+                if a.startswith(b"-"):
+                    continue
+                n = a.decode("utf-8", "replace").replace("\\", "/").rsplit("/", 1)[-1].strip()
+                if n:
+                    names.add(n.lower())
+        except OSError:   # process exited meanwhile, or no permission
+            continue
+    return names
+
+
 def running_process_names() -> set[str]:
-    """Lower-cased names of all running processes (psutil if available, else tasklist/ps)."""
+    """Lower-cased names of all running processes (psutil if available, else /proc on Linux,
+    tasklist on Windows, ps elsewhere)."""
     try:
         import psutil
         names = set()
@@ -90,6 +128,8 @@ def running_process_names() -> set[str]:
         return names
     except ImportError:
         pass
+    if sys.platform.startswith("linux") and os.path.isdir("/proc"):
+        return proc_scan()
     if sys.platform == "win32":
         out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True,
                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
@@ -134,7 +174,11 @@ class SerialLink:
         self.thread.start()
 
     def _open(self) -> bool:
-        port = self.fixed_port or cyd_push.find_port()
+        try:
+            port = self.fixed_port or cyd_push.find_port()
+        except RuntimeError as e:   # no pyserial on Windows
+            self.log(f"cannot look for the display: {e}", debug=True)
+            return False
         if not port:
             return False
         try:
@@ -233,9 +277,14 @@ class Daemon:
     def __init__(self, args, log: Logger):
         self.args = args
         self.log = log
-        self.cards_dir = args.cards_dir or cyd_push.default_cards_dir()
-        self.injector = keymap.KeyInjector(dry_run=args.dry_run, use_scancodes=args.scancodes, log=log)
-        self.link = SerialLink(args.port, log, self.on_device_line, self.on_connect)
+        self.st = cyd_push.resolve_settings(args)
+        self.cards_dir = self.st.cards_dir
+        hold = args.key_hold_ms if args.key_hold_ms is not None else self.st.key_hold_ms
+        self.injector = keymap.make_injector(args.key_backend or self.st.key_backend, dry_run=args.dry_run,
+                                             use_scancodes=args.scancodes, log=log,
+                                             hold_ms=keymap.DEFAULT_HOLD_MS if hold is None else hold)
+        port = self.st.ports[0] if self.st.ports else None
+        self.link = SerialLink(port, log, self.on_device_line, self.on_connect)
         self.state_lock = threading.Lock()
         self.setup_running: str | None = None  # name of the watched process that is running
         self.device_mode = "unknown"           # idle | table | keypad | calibrate | unknown
@@ -247,18 +296,22 @@ class Daemon:
             return []
         if self.args.watch:
             return list(self.args.watch)
-        cfg, _ = cyd_push.load_keypad_config(self.cards_dir, self.args.keypad_config)
+        if self.st.watch is not None:           # config.json
+            return list(self.st.watch)
+        cfg, _ = cyd_push.load_keypad_config(self.cards_dir, self.st.keypad_path)
         w = cfg.get("watch_processes")
-        return [str(x) for x in w] if isinstance(w, list) and w else list(DEFAULT_WATCH)
+        if isinstance(w, list):                 # [] = no watching (arcade keypad)
+            return [str(x) for x in w]
+        return list(DEFAULT_WATCH) if self.st.profile == "pinball" else []
 
     # ---- messages
     def keypad_msg(self) -> dict:
-        cfg, _ = cyd_push.load_keypad_config(self.cards_dir, self.args.keypad_config)  # re-read: edits apply
+        cfg, _ = cyd_push.load_keypad_config(self.cards_dir, self.st.keypad_path)  # re-read: edits apply
         return cyd_push.build_keypad_msg(cfg)
 
     def idle_msg(self) -> dict:
-        cfg, _ = cyd_push.load_idle_config(self.cards_dir)
-        return cyd_push.build_idle_msg(cfg)
+        cfg, _ = cyd_push.load_idle_config(self.cards_dir, self.st.idle_path)
+        return cyd_push.build_idle_msg(cfg, cabinet=self.st.cabinet, subtitle=self.st.subtitle)
 
     def send(self, msg: dict, why: str = "") -> dict:
         r = self.link.request(msg, timeout=self.args.timeout)
@@ -363,7 +416,8 @@ class Daemon:
         if op == "status":
             return {"ok": True, "connected": self.link.connected, "port": self.link.port,
                     "fw": self.link.fw, "mode": self.device_mode, "setup_running": self.setup_running,
-                    "watch": self.watch, "dry_run": self.injector.dry_run}
+                    "watch": self.watch, "dry_run": self.injector.dry_run, "profile": self.st.profile,
+                    "key_backend": self.injector.backend}
         if op == "send":
             msgs = req.get("messages")
             if not isinstance(msgs, list) or not all(isinstance(m, dict) and m.get("cmd") for m in msgs):
@@ -416,8 +470,18 @@ class _Server(socketserver.ThreadingTCPServer):
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="CYD keypad + COM-port daemon (see module docstring).")
-    ap.add_argument("--port", help="COM port of the CYD (default: auto-detect CH340/CH9102/CP210x)")
+    ap = argparse.ArgumentParser(description="CYD keypad + serial-port daemon (see module docstring).")
+    ap.add_argument("--port", action="append",
+                    help="serial port of the CYD, e.g. COM5 or /dev/ttyUSB0 (default: config.json, else "
+                         "auto-detect CH340/CH9102/CP210x)")
+    ap.add_argument("--profile", choices=sorted(cyd_push.PROFILES), help="pinball or arcade (default: config.json)")
+    ap.add_argument("--config", type=Path, default=None, help="host config JSON (default: config.json)")
+    ap.add_argument("--cabinet", help="cabinet name for the idle playlist")
+    ap.add_argument("--idle-config", type=Path, default=None, help="idle playlist JSON (default: profile's file)")
+    ap.add_argument("--key-backend", choices=keymap.BACKENDS, default=None,
+                    help="auto (default: SendInput on Windows, evdev/uinput on Linux), sendinput, evdev, uinput, dry-run")
+    ap.add_argument("--key-hold-ms", type=int, default=None,
+                    help=f"how long each key is held down (default {keymap.DEFAULT_HOLD_MS} ms)")
     ap.add_argument("--watch", action="append", metavar="EXE",
                     help="process name that opens the keypad while running (repeatable)")
     ap.add_argument("--no-watch", action="store_true", help="do not watch processes")
@@ -425,7 +489,8 @@ def main(argv=None) -> int:
     ap.add_argument("--listen-port", type=int, default=cyd_push.DAEMON_PORT,
                     help=f"127.0.0.1 port for cyd_push hand-off (default {cyd_push.DAEMON_PORT}, env CYD_DAEMON_PORT)")
     ap.add_argument("--cards-dir", type=Path, default=None)
-    ap.add_argument("--keypad-config", type=Path, default=None, help="default: cards/_keypad.json")
+    ap.add_argument("--keypad-config", type=Path, default=None,
+                    help="default: cards/_keypad.json (arcade profile: cards/_keypad_arcade.json)")
     ap.add_argument("--dry-run", action="store_true", help="log key presses instead of injecting them")
     ap.add_argument("--scancodes", action="store_true",
                     help="inject hardware scan codes instead of virtual keys (for apps that ignore VK input)")
@@ -442,12 +507,20 @@ def main(argv=None) -> int:
         return 3
     d = Daemon(args, log)
     server.daemon_ref = d
-    log(f"cyd_daemon on {cyd_push.DAEMON_HOST}:{args.listen_port}; key injection "
-        f"{'DRY-RUN (logging only)' if d.injector.dry_run else 'via SendInput'}; Ctrl+C to quit")
+    log(f"cyd_daemon on {cyd_push.DAEMON_HOST}:{args.listen_port}; profile {d.st.profile}"
+        f"{' (' + str(d.st.config_src) + ')' if d.st.config_src else ''}; key injection "
+        f"{'DRY-RUN (logging only)' if d.injector.dry_run else 'via ' + d.injector.backend}; "
+        f"serial via {cyd_push.serialport.backend_name()}; Ctrl+C to quit")
     stop = threading.Event()
     threading.Thread(target=server.serve_forever, name="ipc", daemon=True).start()
     d.link.start()
     threading.Thread(target=d.watch_loop, args=(stop,), name="watch", daemon=True).start()
+    import signal
+    def _on_term(*_):
+        raise KeyboardInterrupt
+
+    if hasattr(signal, "SIGTERM"):   # Linux services stop the daemon with SIGTERM
+        signal.signal(signal.SIGTERM, _on_term)
     try:
         while True:
             time.sleep(0.5)
@@ -459,6 +532,7 @@ def main(argv=None) -> int:
         server.shutdown()
         server.server_close()
         d.link._close()
+        d.injector.close()
     return 0
 
 

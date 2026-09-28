@@ -1,0 +1,12 @@
+{
+  "title": "Metal Slug",
+  "roms": ["mslug"],
+  "match": ["Metal Slug - Super Vehicle-001", "Metal Slug: Super Vehicle-001"],
+  "systems": ["mame", "fbneo", "arcade", "neogeo"],
+  "cards": [
+    { "type": "title", "title": "NOW PLAYING", "text": "Metal Slug" },
+    { "type": "controls", "title": "CONTROLS", "text": "Stick: run, crouch, aim up\nA: shoot   B: jump   C: grenade\nIn the air, aim down to fire below you." },
+    { "type": "instructions", "title": "TIPS", "text": "Free the tied-up prisoners: they drop weapons, ammo and points.\nGrenades run out, so save them for the big targets." },
+    { "type": "credits", "title": "CREDITS", "text": "1 COIN = 1 CREDIT\nP2 JOINS ANY TIME\nPRESS START" }
+  ]
+}

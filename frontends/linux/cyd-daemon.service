@@ -1,0 +1,19 @@
+# CYD cabinet display - systemd USER service for cyd_daemon on a generic Linux cabinet
+# (ES-DE, Attract-Mode, Pegasus, ... on a desktop distro).
+# Install:  mkdir -p ~/.config/systemd/user && cp cyd-daemon.service ~/.config/systemd/user/
+#           systemctl --user daemon-reload && systemctl --user enable --now cyd-daemon
+# Needs: your user in "dialout" (serial) and write access to /dev/uinput (see
+# frontends/retropie/99-cyd-uinput.rules). Edit the path below if the kit lives elsewhere.
+[Unit]
+Description=CYD cabinet display daemon (touch keypad + serial hand-off)
+After=graphical-session.target
+
+[Service]
+Environment=CYD_DEFAULT_PROFILE=arcade
+ExecStart=/usr/bin/env python3 %h/cyd-pinball-cards/host/cyd_daemon.py
+ExecStartPost=/bin/sh -c 'sleep 4; /usr/bin/env python3 %h/cyd-pinball-cards/host/cyd_push.py --idle -q || true'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
