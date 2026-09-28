@@ -3,7 +3,8 @@
 This is custom firmware and a host script that turn an **ESP32 Cheap Yellow Display**
 (ESP32-2432S028R, 2.8" 320×240 ILI9341, XPT2046 resistive touch) into a small card screen that sits
 beside the palm rest of a virtual pinball cabinet. It shows the table title, rules/instruction
-cards, a pricing card and an idle/attract screen. PinUP Popper pushes the cards over USB serial
+cards, a pricing card and, while no table is running, an idle/attract playlist (cabinet marquee,
+"pick a table" prompt, clock, house rules, pricing, a burn-in-safe animation, last played table). PinUP Popper pushes the cards over USB serial
 when a VPX table launches. The idea comes from Pixelcade Sidekick, but everything here is written
 from scratch and needs no Pixelcade software or license.
 
@@ -18,10 +19,12 @@ cyd-pinball-cards/
 ├── cards/             one JSON per table
 │   ├── template.json
 │   ├── _default.json    used when no table matches ({{TITLE}} is filled in)
+│   ├── _idle.json       idle/attract playlist config (cabinet name, screens, texts, durations)
 │   ├── medieval_madness.json
 │   ├── attack_from_mars.json
 │   └── the_addams_family.json
 ├── popper/            PinUP Popper launch/close script snippets + setup notes
+├── docs/              idle_preview.py (Pillow mock-up renderer) + idle-previews.png
 └── README.md
 ```
 
@@ -50,7 +53,8 @@ cyd-pinball-cards/
    If the upload won't start, hold **BOOT**, tap **RST**, then release BOOT.
 
 ### Option B: esptool (flash a prebuilt binary without the toolchain)
-After `pio run`, the images are in `firmware/.pio/build/cyd/`. Flash them with:
+Prebuilt images (firmware 1.1.0) are in `firmware/bin/`. After your own `pio run`, they are in
+`firmware/.pio/build/cyd/`. Flash them with:
 ```
 pip install esptool
 esptool.py --chip esp32 --port COM5 --baud 921600 write_flash -z ^
@@ -67,6 +71,7 @@ esptool.py --chip esp32 --port COM5 --baud 921600 write_flash -z ^
 | `CYD_ROTATION` | `1` | 0/2 = portrait 240×320, 1/3 = landscape 320×240. You can also change it at runtime with `{"cmd":"rotation","value":N}` (saved to flash). |
 | `CARD_ROTATE_MS` | `12000` | How long each card stays up before auto-advancing. 0 turns auto-rotate off. |
 | `DEFAULT_BRIGHTNESS` | `220` | Backlight brightness on first boot (0–255). The `brightness` command overrides it and the new value is saved. |
+| `DEFAULT_CABINET` | `"Crews Pinball"` | Cabinet name on the idle marquee until a host sends `cards/_idle.json`. Needs escaped quotes in build_flags: `-DDEFAULT_CABINET=\"My Cab\"`. |
 
 ### Pin assumptions (standard ESP32-2432S028R)
 * Display on HSPI (`USE_HSPI_PORT`): MISO 12, MOSI 13, SCLK 14, CS 15, DC 2, RST -1 (tied to EN),
@@ -75,12 +80,12 @@ esptool.py --chip esp32 --port COM5 --baud 921600 write_flash -z ^
 * Driver `ILI9341_2_DRIVER`. **If colours are inverted or the image is mirrored or offset**, your board
   may be a newer variant. Try `-DILI9341_DRIVER=1`. For the ST7789 "CYD2" boards (dual USB), use
   `-DST7789_DRIVER=1` and add `-DTFT_INVERSION_ON=1` if colours are inverted.
-* Touch is only used as "tap anywhere = next card", so it needs no calibration.
+* Touch is only used as "tap anywhere = next card" (or next idle screen), so it needs no calibration.
 
 ### Fonts
 TFT_eSPI's built-in Adafruit-GFX FreeFonts (`LOAD_GFXFF`): FreeSansBold 24/18/12pt for headings
 and the title and cost cards, and FreeSans 12pt for rules. Rules drop to FreeSans 9pt only when
-the text doesn't fit. Text is white or yellow/orange on black, with a coloured header bar: red for
+the text doesn't fit. The idle clock uses TFT_eSPI's large digit font (Font 8, 75 px). Text is white or yellow/orange on black, with a coloured header bar: red for
 title, blue for rules, green for cost, purple for idle. The header shows a card counter (`2/4`).
 These fonts only cover **ASCII**, so avoid accented characters and symbols like `¢`. Write `25c`
 instead of `25¢`.
@@ -88,28 +93,98 @@ instead of `25¢`.
 ## Serial protocol
 
 The link runs at **115200 baud, 8N1**. Each command is **one JSON object per line**, ending in `\n`.
-Lines can be up to 6144 bytes, and the firmware keeps up to 8 cards per table.
+Lines can be up to 6144 bytes, and the firmware keeps up to 8 cards per table. The UART receive
+buffer is enlarged to 6.6 KB so a full line can arrive while the screen is redrawing. ArduinoJson 7
+documents grow on the heap as needed (no fixed document size); a full idle config is about 0.7 KB.
 
 | Command | Example | Reply |
 |---|---|---|
 | table | `{"cmd":"table","title":"Medieval Madness","cards":[{"type":"title","title":"NOW PLAYING","text":"Medieval Madness"},{"type":"instructions","title":"HOW TO PLAY","text":"..."},{"type":"cost","title":"PRICING","text":"1 CREDIT = 25c\n3 BALLS"}]}` | `{"ack":"table","ok":true,"cards":3}` |
-| idle | `{"cmd":"idle"}` | `{"ack":"idle","ok":true}` |
+| idle (bare) | `{"cmd":"idle"}` | `{"ack":"idle","ok":true,"screens":8,"clock":false}` |
+| idle (full) | `{"cmd":"idle","ts":1790592987,"cabinet":"Crews Pinball","screens":[{"type":"marquee"},{"type":"clock"}],"selected":"Attack from Mars"}` | `{"ack":"idle","ok":true,"screens":3,"clock":true}` |
 | brightness | `{"cmd":"brightness","value":128}` (0–255) | `{"ack":"brightness","ok":true,"value":128}` |
 | rotation | `{"cmd":"rotation","value":3}` (0–3) | `{"ack":"rotation","ok":true,"value":3}` |
 | next | `{"cmd":"next"}` | `{"ack":"next","ok":true,"card":1}` |
-| ping | `{"cmd":"ping"}` | `{"ack":"ping","ok":true,"fw":"1.0.0","device":"cyd-pinball-cards"}` |
+| ping | `{"cmd":"ping"}` | `{"ack":"ping","ok":true,"fw":"1.1.0","device":"cyd-pinball-cards"}` |
 
 * Errors come back as `{"ack":"<cmd>","ok":false,"err":"..."}`, for example on bad JSON, an unknown
   cmd or an out-of-range value.
-* On boot the device prints `{"ready":true,"device":"cyd-pinball-cards","fw":"1.0.0"}`.
-* The last `table` and the idle state, brightness and rotation are saved in flash (Preferences/NVS),
-  so the display comes back to the same screen after a power cycle.
+* On boot the device prints `{"ready":true,"device":"cyd-pinball-cards","fw":"1.1.0"}`.
+* The last `table`, the idle state, the idle config, the last played table (+ time), brightness and
+  rotation are saved in flash (Preferences/NVS), so the display comes back to the same screen after
+  a power cycle. The idle config is only rewritten when it actually changed.
+* `ts` (optional, on `table` and `idle`) is the PC's **local** time as seconds since 1970-01-01,
+  encoded as if it were UTC (Python: `calendar.timegm(time.localtime())`). The ESP32 has no RTC, so
+  it keeps time with `millis()` from the last `ts` it received. After a reboot the clock is unknown
+  until the next push, and the clock screen is skipped until then.
 * Card `type` values:
   * `title`: big text, auto-sized to fit.
   * `instructions` (or `rules`): word-wrapped paragraphs. `\n` starts a new paragraph.
   * `cost`: each line centred in large yellow text.
   * Anything else is drawn like instructions with a grey header.
 * Tapping the screen moves to the next card and restarts the auto-rotate timer.
+
+## Idle / attract screens
+
+When `{"cmd":"idle"}` arrives (Popper close script), on boot with no saved table, or optionally
+N minutes after the last table push, the display cycles through a playlist of attract screens:
+
+| type | What it shows | Text fields |
+|---|---|---|
+| `marquee` | Cabinet name in large gold letters with a chasing-bulb border and a subtitle | `title` (defaults to `cabinet`), `text` (defaults to `subtitle`) |
+| `choose` | "PICK A TABLE" prompt with sweeping lane arrows | `title`, `text` (default "Now choosing...") |
+| `clock` | Big time (12 h with AM/PM, or 24 h), weekday, date, cabinet name. Colon blinks. Skipped until a host has sent the time. | – |
+| `rules` | House rules: title + word-wrapped text (auto font size) | `title`, `text` (`\n` = new line) |
+| `pricing` | Pricing card: each line centred in large yellow text | `title`, `text` |
+| `anim` | `"style":"pinball"` (default): steel ball bouncing around with a colour-cycling trail. `"style":"stars"`: starfield. Both keep every pixel moving, so they are the burn-in breakers. | `style`, optional dim caption in `text` |
+| `last_played` | Last table pushed with `cyd_push.py <table>`, and when ("Today at 9:42 PM", "1 hour ago"). Skipped if nothing was played yet. | `title` |
+| `up_next` | "UP NEXT: <table>" – only shown while the host sent a `selected` table (see `--browsing`). The firmware adds this slot automatically if the list has room. | `title`, `text` (default "Press START to play") |
+| `text` / other | Plain title + text screen | `title`, `text` |
+
+* Burn-in care: all idle text is shifted by a few pixels (up to ±6 px) every time the screen changes,
+  and the animated screens move every pixel. Tap the screen to skip to the next idle screen.
+* Text must be ASCII (the fonts have no accents); `cyd_push.py` folds accents and common symbols
+  (`é` → `e`, `¢` → `c`) automatically.
+* A bare `{"cmd":"idle"}` (older host scripts, or `cyd_push.py --bare-idle`) still works: it uses the
+  config last saved on the display, or the built-in defaults (marquee "Crews Pinball", pick a table,
+  clock, house rules, pricing "FREE PLAY / PRESS START", pinball animation, last played).
+
+### Config: `cards/_idle.json`
+```json
+{
+  "cabinet": "Crews Pinball",
+  "subtitle": "VIRTUAL PINBALL",
+  "duration": 10,
+  "clock_24h": false,
+  "auto_idle_min": 0,
+  "screens": [
+    { "type": "marquee", "duration": 12 },
+    { "type": "choose", "title": "PICK A TABLE", "text": "Now choosing..." },
+    { "type": "clock" },
+    { "type": "rules", "title": "HOUSE RULES", "text": "Have fun!\nNo drinks on the glass." },
+    { "type": "pricing", "title": "PRICING", "text": "FREE PLAY\nPRESS START", "duration": 8 },
+    { "type": "anim", "style": "pinball", "duration": 20 },
+    { "type": "last_played" },
+    { "type": "anim", "style": "stars", "enabled": false },
+    { "type": "up_next", "text": "Press START to play" }
+  ]
+}
+```
+* `duration` is seconds: the top-level value is the default, and each screen can override it
+  (animations default to at least 20 s).
+* Screens play in list order (max 12). Remove a screen or set `"enabled": false` to skip it.
+  A screen can also be a bare string, e.g. `"clock"`.
+* `auto_idle_min`: if > 0, the display drops back to the idle playlist that many minutes after the
+  last table push, even without a close script. Leave it at 0 unless your close script is
+  unreliable, because a long game would also be interrupted.
+* Keys starting with `_` (like `_comment`) are ignored.
+* `python cyd_push.py --idle` loads the file, adds the PC's local time and sends it. The config is
+  saved on the display, so later bare `idle` commands reuse it.
+* Preview your config without hardware: `pip install pillow` then
+  `python docs/idle_preview.py --out idle-previews` (writes one PNG per screen plus `sheet.png`).
+  These are Pillow mock-ups of the layout, not device captures.
+
+![Idle screen previews](docs/idle-previews.png)
 
 ## Host tool (Windows)
 
@@ -119,7 +194,10 @@ pip install -r requirements.txt
 python cyd_push.py --list-ports
 python cyd_push.py "Medieval Madness (Williams 1997)"          # auto-detects the CYD
 python cyd_push.py medieval_madness.json --port COM5
-python cyd_push.py --idle
+python cyd_push.py --idle                                       # idle playlist from cards\_idle.json + current time
+python cyd_push.py --idle --dry-run                             # show the idle JSON and its size, no serial
+python cyd_push.py --browsing "Attack from Mars (Bally 1995)"   # idle playlist that opens with "UP NEXT: Attack from Mars"
+python cyd_push.py --bare-idle                                  # plain {"cmd":"idle"} (uses config saved on the display)
 python cyd_push.py --brightness 90
 python cyd_push.py "Attack from Mars" --dry-run                 # print the JSON only, no serial
 ```
@@ -128,6 +206,9 @@ python cyd_push.py "Attack from Mars" --dry-run                 # print the JSON
   device with the same chip is plugged in.
 * The cards folder is `cards\` next to the script (or next to the exe), or `..\cards\`. You can
   override it with `--cards-dir`.
+* `table` and `idle` messages include the PC's local time (`ts`) so the clock and "last played"
+  screens work. `--no-clock` leaves it out. `--idle-config PATH` uses another idle config file.
+* The tool refuses to send a message longer than the firmware's 6144-byte line limit.
 * Exit codes: 0 ok, 1 no ack / error, 2 no device found. Serial errors never raise, so the
   script can't break a Popper launch.
 
@@ -160,7 +241,8 @@ Tables with no file get `cards/_default.json`, a title card plus a default prici
 See **`popper/POPPER_SETUP.md`**. In short, add
 `START "" /B ...\cyd_push.exe "[GAMENAME]" -q` to the VPX emulator **Launch Script** and
 `START "" /B ...\cyd_push.exe --idle -q` to its **Close Script**. The exact menu path is marked
-to-verify in that file.
+to-verify in that file, as are the optional hooks for showing idle when Popper starts and for the
+"Up next" hint while browsing.
 
 ## Mounting notes
 * The usual spot is the **right side of the cabinet top rail or lockdown bar, just in front of the

@@ -1,0 +1,19 @@
+{
+  "_comment": "Idle/attract playlist, sent by: cyd_push.py --idle. Keys starting with _ are ignored. ASCII text only. Durations are seconds. Screen types: marquee, choose, clock, rules, pricing, anim (style pinball|stars), last_played, up_next, text. Set \"enabled\": false to skip a screen.",
+  "cabinet": "Crews Pinball",
+  "subtitle": "VIRTUAL PINBALL",
+  "duration": 10,
+  "clock_24h": false,
+  "auto_idle_min": 0,
+  "screens": [
+    { "type": "marquee", "duration": 12 },
+    { "type": "choose", "title": "PICK A TABLE", "text": "Now choosing...", "duration": 10 },
+    { "type": "clock", "duration": 10 },
+    { "type": "rules", "title": "HOUSE RULES", "text": "Have fun!\nNo drinks on the glass.\nGive the next player a turn.", "duration": 12 },
+    { "type": "pricing", "title": "PRICING", "text": "FREE PLAY\nPRESS START", "duration": 8 },
+    { "type": "anim", "style": "pinball", "duration": 20 },
+    { "type": "last_played", "title": "LAST PLAYED", "duration": 8 },
+    { "type": "anim", "style": "stars", "duration": 15, "enabled": false },
+    { "type": "up_next", "title": "UP NEXT", "text": "Press START to play", "duration": 10 }
+  ]
+}

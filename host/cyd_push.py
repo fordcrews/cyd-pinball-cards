@@ -6,7 +6,9 @@ running the cyd-pinball-cards firmware.
 Examples (Windows):
   python cyd_push.py "Medieval Madness (Williams 1997)"
   python cyd_push.py medieval_madness.json
-  python cyd_push.py --idle
+  python cyd_push.py --idle                      (attract playlist from cards/_idle.json + current time)
+  python cyd_push.py --idle --dry-run
+  python cyd_push.py --browsing "[GAMENAME]"     (attract playlist + "Up next: <table>" screen)
   python cyd_push.py --brightness 128
   python cyd_push.py "Attack from Mars" --port COM5
   python cyd_push.py "Attack from Mars" --dry-run
@@ -22,11 +24,13 @@ Table lookup order (in the cards directory):
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 # Known USB-serial bridges used on CYD boards: CH340, CH9102, CP2102
@@ -36,6 +40,13 @@ KNOWN_VID_PID = {
     (0x10C4, 0xEA60): "CP210x",
 }
 BAUD = 115200
+MAX_LINE = 6144          # firmware line limit (bytes, incl. nothing else)
+MAX_IDLE_SCREENS = 12    # firmware keeps at most this many idle screens
+IDLE_SCREEN_TYPES = {
+    "marquee", "logo", "title", "cabinet", "choose", "pick", "pick_table", "prompt", "clock", "time",
+    "rules", "house_rules", "instructions", "pricing", "cost", "price", "anim", "animation", "pinball",
+    "ball", "stars", "starfield", "last_played", "last", "lastplayed", "up_next", "upnext", "selected", "text",
+}
 
 
 def script_dir() -> Path:
@@ -123,7 +134,24 @@ def find_table(name: str, cards_dir: Path) -> tuple[dict, Path | None]:
     return {"title": title, "cards": [{"type": "title", "title": "NOW PLAYING", "text": title}]}, None
 
 
-def build_table_msg(data: dict) -> dict:
+def local_epoch(now: float | None = None) -> int:
+    """Local wall-clock time as seconds since 1970-01-01 00:00 *as if it were UTC*.
+    The firmware has no timezone logic; it just formats this number."""
+    return calendar.timegm(time.localtime(now))
+
+
+def to_ascii(text: str) -> str:
+    """The display fonts are ASCII-only: fold accents, map common symbols, drop the rest."""
+    text = str(text)
+    for a, b in (("\u00a2", "c"), ("\u2019", "'"), ("\u2018", "'"), ("\u201c", '"'), ("\u201d", '"'),
+                 ("\u2013", "-"), ("\u2014", "-"), ("\u2026", "..."), ("\u00d7", "x"), ("\u20ac", "EUR"),
+                 ("\u00a3", "GBP")):
+        text = text.replace(a, b)
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return text
+
+
+def build_table_msg(data: dict, with_clock: bool = True) -> dict:
     cards = []
     for c in data.get("cards", [])[:8]:
         cards.append({
@@ -131,7 +159,70 @@ def build_table_msg(data: dict) -> dict:
             "title": str(c.get("title", "")),
             "text": str(c.get("text", "")),
         })
-    return {"cmd": "table", "title": str(data.get("title", "")), "cards": cards}
+    msg = {"cmd": "table", "title": str(data.get("title", "")), "cards": cards}
+    if with_clock:
+        msg["ts"] = local_epoch()  # lets the display remember *when* this table was last played
+    return msg
+
+
+def load_idle_config(cards_dir: Path, path: Path | None = None) -> tuple[dict, Path | None]:
+    """Load cards/_idle.json (or an explicit path). Missing file -> {} (firmware defaults)."""
+    cand = path or (cards_dir / "_idle.json")
+    if cand.is_file():
+        try:
+            return load_json(cand), cand
+        except (OSError, json.JSONDecodeError) as e:
+            log(f"warning: ignoring {cand}: {e}")
+    elif path:
+        log(f"warning: idle config {path} not found; using firmware defaults")
+    return {}, None
+
+
+def build_idle_msg(cfg: dict, selected: str | None = None, with_clock: bool = True) -> dict:
+    """Turn an _idle.json dict into a compact {"cmd":"idle",...} line for the firmware."""
+    msg: dict = {"cmd": "idle"}
+    if with_clock:
+        msg["ts"] = local_epoch()
+    for key in ("cabinet", "subtitle"):
+        if key in cfg:
+            msg[key] = to_ascii(cfg[key])
+    for key in ("duration", "auto_idle_min"):
+        if key in cfg:
+            msg[key] = int(cfg[key])
+    if "clock_24h" in cfg:
+        msg["clock_24h"] = bool(cfg["clock_24h"])
+    screens = []
+    for sc in cfg.get("screens", []):
+        if isinstance(sc, str):
+            sc = {"type": sc}
+        if not isinstance(sc, dict) or sc.get("enabled", True) is False:
+            continue
+        typ = str(sc.get("type", "text")).lower()
+        if typ not in IDLE_SCREEN_TYPES:
+            log(f"warning: unknown idle screen type '{typ}' (drawn as a plain text screen)")
+        out = {"type": typ}
+        for key in ("title", "text", "style"):
+            if sc.get(key):
+                out[key] = to_ascii(sc[key])
+        if sc.get("duration"):
+            out["duration"] = int(sc["duration"])
+        screens.append(out)
+    if len(screens) > MAX_IDLE_SCREENS:
+        log(f"warning: {len(screens)} idle screens; firmware keeps the first {MAX_IDLE_SCREENS}")
+        screens = screens[:MAX_IDLE_SCREENS]
+    if screens:
+        msg["screens"] = screens
+    if selected:
+        msg["selected"] = to_ascii(selected)
+    return msg
+
+
+def pretty_table_name(name: str, cards_dir: Path) -> str:
+    """Title for the "Up next" screen: the card file's title if one matches, else the cleaned name."""
+    data, src = find_table(name, cards_dir)
+    if src is not None and not src.name.startswith("_"):
+        return str(data.get("title") or name)
+    return re.sub(r"\s*\([^)]*\)\s*", " ", Path(name).stem if name.lower().endswith(".json") else name).strip() or name
 
 
 # ---------------------------------------------------------------- serial
@@ -199,7 +290,14 @@ def send(port: str, messages: list[dict], timeout: float, quiet: bool) -> bool:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Push pinball table cards to a CYD display.")
     ap.add_argument("table", nargs="?", help="table name (e.g. Popper [GAMENAME]) or JSON filename")
-    ap.add_argument("--idle", action="store_true", help="show the idle/attract card")
+    ap.add_argument("--idle", action="store_true",
+                    help="show the idle/attract playlist (config from cards/_idle.json, plus current time)")
+    ap.add_argument("--browsing", metavar="TABLE",
+                    help="idle playlist plus an 'Up next: TABLE' screen (for a Popper selection hook, if you have one)")
+    ap.add_argument("--idle-config", type=Path, default=None, help="idle config JSON (default: cards/_idle.json)")
+    ap.add_argument("--bare-idle", action="store_true",
+                    help='send only {"cmd":"idle"} (keeps the config already saved on the display)')
+    ap.add_argument("--no-clock", action="store_true", help="do not send the PC's local time")
     ap.add_argument("--brightness", type=int, metavar="0-255", help="set backlight brightness")
     ap.add_argument("--port", action="append",
                     help="COM port (repeatable, e.g. --port COM5 --port COM6 for two displays)")
@@ -223,23 +321,40 @@ def main(argv=None) -> int:
         if not 0 <= args.brightness <= 255:
             ap.error("--brightness must be 0-255")
         messages.append({"cmd": "brightness", "value": args.brightness})
-    if args.idle:
+    cards_dir = args.cards_dir or default_cards_dir()
+    if args.bare_idle:
         messages.append({"cmd": "idle"})
+    elif args.idle or args.browsing:
+        cfg, src = load_idle_config(cards_dir, args.idle_config)
+        selected = pretty_table_name(args.browsing, cards_dir) if args.browsing else None
+        log(f"idle config -> {src if src else '(none: firmware defaults)'}"
+            + (f"; up next: {selected}" if selected else ""), args.quiet)
+        messages.append(build_idle_msg(cfg, selected, with_clock=not args.no_clock))
     elif args.table:
-        cards_dir = args.cards_dir or default_cards_dir()
         data, src = find_table(args.table, cards_dir)
         log(f"table '{args.table}' -> {src.name if src else '(generated title card)'}", args.quiet)
-        messages.append(build_table_msg(data))
+        messages.append(build_table_msg(data, with_clock=not args.no_clock))
     if not messages:
-        ap.error("give a table name, --idle, or --brightness")
+        ap.error("give a table name, --idle, --browsing, or --brightness")
+
+    too_big = False
+    for m in messages:
+        size = len(json.dumps(m, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        if size > MAX_LINE:
+            log(f"error: cmd={m.get('cmd')} is {size} bytes; firmware limit is {MAX_LINE}. Shorten the text.")
+            too_big = True
+        elif size > MAX_LINE - 500:
+            log(f"warning: cmd={m.get('cmd')} is {size} bytes (limit {MAX_LINE})", args.quiet)
 
     if args.dry_run:
         for m in messages:
             print(json.dumps(m, ensure_ascii=False, separators=(",", ":")))
-        size = max(len(json.dumps(m, ensure_ascii=False)) for m in messages)
-        if size > 6000:
-            log(f"warning: message is {size} bytes; firmware limit is 6144", args.quiet)
-        return 0
+        for m in messages:
+            size = len(json.dumps(m, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            log(f"cmd={m.get('cmd')}: {size} bytes (limit {MAX_LINE})", args.quiet)
+        return 1 if too_big else 0
+    if too_big:
+        return 1
 
     ports = args.port or []
     if not ports:
