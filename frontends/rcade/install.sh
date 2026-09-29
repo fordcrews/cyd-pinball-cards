@@ -6,7 +6,7 @@
 # /rcade/share (R-Cade user space) is touched: no system files, no overlay save needed.
 set -e
 CYD_HOME="${CYD_HOME:-/rcade/share/cyd-pinball-cards}"
-U="${RCADE_USERSCRIPTS:-/rcade/share/userscripts}"          # TO-VERIFY on your R-Cade version
+U="${RCADE_USERSCRIPTS:-/rcade/share/userscripts}"          # confirmed on R-Cade 2.0.8
 SRC="$CYD_HOME/frontends/rcade"
 WITH_SELECTED=0
 START=1
@@ -26,6 +26,12 @@ fi
 
 install_one() {   # event folder, script path relative to $SRC
   mkdir -p "$U/$1"
+  dst="$U/$1/$(basename "$2")"
+  if [ -f "$dst" ] && ! cmp -s "$SRC/$2" "$dst"; then
+    # the backup goes to the kit folder, not next to the script: R-Cade runs every file in the event folder
+    mkdir -p "$CYD_HOME/backups" && cp -f "$dst" "$CYD_HOME/backups/$1-$(basename "$2").bak"
+    echo "backed up the previous $dst to $CYD_HOME/backups/"
+  fi
   cp -f "$SRC/$2" "$U/$1/"
   chmod +x "$U/$1/$(basename "$2")"
   echo "installed $U/$1/$(basename "$2")"
@@ -34,6 +40,7 @@ install_one system-ready userscripts/system-ready/cyd_ready.sh
 install_one game-start   userscripts/game-start/cyd_game_start.sh
 install_one game-end     userscripts/game-end/cyd_game_end.sh
 install_one shutdown     userscripts/shutdown/cyd_shutdown.sh
+install_one reboot       userscripts/shutdown/cyd_shutdown.sh     # R-Cade fires "reboot" on a restart
 [ "$WITH_SELECTED" = 1 ] && install_one game-selected optional/game-selected/cyd_game_selected.sh
 chmod +x "$SRC/cyd_rcade.sh"
 

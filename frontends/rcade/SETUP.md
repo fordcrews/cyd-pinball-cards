@@ -7,9 +7,10 @@ Python 3 and the kit brings its own serial (termios) and `/dev/uinput` code.
 Hardware notes for the Build-A-Cade FU (which USB port, power, mounting):
 [BUILD-A-CADE-FU.md](BUILD-A-CADE-FU.md).
 
-> Status: written from R-Cade's release notes, the retro-center FAQ, and community R-Cade scripts.
-> It has **not been run on a real R-Cade box yet**. Everything marked **TO-VERIFY** needs a check
-> on the cabinet (list at the end, plus what to send back).
+> Status: installed on R-Cade **2.0.8** (Radxa ROCK Pi 4B+, RK3399, kernel 6.19): user script
+> folders and arguments, Python modules, `/dev/uinput` and the USB serial drivers are confirmed
+> there (see "Checked on R-Cade 2.0.8" below). Still **TO-VERIFY** with a display attached: the
+> controller mapping of `cyd-pad` and R-Cade's keyboard mapping (list at the end).
 
 ## How it fits R-Cade
 
@@ -18,7 +19,7 @@ Hardware notes for the Build-A-Cade FU (which USB port, power, mounting):
 | Game start → card | user script `/rcade/share/userscripts/game-start/` | `userscripts/game-start/cyd_game_start.sh` |
 | Game end → idle playlist | user script `.../userscripts/game-end/` | `userscripts/game-end/cyd_game_end.sh` |
 | Boot → keypad daemon + idle | user script `.../userscripts/system-ready/` | `userscripts/system-ready/cyd_ready.sh` → `cyd_rcade.sh start` |
-| Shutdown → stop daemon | user script `.../userscripts/shutdown/` | `userscripts/shutdown/cyd_shutdown.sh` |
+| Shutdown / reboot → stop daemon | user scripts `.../userscripts/shutdown/` and `.../reboot/` | `userscripts/shutdown/cyd_shutdown.sh` (both) |
 | Scrolling → "Up next" (optional) | user script `.../userscripts/game-selected/` | `optional/game-selected/cyd_game_selected.sh` |
 | Keypad → R-Cade | virtual gamepad `cyd-pad` + virtual keyboard `cyd-keypad` on `/dev/uinput` | `cards/_keypad_rcade.json`, profile `rcade` |
 
@@ -33,6 +34,8 @@ Either way works:
 * **Network share (no SSH needed):** R-Cade shares its user area over SMB. From Windows open
   `\\rcade\share` (or `\\<cabinet IP>\share`) and copy the whole `cyd-pinball-cards` folder there.
   (**TO-VERIFY** the share name; the R-Cade install notes call it "the share folder".)
+  The kit needs `host/`, `cards/`, `frontends/rcade/`, `config.example.json`; `firmware/` and
+  `docs/` can stay on the PC.
 * **SSH:** `ssh root@rcade.local` (default password `retro`, change it in R-Cade's settings), then
   e.g. `scp -r cyd-pinball-cards root@rcade.local:/rcade/share/` from the PC.
 
@@ -44,7 +47,9 @@ Windows, but don't edit them with Notepad. If a script was saved with CRLF, fix 
 ```
 bash /rcade/share/cyd-pinball-cards/frontends/rcade/install.sh
 ```
-It copies the four hook scripts into `/rcade/share/userscripts/<event>/`, makes them executable,
+It copies the hook scripts into `/rcade/share/userscripts/<event>/` (system-ready, game-start,
+game-end, shutdown, reboot), makes them executable, backs up a different script of the same name
+to `cyd-pinball-cards/backups/` (never next to it: R-Cade runs every file in an event folder),
 creates `config.json` with `"profile": "rcade"` if there is none, prints a read-only check (R-Cade
 version, Python modules, `/dev/uinput`, USB serial devices and drivers) and starts the daemon.
 `--with-selected` also installs the optional game-selected script, `--no-start` skips the start.
@@ -119,30 +124,40 @@ The game-start log of each run: `/tmp/cyd_rcade.log`, and R-Cade's own user scri
 
 ## Hook arguments
 
-| Event folder | Arguments | Source |
-|---|---|---|
-| `game-start` | `$1` full ROM path, `$2` ROM file name without extension, `$3` game name, `$4` system (may be empty) | community script [gonzonia/LCDMarquee `userscripts/game-start/marquee-start.sh`](https://github.com/gonzonia/LCDMarquee); R-Cade 1.0.9 release notes: "Added a third argument to the game-start script that includes the title of the game" |
-| `game-selected` | `$1` system, `$2` ROM file name without extension, `$3` full ROM path | same repo, `userscripts/game-selected/marquee-selected.sh` |
-| `game-end`, `system-ready`, `shutdown` | none used | same repo; [gonzonia/ALU_Power_Mod](https://github.com/gonzonia/ALU_Power_Mod) (`system-ready`, `shutdown`) |
-| folder | `/rcade/share/userscripts/<event>/` | both repos; R-Cade release notes mention game-start, game-selected, system-selected, early/late boot ("lateboot") and screen-rotation user scripts and "documentation in userscripts folder" |
+From R-Cade's own `/rcade/share/userscripts/readme.txt` (2.0.8). An event is either a single
+script or a folder named exactly after the event; every script in the folder runs.
+
+| Event folder | Arguments |
+|---|---|
+| `game-start` | `$1` full ROM path, `$2` ROM file name without extension, `$3` game name, `$4` system |
+| `game-selected` | `$1` system, `$2` full path of the selected game, `$3` game name |
+| `system-ready` | none; "when the system is about to display the carousel" |
+| `game-end`, `shutdown`, `reboot` | none (`reboot` fires instead of `shutdown` on a restart) |
+| others (not used by the kit) | `earlyboot`, `lateboot`, `quit` (`$1` restart/reboot/shutdown/kodi), `wake`, `sleep`, `screen-rotated`, `screensaver-start`/`-stop`, `system-selected` (`$1` system), `config-changed`, `settings-changed`, `controls-changed`, `theme-changed` |
 
 The ROM path is `/rcade/share/roms/<system>/<rom>`; `cyd_push` takes the system from the folder
 after `roms/` when `$4` is empty, so games on USB drives (R-Cade mounts their `roms` folders too)
 work the same way.
 
+## Checked on R-Cade 2.0.8 (Radxa ROCK Pi 4B+, RK3399)
+* `/bin/sh` is bash, Python 3.13 with `serial` (pyserial 3.5), `evdev` and `psutil` built in.
+* `/dev/uinput` present (`CONFIG_INPUT_UINPUT=y`).
+* USB serial drivers built in: `cdc_acm` (Waveshare 7" native USB 303A:1001, and the CH343
+  1A86:55D3 UART bridge, which is CDC-compliant and also becomes `/dev/ttyACM*`) and `ch341`
+  (CH340 CYD, `/dev/ttyUSB*`). **No `cp210x`**: a CP2102 CYD will not show up on this kernel.
+* Some gamepads expose a CDC-ACM serial interface too (an Amazon Luna controller is `/dev/ttyACM0`
+  1949:041A): the kit only picks ports with a known display VID:PID, so it leaves those alone. The
+  Waveshare board then becomes `/dev/ttyACM1`.
+* BusyBox has `pgrep` but no `pkill` (`cyd_rcade.sh stop` scans `/proc` instead); `df -h` crashed
+  once on that box, use `busybox df -h`.
+
 ## TO-VERIFY on the cabinet
-* The user script folder names and arguments above (community sources, not official docs): read
-  the documentation R-Cade keeps in `/rcade/share/userscripts/`. If boot scripts live elsewhere
-  (e.g. a `lateboot` folder), put `cyd_ready.sh` there instead.
-* Whether R-Cade waits for user scripts (the kit backgrounds everything, so it should not matter)
-  and whether `system-ready` runs again when EmulationStation restarts (the start is idempotent).
+* Whether R-Cade waits for user scripts (the kit backgrounds everything, so it should not matter).
+  `system-ready` may run more than once per boot; the start is idempotent.
 * That R-Cade accepts `cyd-pad` as a controller and asks to map it; which player it gets.
 * R-Cade's keyboard mapping for pages 3 and 4.
-* The kernel has the USB-serial driver for the display: **ch341** (CH340 CYDs), **cp210x**, or
-  **cdc_acm** (Waveshare 7", native USB). `cyd_rcade.sh check` lists them. If ch341 is missing, a
-  CP2102-based CYD or the Waveshare board is the way around it.
-* `/dev/uinput`: R-Cade ships python-evdev (1.0.7: "so that users can write python scripts to
-  create key-press events") and evsieve, which both need it, so it is very likely present.
+* Other boards/kernels: the USB-serial driver for the display: **ch341** (CH340 CYDs),
+  **cp210x**, or **cdc_acm** (Waveshare 7", native USB). `cyd_rcade.sh check` lists them.
 * Pixelcade users: Pixelcade's `pixelweb` can scan serial ports (`-d auto`). If it ever grabs the
   CYD's port, give pixelweb its own device path with `-d` so the two don't fight over a port.
   (If the kit finds the Pixelcade port instead, add that port to `"exclude_ports"` in config.json.)

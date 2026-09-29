@@ -1,8 +1,8 @@
 #!/bin/bash
 # CYD cabinet display - R-Cade "game-start" user script: game card on every display.
-# R-Cade passes (community-documented, gonzonia/LCDMarquee userscripts/game-start/marquee-start.sh):
+# R-Cade passes (its own /rcade/share/userscripts/readme.txt, checked on 2.0.8):
 #   $1 full ROM path (/rcade/share/roms/<system>/<rom>.zip)  $2 ROM file name without extension
-#   $3 game name (3rd argument added in R-Cade 1.0.9)          $4 system name (may be empty)
+#   $3 game name                                               $4 system name (may be empty)
 # With no $4, cyd_push takes the system from the folder after roms/ in the path.
 # Install: /rcade/share/userscripts/game-start/cyd_game_start.sh  (frontends/rcade/install.sh)
 CYD_HOME="${CYD_HOME:-/rcade/share/cyd-pinball-cards}"

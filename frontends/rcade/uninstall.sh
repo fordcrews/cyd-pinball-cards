@@ -5,7 +5,7 @@ CYD_HOME="${CYD_HOME:-/rcade/share/cyd-pinball-cards}"
 U="${RCADE_USERSCRIPTS:-/rcade/share/userscripts}"
 bash "$CYD_HOME/frontends/rcade/cyd_rcade.sh" stop
 for f in system-ready/cyd_ready.sh game-start/cyd_game_start.sh game-end/cyd_game_end.sh \
-         shutdown/cyd_shutdown.sh game-selected/cyd_game_selected.sh; do
+         shutdown/cyd_shutdown.sh reboot/cyd_shutdown.sh game-selected/cyd_game_selected.sh; do
   [ -f "$U/$f" ] && rm -f "$U/$f" && echo "removed $U/$f"
 done
 exit 0

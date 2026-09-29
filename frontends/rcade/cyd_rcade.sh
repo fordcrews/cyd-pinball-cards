@@ -46,14 +46,19 @@ case "$1" in
       kill "$(cat "$PIDFILE")" 2>/dev/null
       for _ in 1 2 3 4 5 6 7 8 9 10; do running || break; sleep 0.3; done
       echo "cyd_daemon stopped"
-    elif [ -z "$CYD_PIDFILE" ] && command -v pkill >/dev/null 2>&1; then
-      pkill -f "$CYD_HOME/host/cyd_daemon.py" 2>/dev/null && echo "cyd_daemon stopped (pkill)"
+    elif [ -z "$CYD_PIDFILE" ]; then
+      # no pid file: find the daemon in /proc (R-Cade 2.0.8's BusyBox has pgrep but no pkill)
+      for p in /proc/[0-9]*; do
+        if tr '\0' ' ' <"$p/cmdline" 2>/dev/null | grep -q "$CYD_HOME/host/cyd_daemon.py"; then
+          kill "${p#/proc/}" 2>/dev/null && echo "cyd_daemon stopped (pid ${p#/proc/})"
+        fi
+      done
     fi
     rm -f "$PIDFILE"
     ;;
   restart)
-    "$0" stop
-    "$0" start
+    bash "$0" stop
+    bash "$0" start
     ;;
   status)
     if running; then echo "running (pid $(cat "$PIDFILE"))"; else echo "stopped"; fi
@@ -67,17 +72,22 @@ case "$1" in
       if "$PY" -c "import $m" 2>/dev/null; then echo "  python module $m: yes"; else echo "  python module $m: no"; fi
     done
     if [ -e /dev/uinput ]; then echo "/dev/uinput: present"; else echo "/dev/uinput: MISSING (modprobe uinput)"; fi
-    echo "USB serial devices:"; ls -l /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || echo "  none (is the display plugged in? kernel drivers ch341 / cp210x / cdc_acm?)"
+    echo "USB serial devices:"; found=0
+    for t in /dev/ttyUSB* /dev/ttyACM*; do [ -e "$t" ] && { echo "  $(ls -l "$t")"; found=1; }; done
+    [ "$found" = 1 ] || echo "  none (is the display plugged in? kernel drivers ch341 / cp210x / cdc_acm?)"
     for d in ch341 cp210x cdc_acm usbserial; do
-      if [ -d "/sys/bus/usb-serial/drivers/$d" ] || [ -d "/sys/bus/usb/drivers/$d" ] || [ -d "/sys/module/$d" ]; then
+      if [ -d "/sys/bus/usb-serial/drivers/$d" ] || [ -d "/sys/bus/usb-serial/drivers/$d-uart" ] \
+         || [ -d "/sys/bus/usb/drivers/$d" ] || [ -d "/sys/module/$d" ]; then
         echo "  driver $d: yes"
+      else
+        echo "  driver $d: no"
       fi
     done
-    echo "userscripts:"; for ev in system-ready game-start game-end shutdown game-selected; do
+    echo "userscripts:"; for ev in system-ready game-start game-end shutdown reboot game-selected; do
       f=$(ls "${RCADE_USERSCRIPTS:-/rcade/share/userscripts}/$ev/"cyd_* 2>/dev/null); echo "  $ev: ${f:-none}"; done
     "$PY" "$CYD_HOME/host/cyd_push.py" --list-ports 2>&1
     "$PY" "$CYD_HOME/host/cyd_push.py" --show-config 2>&1
-    "$0" status
+    bash "$0" status
     ;;
   *)
     echo "usage: $0 start|stop|restart|status|check"
