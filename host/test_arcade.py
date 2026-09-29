@@ -178,6 +178,26 @@ class Profiles(unittest.TestCase):
         os.environ["CYD_DEFAULT_PROFILE"] = "arcade"
         self.assertEqual(cyd_push.resolve_settings(self.args("--config", str(self.empty_cfg))).profile, "arcade")
 
+    def test_rcade_profile(self):
+        st = cyd_push.resolve_settings(self.args("--config", str(self.empty_cfg), "--profile", "rcade"))
+        self.assertEqual((st.idle_path.name, st.keypad_path.name, st.default_card, st.virtual_gamepad),
+                         ("_idle_arcade.json", "_keypad_rcade.json", "_default_arcade.json", True))
+        self.assertTrue(cyd_push.is_arcade("rcade"))
+        arc = cyd_push.resolve_settings(self.args("--config", str(self.empty_cfg), "--profile", "arcade"))
+        self.assertFalse(arc.virtual_gamepad)                  # only rcade turns the gamepad on
+        cfg = Path(self.tmp.name) / "rc.json"
+        cfg.write_text(json.dumps({"profile": "rcade", "virtual_gamepad": False}))
+        self.assertFalse(cyd_push.resolve_settings(self.args("--config", str(cfg))).virtual_gamepad)
+        cfg.write_text(json.dumps({"profile": "arcade", "virtual_gamepad": "yes"}))
+        self.assertTrue(cyd_push.resolve_settings(self.args("--config", str(cfg))).virtual_gamepad)
+        # cyd_daemon --gamepad / --no-gamepad beat config.json and the profile
+        import cyd_daemon
+        dp = cyd_daemon.build_parser()
+        self.assertFalse(cyd_push.resolve_settings(dp.parse_args(["--config", str(self.empty_cfg), "--profile", "rcade",
+                                                                  "--no-gamepad"])).virtual_gamepad)
+        self.assertTrue(cyd_push.resolve_settings(dp.parse_args(["--config", str(self.empty_cfg), "--gamepad"])).virtual_gamepad)
+        self.assertIsNone(dp.parse_args([]).gamepad)
+
     def test_config_json(self):
         cfg = Path(self.tmp.name) / "config.json"
         cfg.write_text(json.dumps({"profile": "arcade", "cabinet": "Test Cab", "port": "/dev/ttyUSB3",
@@ -218,6 +238,14 @@ class Profiles(unittest.TestCase):
         self.assertEqual(json.loads(r.stdout)["title"], "Medieval Madness")
         r = run("--keypad", "--profile", "arcade")
         self.assertEqual(len(json.loads(r.stdout)["layout"]["pages"]), 4)
+        r = run("--keypad", "--profile", "rcade")
+        pages = json.loads(r.stdout)["layout"]["pages"]
+        self.assertEqual([p["title"] for p in pages], ["R-CADE", "PAD SETUP", "KEYBOARD", "MAME"])
+        self.assertEqual(r.stderr.count("warning"), 0, r.stderr)
+        r = run("pacman", "--profile", "rcade")                        # rcade = arcade-style lookup
+        self.assertEqual(json.loads(r.stdout)["title"], "Pac-Man")
+        r = run("--show-config", "--profile", "rcade")
+        self.assertTrue(json.loads(r.stdout)["virtual_gamepad"])
 
 
 class SerialFallback(unittest.TestCase):
@@ -375,20 +403,80 @@ class FrontendScripts(unittest.TestCase):
                                                                "Street Fighter II' - Champion Edition"],
              "table", "Street Fighter II"),
             ("emulationstation/game-end/cyd_game_end.sh", [], "idle", "Crews Arcade"),
+            # R-Cade user scripts: $1 path, $2 ROM name, $3 game name, $4 system (may be empty)
+            ("rcade/userscripts/game-start/cyd_game_start.sh", ["/rcade/share/roms/mame/mslug.zip", "mslug",
+                                                                "Metal Slug", "mame"], "table", "Metal Slug"),
+            ("rcade/userscripts/game-start/cyd_game_start.sh", ["/rcade/share/roms/fbneo/sf2.zip", "sf2",
+                                                                "Street Fighter II", ""], "table", "Street Fighter II"),
+            ("rcade/userscripts/game-start/cyd_game_start.sh", ["/rcade/share/external/USB1/roms/arcade/pacman.zip",
+                                                                "pacman", "Pac-Man"], "table", "Pac-Man"),
+            ("rcade/userscripts/game-end/cyd_game_end.sh", [], "idle", "Crews Arcade"),
+            # optional game-selected: $1 system, $2 ROM name, $3 path -> idle with "up next"
+            ("rcade/optional/game-selected/cyd_game_selected.sh", ["mame", "mslug", "/rcade/share/roms/mame/mslug.zip"],
+             "idle", "Crews Arcade"),
         ]
         for script, argv, cmd, want in cases:
             before = len(fake.received)
             r = subprocess.run(["bash", str(self.FE / script), *argv], env=env, timeout=30,
                                stdin=subprocess.DEVNULL, capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, f"{script}: {r.stderr}")
-            end = time.time() + 15            # the scripts push in the background
-            while len(fake.received) == before and time.time() < end:
+            end = time.time() + 15            # the scripts push in the background (after a ping)
+            def new():
+                return [x for x in fake.received[before:] if x.get("cmd") not in ("ping", "hello")]
+            while not new() and time.time() < end:
                 time.sleep(0.05)
-            self.assertGreater(len(fake.received), before, f"{script} {argv}: nothing arrived")
-            m = fake.received[-1]
+            self.assertTrue(new(), f"{script} {argv}: nothing arrived")
+            m = new()[-1]
             self.assertEqual(m.get("cmd"), cmd, script)
             self.assertEqual(m.get("title") if cmd == "table" else m.get("cabinet"), want, f"{script} {argv}")
+            if "game-selected" in script:
+                self.assertEqual(m.get("selected"), "Metal Slug")
             time.sleep(0.2)                   # let the pushing process close the port
+
+    def test_rcade_control_script(self):
+        """frontends/rcade/cyd_rcade.sh start/status/stop (and the system-ready + shutdown hooks) with
+        the daemon in dry-run mode against fake_cyd; the idle playlist arrives after start."""
+        import fake_cyd
+        fake = fake_cyd.FakeCyd(log=lambda *_: None)
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "config.json").write_text(json.dumps({"port": fake.path, "cabinet": "Build-A-Cade FU"}))
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            lport = s.getsockname()[1]
+        env = dict(os.environ, CYD_HOME=str(HERE.parent), CYD_CONFIG=str(tmp / "config.json"),
+                   CYD_NO_PYSERIAL="1", CYD_DAEMON_PORT=str(lport), CYD_PIDFILE=str(tmp / "d.pid"),
+                   CYD_LOGDIR=str(tmp / "logs"), CYD_IDLE_DELAY="1", CYD_DAEMON_ARGS="--dry-run -v")
+        env.pop("CYD_DEFAULT_PROFILE", None)
+        ctl = str(self.FE / "rcade" / "cyd_rcade.sh")
+
+        def sh(*argv, script=ctl):
+            return subprocess.run(["bash", script, *argv], env=env, timeout=30, stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True)
+        try:
+            r = sh(script=str(self.FE / "rcade/userscripts/system-ready/cyd_ready.sh"))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            end = time.time() + 20
+            while not [m for m in fake.received if m.get("cmd") == "idle"] and time.time() < end:
+                time.sleep(0.1)
+            idle = [m for m in fake.received if m.get("cmd") == "idle"]
+            log = (tmp / "logs" / "cyd_daemon.log")
+            self.assertTrue(idle, log.read_text() if log.exists() else "no log")
+            self.assertEqual(idle[-1]["cabinet"], "Build-A-Cade FU")
+            self.assertIn("running", sh("status").stdout)
+            text = log.read_text()
+            self.assertIn("profile rcade", text)                     # CYD_DEFAULT_PROFILE from the script
+            self.assertIn("virtual gamepad cyd-pad", text)
+            fake.key("pad:select+start")                              # R-Cade exit combo from the keypad
+            end = time.time() + 10
+            while "linux pad: 314v 315v 315^ 314^" not in log.read_text() and time.time() < end:
+                time.sleep(0.1)
+            self.assertIn("linux pad: 314v 315v 315^ 314^", log.read_text())
+            self.assertIn("already running", sh("start").stdout)
+        finally:
+            r = sh(script=str(self.FE / "rcade/userscripts/shutdown/cyd_shutdown.sh"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("stopped", sh("status").stdout)
+        self.assertFalse((tmp / "d.pid").exists())
 
 
 if __name__ == "__main__":

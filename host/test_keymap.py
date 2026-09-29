@@ -281,6 +281,182 @@ class ArcadeLayout(unittest.TestCase):
         self.assertLess(len(json.dumps(msg, separators=(",", ":")).encode()), cyd_push.MAX_LINE)
 
 
+class PadKeys(unittest.TestCase):
+    """'pad:...' names for the virtual gamepad (R-Cade and other gamepad-driven frontends)."""
+    def test_parse_and_aliases(self):
+        self.assertEqual(keymap.parse_pad("pad:select+start"), ["select", "start"])
+        self.assertEqual(keymap.parse_pad(" PAD:Select + Start "), ["select", "start"])
+        self.assertEqual(keymap.parse_pad("pad:a+b+x+y"), ["south", "east", "north", "west"])
+        self.assertEqual(keymap.parse_pad("pad:coin"), ["select"])
+        self.assertEqual(keymap.parse_pad("pad:up+left"), ["up", "left"])
+        self.assertTrue(keymap.is_pad_key("pad:start"))
+        self.assertFalse(keymap.is_pad_key("start"))
+        self.assertEqual(keymap.describe("pad:Select+START"), "pad:select+start")
+
+    def test_bad_pad_keys(self):
+        for bad in ("pad:", "pad:turbo", "pad:start+start", "pad:up+down", "pad:left+right", "start"):
+            with self.assertRaises(keymap.KeyNameError, msg=bad):
+                keymap.parse_pad(bad)
+        with self.assertRaises(keymap.KeyNameError) as cm:
+            keymap.parse_combo("pad:start")                 # keyboard path explains what is needed
+        self.assertIn("virtual_gamepad", str(cm.exception))
+
+    def test_codes_match_kernel(self):
+        expect = {"south": 0x130, "east": 0x131, "north": 0x133, "west": 0x134, "l": 0x136, "r": 0x137,
+                  "select": 0x13A, "start": 0x13B, "mode": 0x13C}
+        for name, code in expect.items():
+            self.assertEqual(keymap.PAD_BUTTONS[name][1], code, name)
+        self.assertEqual(keymap.PAD_HAT["up"], (keymap.ABS_HAT0Y, -1))
+        hdr = Path("/usr/include/linux/input-event-codes.h")
+        if hdr.is_file():
+            txt = hdr.read_text()
+            for name, (sym, code) in keymap.PAD_BUTTONS.items():
+                m = re.search(rf"#define\s+{sym}\s+(0x[0-9a-fA-F]+|\d+)", txt)
+                self.assertIsNotNone(m, sym)
+                self.assertEqual(int(m.group(1), 0), code, sym)
+
+    def test_sequence_holds_hotkey_first(self):
+        downs, ups = keymap.pad_sequence("pad:select+start")
+        self.assertEqual(downs, [(keymap.EV_KEY, 0x13A, 1), (keymap.EV_KEY, 0x13B, 1)])
+        self.assertEqual(ups, [(keymap.EV_KEY, 0x13B, 0), (keymap.EV_KEY, 0x13A, 0)])
+        downs, ups = keymap.pad_sequence("pad:left")
+        self.assertEqual((downs, ups), ([(keymap.EV_ABS, keymap.ABS_HAT0X, -1)], [(keymap.EV_ABS, keymap.ABS_HAT0X, 0)]))
+
+
+class GamepadBackend(unittest.TestCase):
+    def test_setup_and_chord_with_mock(self):
+        ops = FakeOps()
+        pad = keymap.GamepadInjector("/dev/uinput", ops=ops, hold_ms=0, chord_gap_ms=0, settle_s=0)
+        self.assertIn(("ioctl", keymap.UI_SET_EVBIT, keymap.EV_KEY), ops.calls)
+        self.assertIn(("ioctl", keymap.UI_SET_EVBIT, keymap.EV_ABS), ops.calls)
+        keybits = sorted(c[2] for c in ops.calls if c[0] == "ioctl" and c[1] == keymap.UI_SET_KEYBIT)
+        self.assertEqual(keybits, keymap.all_pad_button_codes())
+        absbits = sorted(c[2] for c in ops.calls if c[0] == "ioctl" and c[1] == keymap.UI_SET_ABSBIT)
+        self.assertEqual(absbits, [keymap.ABS_X, keymap.ABS_Y, keymap.ABS_HAT0X, keymap.ABS_HAT0Y])
+        self.assertIn(("ioctl", keymap.UI_DEV_CREATE, 0), ops.calls)
+        dev = ops.writes[0]
+        self.assertEqual(len(dev), 1116)
+        fields = struct.unpack(f"=80sHHHHi{4 * 64}i", dev)
+        self.assertEqual(fields[0].rstrip(b"\0"), b"cyd-pad")
+        self.assertEqual(fields[3], keymap.PAD_PRODUCT)
+        absmax, absmin = fields[6:6 + 64], fields[6 + 64:6 + 128]
+        self.assertEqual((absmin[keymap.ABS_HAT0X], absmax[keymap.ABS_HAT0X]), (-1, 1))
+        self.assertEqual((absmin[keymap.ABS_X], absmax[keymap.ABS_X]), (-32767, 32767))
+        ops.writes.clear()
+        self.assertTrue(pad.send("pad:select+start"))
+        evs = [struct.unpack("@llHHi", w)[2:] for w in ops.writes]
+        self.assertEqual([e for e in evs if e[0] != keymap.EV_SYN],
+                         [(1, 0x13A, 1), (1, 0x13B, 1), (1, 0x13B, 0), (1, 0x13A, 0)])
+        self.assertEqual(sum(1 for e in evs if e[0] == keymap.EV_SYN), 4)
+        ops.writes.clear()
+        self.assertTrue(pad.send("pad:up"))
+        evs = [struct.unpack("@llHHi", w)[2:] for w in ops.writes if struct.unpack("@llHHi", w)[2] != 0]
+        self.assertEqual(evs, [(keymap.EV_ABS, keymap.ABS_HAT0Y, -1), (keymap.EV_ABS, keymap.ABS_HAT0Y, 0)])
+        pad.close()
+        self.assertIn(("ioctl", keymap.UI_DEV_DESTROY, 0), ops.calls)
+
+    def test_keyboard_struct_unchanged(self):
+        # the keyboard's uinput_user_dev still has all-zero axis ranges
+        fields = struct.unpack(f"=80sHHHHi{4 * 64}i", keymap.pack_uinput_user_dev())
+        self.assertEqual(set(fields[6:]), {0})
+
+    def test_routing(self):
+        sent = []
+
+        class Rec:
+            dry_run, backend = False, "rec"
+
+            def __init__(self, tag):
+                self.tag = tag
+
+            def send(self, key, mods=()):
+                sent.append((self.tag, key))
+                return True
+
+            def foreground_title(self):
+                return "fg"
+
+            def close(self):
+                sent.append((self.tag, "closed"))
+
+        r = keymap.RoutingInjector(Rec("kb"), Rec("pad"), log=lambda *_: None)
+        self.assertTrue(r.send("esc"))
+        self.assertTrue(r.send("pad:select+start"))
+        self.assertEqual(sent, [("kb", "esc"), ("pad", "pad:select+start")])
+        self.assertEqual((r.backend, r.dry_run, r.foreground_title()), ("rec+rec", False, "fg"))
+        r.close()
+        self.assertEqual(sent[-2:], [("pad", "closed"), ("kb", "closed")])
+        out = []
+        nopad = keymap.RoutingInjector(Rec("kb"), None, log=out.append)
+        self.assertFalse(nopad.send("pad:start"))
+        self.assertTrue(out)
+
+    def test_make_injector_with_gamepad_dry_run(self):
+        out = []
+        inj = keymap.make_injector("dry-run", log=out.append, gamepad=True)
+        self.assertIsInstance(inj, keymap.RoutingInjector)
+        self.assertTrue(inj.dry_run)
+        self.assertTrue(inj.send("pad:select+west"))
+        self.assertTrue(any("pad:select+west -> linux pad: 314v 308v 308^ 314^" in m for m in out), out)
+        self.assertTrue(inj.send("f1"))
+        plain = keymap.make_injector("dry-run", log=out.append)
+        self.assertNotIsInstance(plain, keymap.RoutingInjector)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux only")
+    def test_make_pad_falls_back(self):
+        out = []
+        missing = os.path.join(tempfile.gettempdir(), "no-such-uinput-device")
+        pad = keymap.make_pad(log=out.append, uinput_path=missing)
+        self.assertIsInstance(pad, keymap.DryRunPad)
+        self.assertTrue(any("virtual gamepad unavailable" in m for m in out), out)
+
+
+class RcadeLayout(unittest.TestCase):
+    def setUp(self):
+        self.cfg = json.loads((CARDS / "_keypad_rcade.json").read_text(encoding="utf-8"))
+
+    def keys(self):
+        return [k for pg in self.cfg["pages"] for k in pg["keys"] if isinstance(k, dict) and k]
+
+    def test_every_key_maps(self):
+        self.assertLessEqual(len(self.cfg["pages"]), cyd_push.MAX_KP_PAGES)
+        for pg in self.cfg["pages"]:
+            self.assertLessEqual(len([k for k in pg["keys"] if k]), cyd_push.MAX_KP_KEYS)
+            self.assertLessEqual(len(pg["keys"]), pg["cols"] * pg["rows"])
+        for k in self.keys():
+            if k.get("key"):
+                if keymap.is_pad_key(k["key"]):
+                    keymap.parse_pad(k["key"])
+                else:
+                    keymap.key_sequence(k["key"])
+                    keymap.linux_sequence(k["key"])
+
+    def test_rcade_documented_combos_present(self):
+        keys = {str(k.get("key") or k.get("action")).lower() for k in self.keys()}
+        # retro-center.com/about-r-cade FAQ: exit = hotkey+start, save = hotkey+West, load = hotkey+North,
+        # RetroArch menu = hotkey+South, coin = select (hotkey is usually select)
+        need = {"pad:select+start", "pad:select+west", "pad:select+north", "pad:select+south", "pad:select",
+                "pad:start", "pad:up", "pad:down", "pad:left", "pad:right", "pad:south", "pad:east",
+                "pad:north", "pad:west", "pad:l", "pad:r", "exit", "next", "prev",
+                "esc", "enter", "up", "down", "left", "right", "backspace", "tab", "f1"}
+        self.assertEqual(need - keys, set())
+        self.assertEqual(self.cfg["watch_processes"], [])
+        self.assertEqual(self.cfg["pages"][0]["title"], "R-CADE")
+
+    def test_message(self):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            msg = cyd_push.build_keypad_msg(self.cfg)
+        self.assertEqual(err.getvalue(), "")                  # no warnings for pad: keys
+        self.assertEqual(len(msg["layout"]["pages"]), 4)
+        self.assertLess(len(json.dumps(msg, separators=(",", ":")).encode()), cyd_push.MAX_LINE)
+        with contextlib.redirect_stderr(err):
+            cyd_push.build_keypad_msg({"pages": [{"title": "T", "keys": [{"key": "pad:turbo"}]}]})
+        self.assertIn("unknown gamepad button", err.getvalue())
+
+
 class Watcher(unittest.TestCase):
     def test_proc_scan(self):
         with tempfile.TemporaryDirectory() as root:

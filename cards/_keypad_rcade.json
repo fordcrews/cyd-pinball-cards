@@ -1,0 +1,42 @@
+{
+  "_comment": "R-Cade touch keypad (GRS Build-A-Cade FU / Viper SBC): cyd_daemon.py --profile rcade, or config.json \"profile\": \"rcade\"; long-press the display to open it. Page R-CADE presses controller buttons on the virtual gamepad 'cyd-pad' (\"pad:...\" keys, needs \"virtual_gamepad\": true, which the rcade profile sets). Map cyd-pad once in R-Cade's controller/input settings (page PAD SETUP has every button) and give it SELECT as its hotkey. The combos are R-Cade's documented ones (https://www.retro-center.com/about-r-cade/ FAQ): exit game = hotkey (usually select) + start; save state = hotkey + West (usually Y); load state = hotkey + North (usually X); RetroArch menu = hotkey + South (usually B); arcade coin = select. R-Cade names buttons Nintendo-style (South = B, East = A, West = Y, North = X); the labels show both. KEYBOARD and MAME pages send keys on the virtual keyboard 'cyd-keypad': R-Cade has its own keyboard mapping (Input menu) that is not published, so those keys are the MAME / RetroArch defaults and are TO-VERIFY on R-Cade. Warning from the R-Cade FAQ: pressing Esc 6 times switches R-Cade between its keyboard and remote-control mappings. watch_processes is empty: open the keypad by long-press (2 s).",
+  "watch_processes": [],
+  "pages": [
+    {
+      "title": "R-CADE", "cols": 4, "rows": 4,
+      "keys": [
+        { "label": "COIN\nSELECT", "key": "pad:select", "color": "#806000" }, { "label": "START", "key": "pad:start", "color": "#006000" }, { "label": "EXIT\nGAME", "key": "pad:select+start", "color": "#802000" }, { "label": "RA\nMENU", "key": "pad:select+south" },
+        { "label": "SAVE\nSTATE", "key": "pad:select+west" }, { "label": "@up", "key": "pad:up" }, { "label": "LOAD\nSTATE", "key": "pad:select+north" }, { "label": "A\nEAST", "key": "pad:east", "color": "#004080" },
+        { "label": "@left", "key": "pad:left" }, { "label": "@down", "key": "pad:down" }, { "label": "@right", "key": "pad:right" }, { "label": "B\nSOUTH", "key": "pad:south", "color": "#004080" },
+        { "label": "Y\nWEST", "key": "pad:west" }, { "label": "X\nNORTH", "key": "pad:north" }, { "label": "EXIT", "action": "exit" }, { "label": "@next", "action": "next" }
+      ]
+    },
+    {
+      "title": "PAD SETUP", "cols": 4, "rows": 4,
+      "keys": [
+        { "label": "L", "key": "pad:l" }, { "label": "R", "key": "pad:r" }, { "label": "L2", "key": "pad:l2" }, { "label": "R2", "key": "pad:r2" },
+        { "label": "L3", "key": "pad:l3" }, { "label": "R3", "key": "pad:r3" }, { "label": "MODE\nHOME", "key": "pad:mode" }, { "label": "SELECT", "key": "pad:select" },
+        { "label": "START", "key": "pad:start" }, { "label": "A\nEAST", "key": "pad:east" }, { "label": "B\nSOUTH", "key": "pad:south" }, { "label": "X\nNORTH", "key": "pad:north" },
+        { "label": "@prev", "action": "prev" }, { "label": "Y\nWEST", "key": "pad:west" }, { "label": "EXIT", "action": "exit" }, { "label": "@next", "action": "next" }
+      ]
+    },
+    {
+      "title": "KEYBOARD", "cols": 4, "rows": 4,
+      "keys": [
+        { "label": "ESC", "key": "esc" }, { "label": "@up", "key": "up" }, { "label": "TAB", "key": "tab" }, { "label": "ENTER", "key": "enter" },
+        { "label": "@left", "key": "left" }, { "label": "@down", "key": "down" }, { "label": "@right", "key": "right" }, { "label": "BKSP", "key": "backspace" },
+        { "label": "MENU\nF1", "key": "f1" }, { "label": "SAVE\nF2", "key": "f2" }, { "label": "LOAD\nF4", "key": "f4" }, { "label": "SPACE", "key": "space" },
+        { "label": "@prev", "action": "prev" }, { "label": "COIN\n5", "key": "5", "color": "#806000" }, { "label": "EXIT", "action": "exit" }, { "label": "@next", "action": "next" }
+      ]
+    },
+    {
+      "title": "MAME", "cols": 4, "rows": 4,
+      "keys": [
+        { "label": "1P\nSTART", "key": "1", "color": "#006000" }, { "label": "2P\nSTART", "key": "2", "color": "#006000" }, { "label": "COIN 2\n6", "key": "6", "color": "#806000" }, { "label": "TAB\nMENU", "key": "tab" },
+        { "label": "SERVICE\nF2", "key": "f2" }, { "label": "RESET\nF3", "key": "f3" }, { "label": "PAUSE\nP", "key": "p" }, { "label": "SVC\n9", "key": "9" },
+        { "label": "SAVE\nF6", "key": "f6" }, { "label": "LOAD\nF7", "key": "f7" }, { "label": "QSAVE\nSH+F6", "key": "shift+f6" }, { "label": "QLOAD\nSH+F7", "key": "shift+f7" },
+        { "label": "@prev", "action": "prev" }, { "label": "ESC", "key": "esc" }, { "label": "EXIT", "action": "exit" }, { "label": "@next", "action": "next" }
+      ]
+    }
+  ]
+}

@@ -9,6 +9,11 @@ KEY_* codes, plus the key injectors:
              Both need write access to /dev/uinput: root has it (Batocera runs everything as
              root); on Raspberry Pi OS see frontends/retropie/SETUP.md for a udev rule.
   * any OS:  dry-run, which only logs what it would press                backend "dry-run"
+  * Linux, optional: a virtual *gamepad* "cyd-pad" next to the keyboard (config.json
+             "virtual_gamepad": true, on by default in the rcade profile). Keypad keys named
+             "pad:<button>[+<button>...]" press gamepad buttons on it, e.g. "pad:select+start" (a
+             controller hotkey combo, for frontends such as R-Cade that are driven by gamepad
+             mappings rather than keyboard shortcuts). Built-in /dev/uinput writer, no packages.
 
 make_injector(backend="auto") picks one. The name -> code tables and the event sequences are
 plain Python, so they are unit-tested on any OS (test_keymap.py).
@@ -22,6 +27,12 @@ Key names (case-insensitive):
   playpause, nexttrack, prevtrack, stop.
 Combos join names with "+": "alt+f4", "ctrl+shift+esc". The last name is the key, the others
 must be modifiers. Use "plus" for the + key itself.
+
+Gamepad names (after "pad:"), by position so they mean the same on every pad layout:
+  south, east, west, north (face buttons; Linux BTN_SOUTH = BTN_A, BTN_EAST = BTN_B,
+  BTN_NORTH = BTN_X, BTN_WEST = BTN_Y, so a/b/x/y are accepted as aliases for those),
+  select, start, mode (guide/home), l, r, l2, r2, l3, r3, and up/down/left/right (D-pad, sent
+  as hat 0). "pad:select+start" holds select, then presses start, then releases both.
 """
 from __future__ import annotations
 
@@ -108,6 +119,9 @@ def parse_combo(key: str, mods: list[str] | tuple[str, ...] = ()) -> tuple[list[
     raw = str(key).strip()
     if not raw:
         raise KeyNameError("empty key name")
+    if is_pad_key(raw):
+        raise KeyNameError(f"'{key}' is a gamepad key: it needs the virtual gamepad "
+                           "(config.json \"virtual_gamepad\": true, Linux only)")
     parts = [p for p in raw.split("+")] if raw != "+" else ["plus"]
     if any(p.strip() == "" for p in parts):
         raise KeyNameError(f"bad combo '{key}' (use 'plus' for the + key)")
@@ -191,6 +205,82 @@ def all_linux_codes() -> list[int]:
     return sorted({c for _, c in LINUX_KEY.values()})
 
 
+# ---------------------------------------------------------------- gamepad names ("pad:...")
+EV_ABS = 0x03
+ABS_X, ABS_Y, ABS_HAT0X, ABS_HAT0Y = 0x00, 0x01, 0x10, 0x11
+PAD_PREFIX = "pad:"
+# linux/input-event-codes.h (stable ABI); names by position, like the kernel's BTN_SOUTH etc.
+PAD_BUTTONS: dict[str, tuple[str, int]] = {
+    "south": ("BTN_SOUTH", 0x130), "east": ("BTN_EAST", 0x131), "north": ("BTN_NORTH", 0x133),
+    "west": ("BTN_WEST", 0x134), "l": ("BTN_TL", 0x136), "r": ("BTN_TR", 0x137),
+    "l2": ("BTN_TL2", 0x138), "r2": ("BTN_TR2", 0x139), "select": ("BTN_SELECT", 0x13A),
+    "start": ("BTN_START", 0x13B), "mode": ("BTN_MODE", 0x13C), "l3": ("BTN_THUMBL", 0x13D),
+    "r3": ("BTN_THUMBR", 0x13E),
+}
+PAD_HAT: dict[str, tuple[int, int]] = {          # D-pad as hat 0: (axis, value)
+    "up": (ABS_HAT0Y, -1), "down": (ABS_HAT0Y, 1), "left": (ABS_HAT0X, -1), "right": (ABS_HAT0X, 1),
+}
+PAD_ALIASES = {
+    "a": "south", "b": "east", "x": "north", "y": "west",          # Linux BTN_A/B/X/Y
+    "cross": "south", "circle": "east", "triangle": "north", "square": "west",
+    "back": "select", "coin": "select", "guide": "mode", "home": "mode",
+    "tl": "l", "tr": "r", "lb": "l", "rb": "r", "l1": "l", "r1": "r", "tl2": "l2", "tr2": "r2",
+    "lt": "l2", "rt": "r2", "thumbl": "l3", "thumbr": "r3",
+    "dpup": "up", "dpdown": "down", "dpleft": "left", "dpright": "right",
+}
+PAD_AXIS_RANGE = {ABS_X: (-32767, 32767), ABS_Y: (-32767, 32767), ABS_HAT0X: (-1, 1), ABS_HAT0Y: (-1, 1)}
+
+
+def is_pad_key(key) -> bool:
+    return str(key).strip().lower().startswith(PAD_PREFIX)
+
+
+def parse_pad(key: str) -> list[str]:
+    """'pad:select+start' -> ['select', 'start'] (canonical names, press order kept)."""
+    raw = str(key).strip().lower()
+    if not raw.startswith(PAD_PREFIX):
+        raise KeyNameError(f"'{key}' is not a gamepad key (they start with '{PAD_PREFIX}')")
+    body = raw[len(PAD_PREFIX):].replace(" ", "")
+    if not body:
+        raise KeyNameError(f"'{key}': no gamepad button after '{PAD_PREFIX}'")
+    out: list[str] = []
+    for part in body.split("+"):
+        n = PAD_ALIASES.get(part, part)
+        if n not in PAD_BUTTONS and n not in PAD_HAT:
+            raise KeyNameError(f"unknown gamepad button '{part}' in '{key}' "
+                               f"(use {', '.join(list(PAD_BUTTONS) + list(PAD_HAT))})")
+        if n in out:
+            raise KeyNameError(f"gamepad button '{n}' twice in '{key}'")
+        if n in PAD_HAT and any(o in PAD_HAT and PAD_HAT[o][0] == PAD_HAT[n][0] for o in out):
+            raise KeyNameError(f"'{key}': opposite D-pad directions at once")
+        out.append(n)
+    return out
+
+
+def pad_events(name: str, down: bool) -> tuple[int, int, int]:
+    """One canonical pad name -> (EV_KEY/EV_ABS, code, value)."""
+    if name in PAD_HAT:
+        axis, val = PAD_HAT[name]
+        return (EV_ABS, axis, val if down else 0)
+    return (EV_KEY, PAD_BUTTONS[name][1], 1 if down else 0)
+
+
+def pad_sequence(key: str) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]]:
+    """'pad:select+start' -> (presses in order, releases in reverse order)."""
+    names = parse_pad(key)
+    return [pad_events(n, True) for n in names], [pad_events(n, False) for n in reversed(names)]
+
+
+def all_pad_button_codes() -> list[int]:
+    return sorted(c for _, c in PAD_BUTTONS.values())
+
+
+def _pad_log(key: str) -> str:
+    downs, ups = pad_sequence(key)
+    return " ".join(f"{'hat' if t == EV_ABS else ''}{c}{'=' + str(v) if t == EV_ABS else ('v' if v else '^')}"
+                    for t, c, v in downs + ups)
+
+
 @dataclass(frozen=True)
 class KeyEvent:
     vk: int
@@ -212,6 +302,8 @@ def key_sequence(key: str, mods=()) -> list[KeyEvent]:
 
 
 def describe(key: str, mods=()) -> str:
+    if is_pad_key(key):
+        return "pad:" + "+".join(parse_pad(key))
     ms, main = parse_combo(key, mods)
     return "+".join(ms + [main])
 
@@ -319,6 +411,8 @@ BUS_VIRTUAL = 0x06
 UINPUT_NAME = "cyd-keypad"
 # ioctl numbers from linux/uinput.h: _IOW('U', 100/101, int), _IO('U', 1/2)
 UI_SET_EVBIT, UI_SET_KEYBIT, UI_DEV_CREATE, UI_DEV_DESTROY = 0x40045564, 0x40045565, 0x5501, 0x5502
+UI_SET_ABSBIT = 0x40045567                     # _IOW('U', 103, int)
+PAD_UINPUT_NAME, PAD_PRODUCT = "cyd-pad", 0xC7D1
 UINPUT_MAX_NAME_SIZE, ABS_CNT = 80, 64
 _EVENT_FMT = "@llHHi"     # struct input_event: timeval (2 x C long), __u16 type, __u16 code, __s32 value
 
@@ -328,12 +422,16 @@ def pack_input_event(etype: int, code: int, value: int) -> bytes:
 
 
 def pack_uinput_user_dev(name: str = UINPUT_NAME, vendor: int = 0x1209, product: int = 0xC7D0,
-                         version: int = 1) -> bytes:
+                         version: int = 1, abs_ranges: dict | None = None) -> bytes:
     """Legacy struct uinput_user_dev (name[80], input_id{bustype,vendor,product,version},
-    ff_effects_max, absmax/absmin/absfuzz/absflat[64]); 1116 bytes, works on every kernel."""
+    ff_effects_max, absmax/absmin/absfuzz/absflat[64]); 1116 bytes, works on every kernel.
+    abs_ranges: {axis: (min, max)} for devices with EV_ABS axes (the virtual gamepad)."""
+    absmax, absmin = [0] * ABS_CNT, [0] * ABS_CNT
+    for axis, (lo, hi) in (abs_ranges or {}).items():
+        absmin[axis], absmax[axis] = int(lo), int(hi)
     return struct.pack(f"={UINPUT_MAX_NAME_SIZE}sHHHHi{4 * ABS_CNT}i",
                        name.encode()[:UINPUT_MAX_NAME_SIZE - 1], BUS_VIRTUAL, vendor, product, version,
-                       0, *([0] * (4 * ABS_CNT)))
+                       0, *absmax, *absmin, *([0] * (2 * ABS_CNT)))
 
 
 class _OsOps:
@@ -432,14 +530,159 @@ class EvdevInjector(UinputInjector):
             pass
 
 
+class GamepadInjector:
+    """Virtual gamepad "cyd-pad" on /dev/uinput (standard library only). Face/shoulder/select/start
+    buttons as EV_KEY BTN_*, D-pad as hat 0, plus a centred left stick (ABS_X/ABS_Y) so SDL and
+    udev classify it as a joystick. send("pad:select+start") presses the buttons one after the
+    other (chord_gap_ms apart, so a hotkey is already held when the second button arrives), holds
+    them hold_ms, then releases in reverse order."""
+    backend = "uinput-pad"
+    dry_run = False
+
+    def __init__(self, path: str = "/dev/uinput", log=print, hold_ms: int = DEFAULT_HOLD_MS,
+                 chord_gap_ms: int = 50, ops: _OsOps | None = None, settle_s: float = 0.2):
+        self.log = log
+        self.hold_ms = max(DEFAULT_HOLD_MS, int(hold_ms))   # pads are polled per frame too
+        self.chord_gap_ms = max(0, int(chord_gap_ms))
+        self.ops = ops or _OsOps()
+        self.fd = self.ops.open(path)
+        try:
+            self.ops.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+            for code in all_pad_button_codes():
+                self.ops.ioctl(self.fd, UI_SET_KEYBIT, code)
+            self.ops.ioctl(self.fd, UI_SET_EVBIT, EV_ABS)
+            for axis in sorted(PAD_AXIS_RANGE):
+                self.ops.ioctl(self.fd, UI_SET_ABSBIT, axis)
+            self.ops.write(self.fd, pack_uinput_user_dev(PAD_UINPUT_NAME, product=PAD_PRODUCT,
+                                                         abs_ranges=PAD_AXIS_RANGE))
+            self.ops.ioctl(self.fd, UI_DEV_CREATE)
+        except Exception:
+            self.ops.close(self.fd)
+            raise
+        time.sleep(settle_s)
+
+    def _emit(self, etype: int, code: int, value: int):
+        self.ops.write(self.fd, pack_input_event(etype, code, value))
+        self.ops.write(self.fd, pack_input_event(EV_SYN, SYN_REPORT, 0))
+
+    def send(self, key: str, mods=()) -> bool:
+        downs, ups = pad_sequence(key)
+        try:
+            for i, ev in enumerate(downs):
+                if i and self.chord_gap_ms:
+                    time.sleep(self.chord_gap_ms / 1000.0)
+                self._emit(*ev)
+            time.sleep(self.hold_ms / 1000.0)
+            for ev in ups:
+                self._emit(*ev)
+            return True
+        except OSError as e:
+            self.log(f"uinput (pad) write failed: {e}")
+            return False
+
+    def foreground_title(self) -> str:
+        return ""
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                self.ops.ioctl(self.fd, UI_DEV_DESTROY)
+            except OSError:
+                pass
+            self.ops.close(self.fd)
+            self.fd = None
+
+
+class DryRunPad:
+    """Logs gamepad keys instead of pressing them."""
+    backend = "dry-run-pad"
+    dry_run = True
+
+    def __init__(self, log=print):
+        self.log = log
+
+    def send(self, key: str, mods=()) -> bool:
+        self.log(f"[dry-run] {describe(key)} -> linux pad: {_pad_log(key)}")
+        return True
+
+    def foreground_title(self) -> str:
+        return ""
+
+    def close(self):
+        pass
+
+
+class RoutingInjector:
+    """Keyboard injector + virtual gamepad: "pad:..." keys go to the pad, everything else to the
+    keyboard. Same interface as the single injectors (send / foreground_title / close)."""
+
+    def __init__(self, keyboard, pad, log=print):
+        self.keyboard, self.pad, self.log = keyboard, pad, log
+
+    @property
+    def backend(self) -> str:
+        return f"{self.keyboard.backend}+{self.pad.backend}" if self.pad else self.keyboard.backend
+
+    @property
+    def dry_run(self) -> bool:
+        return self.keyboard.dry_run
+
+    def send(self, key: str, mods=()) -> bool:
+        if is_pad_key(key):
+            if self.pad is None:
+                self.log(f"{key}: virtual gamepad unavailable (Linux only); not pressed")
+                return False
+            return self.pad.send(key)
+        return self.keyboard.send(key, mods)
+
+    def foreground_title(self) -> str:
+        return self.keyboard.foreground_title()
+
+    def close(self):
+        for inj in (self.pad, self.keyboard):
+            if inj is not None:
+                inj.close()
+
+
+def make_pad(dry_run: bool = False, log=print, hold_ms: int = DEFAULT_HOLD_MS, uinput_path: str = "/dev/uinput"):
+    """Virtual gamepad for "pad:" keys: GamepadInjector on Linux, DryRunPad when dry-running or when
+    /dev/uinput can't be opened, None on Windows/macOS (no virtual gamepad there)."""
+    if dry_run:
+        return DryRunPad(log)
+    if not sys.platform.startswith("linux"):
+        log("virtual gamepad: Linux only; pad: keys are ignored on this OS")
+        return None
+    try:
+        return GamepadInjector(uinput_path, log=log, hold_ms=hold_ms)
+    except FileNotFoundError:
+        why = f"{uinput_path} missing (try: modprobe uinput)"
+    except PermissionError:
+        why = f"no write access to {uinput_path} (run as root or add a udev rule)"
+    except OSError as e:
+        why = f"uinput: {e}"
+    log(f"virtual gamepad unavailable ({why}); logging pad keys only (dry-run)")
+    return DryRunPad(log)
+
+
 BACKENDS = ("auto", "sendinput", "evdev", "uinput", "dry-run")
 
 
 def make_injector(backend: str = "auto", dry_run: bool = False, use_scancodes: bool = False,
-                  log=print, hold_ms: int = DEFAULT_HOLD_MS, uinput_path: str = "/dev/uinput"):
+                  log=print, hold_ms: int = DEFAULT_HOLD_MS, uinput_path: str = "/dev/uinput",
+                  gamepad: bool = False):
     """Pick a key injector. 'auto': SendInput on Windows; on Linux python-evdev, else the built-in
     uinput writer. If the Linux device can't be opened (no /dev/uinput, no permission) it logs why
-    and returns a dry-run injector, so the daemon keeps running (cards still work)."""
+    and returns a dry-run injector, so the daemon keeps running (cards still work).
+    gamepad=True adds the virtual gamepad for "pad:" keys (RoutingInjector)."""
+    kb = _make_keyboard(backend, dry_run, use_scancodes, log, hold_ms, uinput_path)
+    if not gamepad:
+        return kb
+    pad = make_pad(dry_run=dry_run or (backend or "").lower() == "dry-run", log=log,
+                   hold_ms=hold_ms, uinput_path=uinput_path)
+    return RoutingInjector(kb, pad, log=log)
+
+
+def _make_keyboard(backend, dry_run, use_scancodes, log, hold_ms, uinput_path):
     backend = (backend or "auto").lower()
     if backend not in BACKENDS:
         raise ValueError(f"unknown key backend '{backend}' (use {', '.join(BACKENDS)})")

@@ -19,6 +19,7 @@ in parallel, each with the cards for its role (main README, "Multiple displays")
 | [`retropie/`](retropie/SETUP.md) | RetroPie | Raspberry Pi OS / Linux | `/opt/retropie/configs/all/runcommand-onstart.sh` / `runcommand-onend.sh` | `/opt/retropie/configs/all/autostart.sh` |
 | [`es-de/`](es-de/SETUP.md) | ES-DE | Linux, Windows (macOS untested) | `~/ES-DE/scripts/game-start/` / `game-end/` | `scripts/startup/` or systemd |
 | [`emulationstation/`](emulationstation/SETUP.md) | Other EmulationStation forks (RetroPie's ES, batocera-emulationstation) | Linux / Windows | `<ES config>/scripts/game-start/` / `game-end/` | – |
+| [`rcade/`](rcade/SETUP.md) | R-Cade (GRS Build-A-Cade FU / Viper, other Rockchip boxes) | Linux (Buildroot, Rockchip ARM) | `/rcade/share/userscripts/game-start/` / `game-end/` | `userscripts/system-ready/` → `rcade/cyd_rcade.sh start`; keypad = virtual gamepad `cyd-pad` + keyboard (profile `rcade`) |
 | [`linux/`](emulationstation/SETUP.md#generic-linux-and-windows-frontends) | Any Linux frontend | Linux | call `cyd_push.py` from its launch hook | `cyd-daemon.service` (systemd user unit) |
 
 Any other frontend (LaunchBox/BigBox, Attract-Mode, Pegasus, ...) works the same way if it can run
@@ -36,6 +37,7 @@ a command before and after a game: see
 | RetroPie runcommand | `$1` system, `$2` emulator, `$3` full ROM path, `$4` full command line; files in `/opt/retropie/configs/all/` | [RetroPie docs: Runcommand](https://retropie.org.uk/docs/Runcommand/) "Runcommand scripts"; `user_script()` in [runcommand.sh](https://github.com/RetroPie/RetroPie-Setup/blob/master/scriptmodules/supplementary/runcommand/runcommand.sh) |
 | RetroPie autostart | `/opt/retropie/configs/all/autostart.sh` | [RetroPie FAQ](https://retropie.org.uk/docs/FAQ/) |
 | RetroPie EmulationStation scripts | `~/.emulationstation/scripts/<event>/`; `game-start`: ROM path, ROM name, game name; `game-end`, `screensaver-start/stop`: none | [RetroPie docs: EmulationStation → Scripting](https://retropie.org.uk/docs/EmulationStation/) |
+| R-Cade user scripts | `/rcade/share/userscripts/<event>/`; `game-start`: ROM path, ROM name, game name, system (may be empty); `game-selected`: system, ROM name, ROM path; `system-ready`, `game-end`, `shutdown`: none used | community scripts [gonzonia/LCDMarquee](https://github.com/gonzonia/LCDMarquee) (`userscripts/<event>/*.sh`) and [gonzonia/ALU_Power_Mod](https://github.com/gonzonia/ALU_Power_Mod); [R-Cade release notes](https://github.com/retro-center/rcade_releases/releases) (1.0.9 "third argument to the game-start script ... title of the game") – no official docs online, see [rcade/SETUP.md](rcade/SETUP.md#hook-arguments) |
 | ES-DE custom event scripts | `~/ES-DE/scripts/<event>/`; `game-start`/`game-end`: ROM path, game name, system name, system full name; `startup`, `screensaver-start/end`, ...; must be enabled in Other settings; Windows runs only `.bat`; on Linux spaces in the path are backslash-escaped; ES-DE waits for each script | [ES-DE INSTALL.md → Custom event scripts](https://gitlab.com/es-de/emulationstation-de/-/blob/master/INSTALL.md#custom-event-scripts) |
 
 `cyd_push.py --rom` copes with every one of those path styles: surrounding or doubled quotes,
@@ -60,5 +62,8 @@ These are written from the docs and source above but have not been run on a real
   `--rom-name %2`, which does not depend on the path.
 * ES-DE on Windows: the portable release's data folder (the installer release uses
   `%HOMEPATH%\ES-DE`).
+* R-Cade: everything in [rcade/SETUP.md → TO-VERIFY](rcade/SETUP.md#to-verify-on-the-cabinet) (user script
+  folders/arguments from community scripts, the `cyd-pad` virtual controller being accepted and
+  mapped, R-Cade's own keyboard mapping, the ch341/cp210x/cdc_acm kernel drivers).
 * RetroPie images based on Debian Buster ship Python 3.7; the host scripts are tested on 3.8 and
   newer (and written to run on 3.7).

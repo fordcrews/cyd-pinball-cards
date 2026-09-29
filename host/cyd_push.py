@@ -10,6 +10,7 @@ Examples:
   python cyd_push.py --rom sf2 --system mame
   python cyd_push.py --idle                      (attract playlist for the profile + current time)
   python cyd_push.py --idle --profile arcade     (cards/_idle_arcade.json)
+  python cyd_push.py --keypad --profile rcade    (R-Cade keypad, cards/_keypad_rcade.json)
   python cyd_push.py --idle --rom mslug          (attract playlist + "Up next: Metal Slug")
   python cyd_push.py --browsing "[GAMENAME]"     (attract playlist + "Up next: <table>" screen)
   python cyd_push.py --brightness 128
@@ -33,7 +34,7 @@ Pinball table lookup (positional name, in the cards directory):
   4. substring match on normalised names
   5. otherwise the profile's default card (_default.json), else a generated title-only card
 
-Arcade/console lookup (--rom, or the positional name with --profile arcade):
+Arcade/console lookup (--rom, or the positional name with --profile arcade or rcade):
   The ROM may be a full path in any frontend's style (quoted, ES-escaped "Metal\ Slug.zip",
   Windows or POSIX); path and extension are stripped. The system comes from --system, else from
   the folder after "roms" in the path (/userdata/roms/mame/x.zip -> mame).
@@ -117,8 +118,17 @@ def log(msg: str, quiet: bool = False) -> None:
 PROFILES = {
     "pinball": {"idle": "_idle.json", "keypad": "_keypad.json", "default_card": "_default.json"},
     "arcade": {"idle": "_idle_arcade.json", "keypad": "_keypad_arcade.json", "default_card": "_default_arcade.json"},
+    # R-Cade (retro-center.com; GRS Build-A-Cade / Viper SBCs): arcade cards + idle, R-Cade keypad
+    # whose main page presses R-Cade's documented controller combos on the virtual gamepad
+    "rcade": {"idle": "_idle_arcade.json", "keypad": "_keypad_rcade.json", "default_card": "_default_arcade.json",
+              "virtual_gamepad": True},
 }
 DEFAULT_PROFILE = "pinball"
+ARCADE_PROFILES = {"arcade", "rcade"}     # ROM-style lookup for the positional name, arcade default card
+
+
+def is_arcade(profile: str) -> bool:
+    return profile in ARCADE_PROFILES
 
 
 def find_host_config(path: Path | None = None) -> Path | None:
@@ -162,6 +172,7 @@ class Settings:
     watch: list | None = None          # None: take watch_processes from the keypad file
     key_backend: str = "auto"
     key_hold_ms: int | None = None
+    virtual_gamepad: bool = False       # "pad:" keypad keys -> virtual gamepad (Linux); rcade profile: on
     config_src: Path | None = None
     config: dict = field(default_factory=dict)
     displays: dict = field(default_factory=dict)     # config.json "displays": board id -> name/role/...
@@ -181,6 +192,10 @@ def _cfg_path(value, cards_dir: Path, base: Path | None) -> Path | None:
         if root is not None and (root / p).is_file():
             return root / p
     return cards_dir / p
+
+
+def _truthy(v) -> bool:
+    return v if isinstance(v, bool) else str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 def resolve_settings(args) -> Settings:
@@ -218,6 +233,10 @@ def resolve_settings(args) -> Settings:
     s.key_backend = str(cfg.get("key_backend") or "auto")
     if cfg.get("key_hold_ms") is not None:
         s.key_hold_ms = int(cfg["key_hold_ms"])
+    vg = getattr(args, "gamepad", None)                      # cyd_daemon --gamepad / --no-gamepad
+    if vg is None and cfg.get("virtual_gamepad") is not None:
+        vg = _truthy(cfg["virtual_gamepad"])
+    s.virtual_gamepad = bool(defaults.get("virtual_gamepad", False) if vg is None else vg)
     if isinstance(cfg.get("displays"), dict):
         s.displays = {k: v for k, v in cfg["displays"].items() if isinstance(v, dict)}
     kr = cfg.get("keypad_roles")
@@ -463,7 +482,10 @@ def build_keypad_msg(cfg: dict, page: int | None = None) -> dict:
                 o["label"] = to_ascii(o["label"])
             if keymap and o.get("key") and not o.get("action") and not o.get("mod"):
                 try:
-                    keymap.parse_combo(o["key"])
+                    if keymap.is_pad_key(o["key"]):
+                        keymap.parse_pad(o["key"])
+                    else:
+                        keymap.parse_combo(o["key"])
                 except ValueError as e:
                     log(f"warning: keypad page '{out['title']}': {e}")
             if "mod" in o and str(o["mod"]).lower() not in ("ctrl", "control", "shift", "alt", "win", "gui", "super", "meta"):
@@ -871,7 +893,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--game-name", metavar="NAME", help="game name from the frontend (shown when no card matches)")
     ap.add_argument("--rom-name", metavar="NAME",
                     help="ROM file name without extension (ES %%rom_name%%), used instead of the one in --rom")
-    ap.add_argument("--profile", choices=sorted(PROFILES), help="pinball (default) or arcade: picks the idle/keypad/default files")
+    ap.add_argument("--profile", choices=sorted(PROFILES), help="pinball (default), arcade, or rcade (arcade + R-Cade keypad and virtual gamepad): "
+                         "picks the idle/keypad/default files")
     ap.add_argument("--config", type=Path, default=None,
                     help="host config JSON (default: env CYD_CONFIG, else config.json next to host/ or the kit root)")
     ap.add_argument("--cabinet", help="cabinet name on the idle screens (overrides the idle file / config.json)")
@@ -994,7 +1017,7 @@ def main(argv=None) -> int:
             "default_card": st.default_card, "cabinet": st.cabinet, "ports": st.ports or "auto-detect (all CYDs)",
             "exclude_ports": st.exclude_ports, "displays": st.displays, "keypad_roles": st.keypad_roles or "all",
             "max_displays": st.max_displays, "watch_processes": st.watch, "key_backend": st.key_backend,
-            "serial": serialport.backend_name(),
+            "virtual_gamepad": st.virtual_gamepad, "serial": serialport.backend_name(),
         }, indent=2))
         return 0
 
@@ -1011,7 +1034,7 @@ def main(argv=None) -> int:
         return 0
 
     rom = args.rom
-    if rom is None and args.table and st.profile == "arcade":
+    if rom is None and args.table and is_arcade(st.profile):
         rom = args.table
     explicit_target = not _target_all(args.target)
     base = st.config_src.parent if st.config_src else None
@@ -1039,14 +1062,14 @@ def main(argv=None) -> int:
             selected = pretty_table_name(args.browsing, cards_dir)
         elif rom:
             selected = find_rom_card(rom, cards_dir, args.system, args.game_name, args.rom_name,
-                                     st.default_card if st.profile == "arcade" else "_default_arcade.json")[2]["title"]
+                                     st.default_card if is_arcade(st.profile) else "_default_arcade.json")[2]["title"]
         log(f"idle config -> {src if src else '(none: firmware defaults)'} [profile {st.profile}]"
             + (f"; up next: {selected}" if selected else ""), args.quiet)
         plan.append(lambda b, c=icfg, sel=selected: build_idle_msg(
             idle_cfg_for_board(c, b, cards_dir, base), sel, with_clock=not no_clock,
             cabinet=st.cabinet, subtitle=st.subtitle))
     elif rom:
-        default = st.default_card if st.profile == "arcade" else "_default_arcade.json"
+        default = st.default_card if is_arcade(st.profile) else "_default_arcade.json"
         data, src, info = find_rom_card(rom, cards_dir, args.system, args.game_name, args.rom_name, default)
         log(f"rom '{info['rom']}' system={info['system'] or '?'} -> {rel_name(src, cards_dir)} ({info['match']})",
             args.quiet)

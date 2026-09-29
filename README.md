@@ -35,6 +35,7 @@ required packages on Linux (pyserial, python-evdev and psutil are used when pres
 | RetroBat | Windows | ES `scripts\game-start\` | ES `scripts\game-end\` | ES `scripts\start\` | [frontends/retrobat](frontends/retrobat/SETUP.md) |
 | RetroPie | Raspberry Pi OS / Linux | `runcommand-onstart.sh` | `runcommand-onend.sh` | `autostart.sh` | [frontends/retropie](frontends/retropie/SETUP.md) |
 | ES-DE | Linux, Windows | `~/ES-DE/scripts/game-start/` | `scripts/game-end/` | `scripts/startup/` or systemd | [frontends/es-de](frontends/es-de/SETUP.md) |
+| R-Cade (GRS Build-A-Cade FU, Viper boards) | Linux (Rockchip ARM) | `/rcade/share/userscripts/game-start/` | `userscripts/game-end/` | `userscripts/system-ready/` (keypad = virtual controller + keyboard) | [frontends/rcade](frontends/rcade/SETUP.md) |
 | Other EmulationStation forks | Linux, Windows | `scripts/game-start/` | `scripts/game-end/` | – | [frontends/emulationstation](frontends/emulationstation/SETUP.md) |
 | Anything else (LaunchBox, Attract-Mode, Pegasus...) | Windows, Linux | run `cyd_push.py --rom ...` | run `cyd_push.py --idle` | Startup folder / systemd user unit | [generic](frontends/emulationstation/SETUP.md#generic-linux-and-windows-frontends) |
 
@@ -68,11 +69,12 @@ cyd-pinball-cards/
 │   ├── _idle_arcade.json      arcade idle/attract playlist ("Crews Arcade")
 │   ├── _keypad.json           pinball touch keypad + process names that open it
 │   ├── _keypad_arcade.json    arcade touch keypad (coin/start, MAME, RetroArch, NAV pages)
+│   ├── _keypad_rcade.json     R-Cade keypad (controller hotkey combos on the virtual gamepad, pad setup, keyboard, MAME)
 │   ├── medieval_madness.json, attack_from_mars.json, the_addams_family.json   (pinball)
 │   ├── sf2.json, mslug.json, pacman.json                                      (arcade)
 │   └── <system>/<rom>.json    optional per-system cards (e.g. cards/snes/sf2.json)
 ├── config.example.json  per-cabinet settings (copy to config.json)
-├── frontends/         hook scripts + SETUP.md per frontend (popper, batocera, retrobat, retropie, es-de, emulationstation, linux)
+├── frontends/         hook scripts + SETUP.md per frontend (popper, batocera, retrobat, retropie, es-de, emulationstation, rcade, linux)
 ├── docs/              idle_preview.py / keypad_preview.py / multi_display_preview.py / waveshare7_preview.py (Pillow mock-up renderers) + preview PNGs
 └── README.md
 ```
@@ -433,6 +435,16 @@ menu = TAB, save/load state = F2/F4 (RetroArch) or F6/F7 (MAME). Frontends such 
 RetroBat write their own emulator configs, so check the keys on your cabinet and edit the file.
 The arcade preset has `"watch_processes": []`: open it with a long-press.
 
+**R-Cade preset** (`cards/_keypad_rcade.json`, profile `rcade`; GRS Build-A-Cade FU): R-Cade is
+driven by controller mappings, so on Linux the daemon can also create a virtual **gamepad**
+`cyd-pad` (`"virtual_gamepad": true` in config.json or `--gamepad`; on by default in the rcade
+profile). Keypad keys named `pad:...` press its buttons, e.g. `pad:select+start` = R-Cade's "exit
+game" combo (hotkey + start), `pad:select+west` save state, `pad:select+north` load state,
+`pad:select+south` RetroArch menu, `pad:select` coin. You map `cyd-pad` once in R-Cade like any new
+controller. Details, sources and what is TO-VERIFY: [frontends/rcade/SETUP.md](frontends/rcade/SETUP.md).
+
+![R-Cade keypad previews](docs/keypad-rcade-previews.png)
+
 ### Auto-switching with Popper's setup program (pinball profile)
 `cyd_daemon.py` checks the running processes every 1.5 s:
 * When a watched program starts, it sends `{"cmd":"keypad",...}` with the layout from `cards/_keypad.json`.
@@ -456,6 +468,7 @@ pip install -r requirements.txt            # Windows: pyserial (+ psutil); optio
 python cyd_daemon.py                       # auto-detects the CYD; settings from config.json; Ctrl+C to quit
 python cyd_daemon.py --port COM5 -v        # verbose: shows every key and the window it went to
 python cyd_daemon.py --profile arcade      # arcade idle playlist + arcade keypad
+python3 cyd_daemon.py --profile rcade      # R-Cade: arcade cards + R-Cade keypad + virtual gamepad cyd-pad (Linux)
 python cyd_daemon.py --dry-run             # log keys instead of pressing them
 python cyd_daemon.py --no-watch            # manual keypad only (long-press, or cyd_push.py --keypad)
 python cyd_daemon.py --log C:\cyd-pinball-cards\daemon.log

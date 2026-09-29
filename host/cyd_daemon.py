@@ -12,7 +12,9 @@ Runs on Windows (PinUP Popper, RetroBat, ...) and Linux (Batocera, RetroPie, ...
     display, or only the ones listed in config.json "keypad_roles"):
     Windows SendInput into the foreground window (ctypes, no admin rights, no extra packages);
     Linux a virtual "cyd-keypad" keyboard on /dev/uinput (python-evdev if installed, else a
-    built-in writer; needs write access to /dev/uinput, which root has).
+    built-in writer; needs write access to /dev/uinput, which root has). Optionally (config.json
+    "virtual_gamepad": true, --gamepad, or the rcade profile) also a virtual "cyd-pad" gamepad:
+    keypad keys named "pad:select+start" etc. press controller buttons / hotkey combos on it.
   * Optionally watches for configuration programs (PinUP Popper's setup tool by default) and
     opens the keypad on the display while one runs, then returns to the idle playlist.
   * Listens on 127.0.0.1:47291 so cyd_push.py (frontend launch/exit scripts) can still send
@@ -22,6 +24,7 @@ Runs on Windows (PinUP Popper, RetroBat, ...) and Linux (Batocera, RetroPie, ...
 Examples:
   python cyd_daemon.py                          auto-detect the CYD, settings from config.json
   python cyd_daemon.py --profile arcade         arcade idle playlist + arcade keypad, no process watch
+  python cyd_daemon.py --profile rcade          R-Cade: arcade cards + R-Cade keypad + virtual gamepad
   python cyd_daemon.py --port COM5 -v           (Linux: --port /dev/ttyUSB0; repeat --port for more)
   python cyd_daemon.py --watch PinUpMenuSetup.exe --watch "PinUP Popper Config.exe"
   python cyd_daemon.py --dry-run                log key presses instead of injecting them
@@ -308,7 +311,7 @@ class Daemon:
         hold = args.key_hold_ms if args.key_hold_ms is not None else self.st.key_hold_ms
         self.injector = injector or keymap.make_injector(
             args.key_backend or self.st.key_backend, dry_run=args.dry_run, use_scancodes=args.scancodes, log=log,
-            hold_ms=keymap.DEFAULT_HOLD_MS if hold is None else hold)
+            hold_ms=keymap.DEFAULT_HOLD_MS if hold is None else hold, gamepad=self.st.virtual_gamepad)
         self.fixed_ports = list(self.st.ports)      # --port / config "port": only these, else auto-detect
         self.links: dict[str, BoardLink] = {}        # port -> link (handshake done)
         self.links_lock = threading.RLock()
@@ -608,7 +611,8 @@ class Daemon:
                 "boards": [b.as_dict() for b in boards], "count": len(boards),
                 "ports": self.fixed_ports or "auto-detect", "keypad_roles": self.st.keypad_roles or "all",
                 "setup_running": self.setup_running, "watch": self.watch, "dry_run": self.injector.dry_run,
-                "profile": self.st.profile, "key_backend": self.injector.backend}
+                "profile": self.st.profile, "key_backend": self.injector.backend,
+                "virtual_gamepad": self.st.virtual_gamepad}
 
     def run_sends(self, sends: list, timeout: float, wait: bool = True) -> dict:
         """sends: [{"board": id, "messages": [...]}]. Every board is served by its own worker thread,
@@ -718,12 +722,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="never open this port (another device with the same USB chip; repeatable)")
     ap.add_argument("--scan-interval", type=float, default=RECONNECT_S,
                     help=f"seconds between scans for new or re-plugged displays (default {RECONNECT_S:g})")
-    ap.add_argument("--profile", choices=sorted(cyd_push.PROFILES), help="pinball or arcade (default: config.json)")
+    ap.add_argument("--profile", choices=sorted(cyd_push.PROFILES), help="pinball, arcade or rcade (default: config.json)")
     ap.add_argument("--config", type=Path, default=None, help="host config JSON (default: config.json)")
     ap.add_argument("--cabinet", help="cabinet name for the idle playlist")
     ap.add_argument("--idle-config", type=Path, default=None, help="idle playlist JSON (default: profile's file)")
     ap.add_argument("--key-backend", choices=keymap.BACKENDS, default=None,
                     help="auto (default: SendInput on Windows, evdev/uinput on Linux), sendinput, evdev, uinput, dry-run")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--gamepad", dest="gamepad", action="store_true", default=None,
+                   help="also create the virtual gamepad 'cyd-pad' for pad: keys (Linux; default: config.json "
+                        "\"virtual_gamepad\", on in the rcade profile)")
+    g.add_argument("--no-gamepad", dest="gamepad", action="store_false", help="no virtual gamepad")
     ap.add_argument("--key-hold-ms", type=int, default=None,
                     help=f"how long each key is held down (default {keymap.DEFAULT_HOLD_MS} ms)")
     ap.add_argument("--watch", action="append", metavar="EXE",
@@ -734,7 +743,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help=f"127.0.0.1 port for cyd_push hand-off (default {cyd_push.DAEMON_PORT}, env CYD_DAEMON_PORT)")
     ap.add_argument("--cards-dir", type=Path, default=None)
     ap.add_argument("--keypad-config", type=Path, default=None,
-                    help="default: cards/_keypad.json (arcade profile: cards/_keypad_arcade.json)")
+                    help="default: cards/_keypad.json (arcade: _keypad_arcade.json, rcade: _keypad_rcade.json)")
     ap.add_argument("--dry-run", action="store_true", help="log key presses instead of injecting them")
     ap.add_argument("--scancodes", action="store_true",
                     help="inject hardware scan codes instead of virtual keys (for apps that ignore VK input)")
@@ -757,7 +766,8 @@ def main(argv=None) -> int:
     server.daemon_ref = d
     log(f"cyd_daemon on {cyd_push.DAEMON_HOST}:{args.listen_port}; profile {d.st.profile}"
         f"{' (' + str(d.st.config_src) + ')' if d.st.config_src else ''}; key injection "
-        f"{'DRY-RUN (logging only)' if d.injector.dry_run else 'via ' + d.injector.backend}; "
+        f"{'DRY-RUN (logging only)' if d.injector.dry_run else 'via ' + d.injector.backend}"
+        f"{' + virtual gamepad cyd-pad' if d.st.virtual_gamepad else ''}; "
         f"serial via {cyd_push.serialport.backend_name()}; Ctrl+C to quit")
     stop = threading.Event()
     threading.Thread(target=server.serve_forever, name="ipc", daemon=True).start()
