@@ -35,7 +35,7 @@ Examples:
   python cyd_daemon.py --watch PinUpMenuSetup.exe --watch "PinUP Popper Config.exe"
   python cyd_daemon.py --dry-run                log key presses instead of injecting them
   python cyd_daemon.py --key-backend uinput     force the built-in Linux uinput writer
-  python cyd_daemon.py --no-watch               manual keypad only (long-press on the display, or
+  python cyd_daemon.py --no-watch               manual keypad only (tap or long-press on the display, or
                                                 cyd_push.py --keypad)
 
 The watched process names come from --watch, else "watch_processes" in config.json, else
@@ -44,7 +44,9 @@ built-in default below. TO-VERIFY on your cabinet: with the tool open, check the
 name (Windows: Task Manager > Details; Linux: ps -e).
 
 The daemon never accepts keystrokes over the network socket: keys only come from the displays.
-A long-press opens the keypad only on the display that was pressed.
+A tap, or a long-press, opens the keypad only on the display that was touched. About 10 seconds
+after the last touch there, that display goes back to its assigned cards. Touching again while
+the keypad is up restarts the 10 seconds. A display whose role is keyboard stays on the keypad.
 """
 from __future__ import annotations
 
@@ -69,6 +71,7 @@ DEFAULT_WATCH = ["PinUpMenuSetup.exe"]   # PinUP Popper setup/config tool (TO-VE
                                          # (pinball profile only; the arcade keypad file sets [])
 RECONNECT_S = 2.0      # how often to look for new / re-plugged displays
 IGNORE_S = 30.0        # a port that did not answer like a CYD is left alone this long
+TOUCH_KEYPAD_S = 10.0  # after a touch, return a non-keyboard display to its role this many seconds later
 
 
 def _ver(v: str) -> tuple:
@@ -335,6 +338,9 @@ class Daemon:
         self.ignored: dict[str, float] = {}          # port -> retry time (no CYD answered)
         self.seen_ids: set[str] = set()
         self.last_by_role: dict[str, tuple[dict, float]] = {}   # role -> (last table/idle msg, time)
+        self.last_content: dict[str, dict] = {}                  # board id -> last idle/table message
+        self.touch_until: dict[str, float] = {}                  # board id -> monotonic deadline for role return
+        self.touch_keypad_s = TOUCH_KEYPAD_S
         self.state_lock = threading.RLock()
         self.setup_running: str | None = None  # name of the watched process that is running
         self.manual_exit = False               # user tapped EXIT while setup is open: stay out
@@ -599,6 +605,10 @@ class Daemon:
         elif cmd in ("idle", "table"):
             b.mode = cmd
             self.last_by_role[b.role] = (msg, time.time())
+            with self.state_lock:
+                self.last_content[b.id] = msg
+                # a real content push wins over the temporary touch keypad
+                self.touch_until.pop(b.id, None)
         elif cmd == "calibrate":
             b.mode = "calibrate"
 
@@ -606,6 +616,65 @@ class Daemon:
         for lk in (self.keypad_links() if links is None else links):
             if lk.board.mode != "keypad":
                 lk.submit(lambda lk=lk: self.send_to(lk, self.keypad_msg(), why))
+
+    def _setup_wants_keypad(self, b: displays.Board) -> bool:
+        return bool(self.setup_running and not self.manual_exit and cyd_push.keypad_allowed(b, self.st))
+
+    def note_touch(self, lk: BoardLink, *, opened: bool):
+        """A touch on this display. opened=True for a tap or a keypad that just opened; a key
+        (opened=False) only restarts the timer when the touch keypad is already up.
+
+        The keypad is pushed to this board only. A keyboard-role board stays on it. Any other
+        role goes back to the cards it was showing about touch_keypad_s seconds after the last touch.
+        """
+        b = lk.board
+        if b is None or not cyd_push.keypad_allowed(b, self.st):
+            return
+        if displays._fold(b.role) == "keyboard":
+            with self.state_lock:
+                self.touch_until.pop(b.id, None)
+            if opened and b.mode != "keypad":
+                lk.submit(lambda lk=lk: self.send_to(lk, self.keypad_msg(), "touch"))
+            return
+        if self._setup_wants_keypad(b):
+            with self.state_lock:
+                self.touch_until.pop(b.id, None)
+            return
+        with self.state_lock:
+            active = b.id in self.touch_until
+            if not opened and not active:
+                return
+            self.touch_until[b.id] = time.monotonic() + self.touch_keypad_s
+            push = opened and not active and b.mode != "keypad"
+        if push:
+            lk.submit(lambda lk=lk: self.send_to(lk, self.keypad_msg(), "touch"))
+
+    def poll_touch_keypads(self):
+        """Return boards whose touch keypad has been idle for touch_keypad_s seconds."""
+        now = time.monotonic()
+        with self.state_lock:
+            due = [i for i, t in self.touch_until.items() if t <= now]
+            for i in due:
+                self.touch_until.pop(i, None)
+        for bid in due:
+            lk = self.link_for(bid)
+            if lk is None or lk.board is None:
+                continue
+            b = lk.board
+            if displays._fold(b.role) == "keyboard" or self._setup_wants_keypad(b):
+                continue
+            msg = dict(self.last_content.get(b.id) or self.idle_msg(b))
+
+            def restore(lk=lk, msg=msg, bid=bid):
+                with self.state_lock:
+                    if bid in self.touch_until:
+                        return
+                    board = lk.board
+                    if board is None or displays._fold(board.role) == "keyboard" or self._setup_wants_keypad(board):
+                        return
+                self.send_to(lk, msg, "touch keypad timeout")
+
+            lk.submit(restore)
 
     # ---- device -> host
     def on_device_line(self, lk: BoardLink, obj: dict):
@@ -617,6 +686,7 @@ class Daemon:
             if not allowed:
                 self.log(f"key from {who} ignored (keypad not enabled for this display; see keypad_roles)")
                 return
+            self.note_touch(lk, opened=False)
             key, mods = str(obj.get("key", "")), obj.get("mods") or []
             try:
                 desc = keymap.describe(key, mods)
@@ -635,6 +705,11 @@ class Daemon:
                 lk.submit(lambda: self.send_to(lk, {"cmd": "keypad", "exit": True}, "keypad not enabled here"))
             elif state == "off" and self.setup_running:
                 self.manual_exit = True   # respect the user's EXIT until setup is reopened
+            if state == "off" and b is not None:
+                with self.state_lock:
+                    self.touch_until.pop(b.id, None)
+            elif state == "on":
+                self.note_touch(lk, opened=True)
         elif evt == "cal" and obj.get("touch") == "capacitive":
             self.log(f"{who} has capacitive touch: no calibration needed")
             if b is not None:
@@ -647,6 +722,9 @@ class Daemon:
         elif evt == "touch":
             self.log(f"touch on {who} raw=({obj.get('raw_x')},{obj.get('raw_y')}) z={obj.get('z')} "
                      f"screen=({obj.get('x')},{obj.get('y')})")
+            # Calibration debug samples carry raw_x/raw_y. A tap does not: show the keypad.
+            if obj.get("raw_x") is None and obj.get("raw_y") is None:
+                self.note_touch(lk, opened=True)
         elif obj.get("ready"):
             self.log(f"display {who} (re)booted, fw {obj.get('fw')}")
             if b is not None:
@@ -890,6 +968,7 @@ def main(argv=None) -> int:
         signal.signal(signal.SIGTERM, _on_term)
     try:
         while True:
+            d.poll_touch_keypads()
             time.sleep(0.5)
     except KeyboardInterrupt:
         log("stopping")

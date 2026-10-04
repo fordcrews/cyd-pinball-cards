@@ -27,6 +27,7 @@
 //   {"evt":"key","key":"alt+f4"[,"mods":["ctrl","shift","alt","win"]]}   keypad button released
 //   {"evt":"keypad","state":"on"|"off","source":"touch"}   keypad opened (long-press) / EXIT tapped
 //   {"evt":"cal","ok":true,"x_min":..,...}   calibration finished (or "ok":false,"err":...)
+//   {"evt":"touch","x":..,"y":..}   a tap that is not a keypad key (host shows the keypad on this board)
 //   {"evt":"touch","raw_x":..,"raw_y":..,"x":..,"y":..}   only while cal debug is on
 // Replies: {"ack":"<cmd>","ok":true[, ...]} or {"ack":"<cmd>","ok":false,"err":"..."}
 // Boot line: {"ready":true,"device":"cyd-pinball-cards","fw":"1.4.0","board":"cyd","id":"cyd-a1b2c3","name":"","role":""}
@@ -2007,8 +2008,9 @@ void pollSerial() {
 
 // ---------- Touch ----------
 // A small gesture layer: press / hold / release with screen coordinates.
-//   idle + cards: tap (on release) = next card/screen; hold LONGPRESS_KEYPAD_MS = open keypad
-//   keypad: press highlights a key, release on it sends it; horizontal swipe = page change
+//   idle + cards: tap (on release) reports evt touch (host shows the keypad); hold = open keypad
+//   keypad: any touch reports evt touch (host keeps the keypad up); press highlights a key,
+//           release on it sends it; horizontal swipe = page change
 //   calibrate: the averaged raw position of each press is one calibration sample
 struct TouchState {
   bool down = false, consumed = false;
@@ -2018,6 +2020,14 @@ struct TouchState {
 } tch;
 unsigned long lastTapMs = 0;
 
+void emitTouch(int x, int y) {
+  JsonDocument e;
+  e["evt"] = "touch";
+  e["x"] = x;
+  e["y"] = y;
+  emitLine(e);
+}
+
 void onTouchDown() {
   if (ui == UI_IDENT) {  // a tap closes the identify label; the rest of this touch is ignored
     tch.consumed = true;
@@ -2025,6 +2035,7 @@ void onTouchDown() {
     return;
   }
   if (ui == UI_KEYPAD) {
+    emitTouch(tch.x0, tch.y0);  // key, miss, or swipe: host resets the return timer
     kpPressed = kpHit(tch.x0, tch.y0);
     if (kpPressed >= 0) kpDrawKey(kpPressed, true);
   }
@@ -2069,8 +2080,7 @@ void onTouchUp(unsigned long now) {
   }
   if (!tch.consumed && now - lastTapMs > 150) {
     lastTapMs = now;
-    nextCard();
-    lastRotate = now;  // restart auto-rotate timer after manual tap
+    emitTouch(tch.x, tch.y);  // not a keypad key; the host pushes the keypad to this board
   }
 }
 

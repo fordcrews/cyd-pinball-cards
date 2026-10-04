@@ -14,6 +14,7 @@ cyd_push.py can be tested without hardware.
       key alt+f4            -> {"evt":"key","key":"alt+f4"}
       key up ctrl shift     -> {"evt":"key","key":"up","mods":["ctrl","shift"]}
       longpress             -> device opens the keypad itself (evt keypad on)
+      tap                   -> {"evt":"touch","x":..,"y":..} (not a keypad key)
       exit                  -> EXIT button (evt keypad off)
       reboot                -> {"ready":true,...}
   python fake_cyd.py --boards 3 --roles right,left,top      three fw 1.3.0 boards on three PTYs;
@@ -176,6 +177,10 @@ class FakeBoard:
         if mods:
             e["mods"] = list(mods)
         self.emit(e)
+
+    def tap(self, x: int = 10, y: int = 10):
+        """A tap that is not a keypad key. The host decides to show the keypad."""
+        self.emit({"evt": "touch", "x": x, "y": y})
 
     def longpress(self) -> bool:
         if not self.keypad and not self.legacy:
@@ -395,7 +400,7 @@ def main():
     for i, f in enumerate(boards, 1):
         extra = f" id={f.id} role={f.role or '-'}" if not f.legacy else ""
         print(f"board {i}: fake CYD fw {f.fw} on {f.path}{extra}", flush=True)
-    print("commands: [N] key NAME [MODS..] | [N] longpress | [N] exit | [N] reboot | [N] unplug | quit", flush=True)
+    print("commands: [N] key NAME [MODS..] | [N] tap | [N] longpress | [N] exit | [N] reboot | [N] unplug | quit", flush=True)
     for line in sys.stdin:
         parts = line.split()
         if not parts:
@@ -408,6 +413,8 @@ def main():
         f = boards[idx]
         if parts[0] == "key" and len(parts) > 1:
             f.key(parts[1], parts[2:])
+        elif parts[0] == "tap":
+            f.tap()
         elif parts[0] == "longpress":
             f.longpress()
         elif parts[0] == "exit":
