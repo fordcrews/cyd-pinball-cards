@@ -20,6 +20,10 @@ Runs on Windows (PinUP Popper, RetroBat, ...) and Linux (Batocera, RetroPie, ...
   * Listens on 127.0.0.1:47291 so cyd_push.py (frontend launch/exit scripts) can still send
     card and idle messages while the daemon owns the port. cyd_push falls back to direct serial
     when no daemon is running, so nothing breaks if you never start this.
+  * Listens on TCP 47311 (all interfaces; --wifi-port, env CYD_WIFI_PORT) for wireless displays.
+    They speak the same JSON lines as USB. A board id already on USB keeps that session and the
+    Wi-Fi connection is closed. --no-wifi turns the wireless listener off. Port 47291 stays
+    localhost-only.
 
 Examples:
   python cyd_daemon.py                          auto-detect the CYD, settings from config.json
@@ -184,6 +188,13 @@ class BoardLink:
     def connected(self) -> bool:
         return self.ser is not None and not self.stop.is_set()
 
+    def _start_io(self) -> bool:
+        if self.ser is None:
+            return False
+        threading.Thread(target=self._run, name=f"serial-{self.port}", daemon=True).start()
+        threading.Thread(target=self._worker, name=f"send-{self.port}", daemon=True).start()
+        return True
+
     def open(self) -> bool:
         try:
             self.ser = cyd_push.open_serial(self.port, timeout=0.2)
@@ -191,9 +202,12 @@ class BoardLink:
             self.log(f"cannot open {self.port}: {e}", debug=True)
             self.ser = None
             return False
-        threading.Thread(target=self._run, name=f"serial-{self.port}", daemon=True).start()
-        threading.Thread(target=self._worker, name=f"send-{self.port}", daemon=True).start()
-        return True
+        return self._start_io()
+
+    def attach(self, stream) -> bool:
+        # Already-open stream (a Wi-Fi socket) instead of a serial port.
+        self.ser = stream
+        return self._start_io()
 
     def close(self):
         self.stop.set()
@@ -326,6 +340,7 @@ class Daemon:
         self.stop = threading.Event()
         self._warned_wait = False
         self._warned_max = False
+        self.wifi_hub = None
 
     def _watch_list(self) -> list[str]:
         if self.args.no_watch:
@@ -375,7 +390,7 @@ class Daemon:
         now = time.time()
         with self.links_lock:
             if not self.fixed_ports:
-                for port in [p for p in self.links if p not in ports]:
+                for port in [p for p in self.links if p not in ports and not str(p).startswith("wifi:")]:
                     lk = self.links.pop(port)
                     self.log(f"display {lk.board.label() if lk.board else port} unplugged")
                     lk.close()
@@ -430,14 +445,8 @@ class Daemon:
                 r = dict(lk.last_ready or {})   # configured port: keep it, as firmware 1.0-1.2 did
             board = displays.make_board(port, r, self.st.displays)
             with self.links_lock:
-                others = {x.board.id for x in self.links.values() if x.board}
-                if board.id in others:
-                    self.log(f"warning: two displays report id {board.id}; calling the one on {port} "
-                             f"{board.id}@{displays.port_name(port)} (give it its own id with --assign ... --new-id)")
-                    board.id = f"{board.id}@{displays.port_name(port)}"
-                lk.board = board
-                self.links[port] = lk
-                self._warned_wait = False
+                if not self._claim(lk, board):
+                    return
             self.log(f"display {board.label()} connected, fw {board.fw or '?'} mode {board.mode}"
                      + (f" board {board.hw}" if board.hw else "")
                      + (" (no identity: firmware < 1.3.0, role 'all')" if board.legacy else ""))
@@ -447,6 +456,84 @@ class Daemon:
         finally:
             with self.links_lock:
                 self.connecting.discard(port)
+
+    def _claim(self, lk: BoardLink, board: displays.Board) -> bool:
+        # Register lk. Caller holds links_lock. USB wins over Wi-Fi for the same id.
+        # False when this link was closed because USB already has the board.
+        clash = [x for x in self.links.values() if x.board and x.connected and x.board.id == board.id]
+        if clash:
+            other = clash[0]
+            wifi_new = str(lk.port).startswith("wifi:")
+            wifi_old = str(other.port).startswith("wifi:")
+            if wifi_new and not wifi_old:
+                self.log(f"wifi {board.id} from {lk.port} closed; USB on {other.port} is the session")
+                lk.close()
+                return False
+            if wifi_old and not wifi_new:
+                self.log(f"wifi {board.id} on {other.port} dropped; USB on {lk.port} is the session")
+                self.links.pop(other.port, None)
+                other.close()
+            else:
+                self.log(f"warning: two displays report id {board.id}; calling the one on {lk.port} "
+                         f"{board.id}@{displays.port_name(lk.port)} (give it its own id with --assign ... --new-id)")
+                board.id = f"{board.id}@{displays.port_name(lk.port)}"
+        lk.board = board
+        self.links[lk.port] = lk
+        self._warned_wait = False
+        return True
+
+    def adopt_wifi(self, conn, addr) -> None:
+        # Handshake one inbound wireless display. USB with the same id stays; this socket is closed.
+        import wifi_displays
+        port = f"wifi:{addr[0]}:{addr[1]}"
+        lk = BoardLink(port, self.log, self.on_device_line, self.on_lost, self.on_identity)
+        if not lk.attach(wifi_displays.SocketStream(conn)):
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return
+        try:
+            r = lk.request({"cmd": "ping"}, timeout=min(2.0, self.args.timeout))
+            if not r.get("ok") and lk.connected:
+                r = lk.request({"cmd": "ping"}, timeout=min(2.0, self.args.timeout))
+            if not lk.connected:
+                return
+            if not r.get("ok"):
+                self.log(f"{port}: no CYD answer over wifi")
+                lk.close()
+                return
+            board = displays.make_board(port, r, self.st.displays)
+            with self.links_lock:
+                if not self._claim(lk, board):
+                    return
+            self.log(f"display {board.label()} connected over wifi, fw {board.fw or '?'}"
+                     + (f" board {board.hw}" if board.hw else ""))
+            threading.Thread(target=self.after_connect, args=(lk,), daemon=True).start()
+        except Exception as e:
+            self.log(f"wifi display {port} failed: {e}")
+            lk.close()
+
+    def start_wifi(self, port: int | None = None, beacon_targets=None, beacon_interval: float = 2.0):
+        # Listen for wireless displays. None if the port is busy; USB keeps working.
+        if self.wifi_hub is not None:
+            return self.wifi_hub
+        import wifi_displays
+        tcp = wifi_displays.DISPLAY_TCP_PORT if port is None else port
+        hub = wifi_displays.DisplayHub(self._wifi_accept, tcp_port=tcp, beacon_targets=beacon_targets,
+                                       beacon_interval=beacon_interval)
+        try:
+            hub.start()
+        except OSError as e:
+            self.log(f"wireless displays disabled: {e}")
+            return None
+        self.wifi_hub = hub
+        self.log(f"wireless displays on {hub.bind_host}:{hub.tcp_port} "
+                 f"(UDP beacon {wifi_displays.BEACON_UDP_PORT}, USB preferred)")
+        return hub
+
+    def _wifi_accept(self, conn, addr) -> None:
+        threading.Thread(target=self.adopt_wifi, args=(conn, addr), name="wifi-board", daemon=True).start()
 
     def after_connect(self, lk: BoardLink):
         b = lk.board
@@ -612,7 +699,8 @@ class Daemon:
                 "ports": self.fixed_ports or "auto-detect", "keypad_roles": self.st.keypad_roles or "all",
                 "setup_running": self.setup_running, "watch": self.watch, "dry_run": self.injector.dry_run,
                 "profile": self.st.profile, "key_backend": self.injector.backend,
-                "virtual_gamepad": self.st.virtual_gamepad}
+                "virtual_gamepad": self.st.virtual_gamepad,
+                "wifi_port": self.wifi_hub.tcp_port if self.wifi_hub else None}
 
     def run_sends(self, sends: list, timeout: float, wait: bool = True) -> dict:
         """sends: [{"board": id, "messages": [...]}]. Every board is served by its own worker thread,
@@ -678,6 +766,9 @@ class Daemon:
 
     def shutdown(self):
         self.stop.set()
+        if self.wifi_hub is not None:
+            self.wifi_hub.stop()
+            self.wifi_hub = None
         with self.links_lock:
             for lk in list(self.links.values()):
                 lk.close()
@@ -741,6 +832,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--poll", type=float, default=1.5, help="process scan interval in seconds")
     ap.add_argument("--listen-port", type=int, default=cyd_push.DAEMON_PORT,
                     help=f"127.0.0.1 port for cyd_push hand-off (default {cyd_push.DAEMON_PORT}, env CYD_DAEMON_PORT)")
+    ap.add_argument("--wifi-port", type=int, default=int(os.environ.get("CYD_WIFI_PORT", "47311")),
+                    help="LAN TCP port wireless displays dial (default 47311, env CYD_WIFI_PORT). "
+                         "Not the localhost hand-off port. UDP beacon stays on 47311.")
+    ap.add_argument("--no-wifi", action="store_true", help="do not listen for wireless displays")
     ap.add_argument("--cards-dir", type=Path, default=None)
     ap.add_argument("--keypad-config", type=Path, default=None,
                     help="default: cards/_keypad.json (arcade: _keypad_arcade.json, rcade: _keypad_rcade.json)")
@@ -764,6 +859,8 @@ def main(argv=None) -> int:
         return 3
     d = Daemon(args, log)
     server.daemon_ref = d
+    if not args.no_wifi:
+        d.start_wifi(args.wifi_port)
     log(f"cyd_daemon on {cyd_push.DAEMON_HOST}:{args.listen_port}; profile {d.st.profile}"
         f"{' (' + str(d.st.config_src) + ')' if d.st.config_src else ''}; key injection "
         f"{'DRY-RUN (logging only)' if d.injector.dry_run else 'via ' + d.injector.backend}"

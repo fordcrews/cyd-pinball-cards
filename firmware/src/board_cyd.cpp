@@ -43,4 +43,5 @@ bool boardReadTouch(TouchSample &t) {
   t.x = t.y = 0;  // mapped with the calibration in main.cpp
   return true;
 }
+bool boardUsbHostOpen() { return false; }  // CH340/CP210x: the UART is up whenever the cable is powered
 #endif

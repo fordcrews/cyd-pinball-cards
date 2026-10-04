@@ -60,3 +60,4 @@ void boardInitDisplay(uint8_t rotation, uint8_t brightness); // panel, backlight
 void boardSetBacklight(uint8_t v);       // 0-255 (on/off only when BACKLIGHT_DIMMABLE == 0)
 void boardSetRotation(uint8_t rotation); // protocol rotation: 0/2 portrait, 1/3 landscape (both boards)
 bool boardReadTouch(TouchSample &t);     // true while touched; raw values only (CYD maps them in main.cpp)
+bool boardUsbHostOpen();             // true only when a native USB CDC host has the port open (false on UART-bridge CYDs)

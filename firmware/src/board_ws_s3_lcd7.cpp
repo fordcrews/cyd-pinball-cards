@@ -127,6 +127,8 @@ void HostLink::flush() {
 
 void boardBeginSerial(size_t rxBuf) { hostLink.begin(115200, rxBuf); }
 
+bool boardUsbHostOpen() { return (bool)Serial; }  // HWCDC: true while a host has the native USB port open
+
 // ---------- display / backlight / touch ----------
 void boardSetBacklight(uint8_t v) {
   uint8_t n = v ? (exio | EXIO_BL) : (exio & ~EXIO_BL);

@@ -19,3 +19,7 @@ Desktop.ini
 
 # Per-cabinet host config (copy config.example.json)
 config.json
+
+# Wi-Fi credentials (copy firmware/wifi.example.json). Never commit SSIDs or passwords.
+firmware/wifi.json
+firmware/src/wifi_secrets.h

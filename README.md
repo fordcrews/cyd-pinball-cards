@@ -840,7 +840,7 @@ card). Map them by that id in config.json `displays` to give them a role. `ident
 ### Testing without hardware
 ```
 cd host
-python -m unittest test_keymap.py test_arcade.py test_multi.py
+python -m unittest test_keymap.py test_arcade.py test_multi.py test_wifi.py
 python fake_cyd.py --boards 3 --roles right,left,top     # Linux/macOS: three simulated boards on PTYs
 ```
 `test_multi.py` runs five simulated boards on an in-memory bus (any OS, no COM port is opened)
@@ -850,6 +850,44 @@ and, on Linux/macOS, boards on PTYs with the real daemon and cyd_push processes.
 `--port COM5 --port COM6` still works (only those ports), and so do `--side` with the
 `CYD_SERIAL_<SIDE>` variables and a separate `--cards-dir` per port. With identities and per-role
 cards you normally don't need any of them.
+
+
+## Wireless displays (wifi-idle)
+
+A board can sit anywhere on the house Wi-Fi and still show the cabinet's cards. The daemon listens
+for displays on **TCP port 47311**, on every network interface (`--wifi-port`, env `CYD_WIFI_PORT`).
+That port is not the local helper socket: **127.0.0.1:47291** is still only for `cyd_push.py` on the
+cabinet PC. `--no-wifi` turns the wireless listener off. `cyd_push.py --no-daemon` stays USB-only;
+house displays need the daemon.
+
+The cabinet broadcasts a UDP beacon on port **47311**:
+
+```json
+{"svc":"cyd-pinball-cards","proto":1,"tcp":47311}
+```
+
+A board uses the address that sent the beacon. To skip the beacon, set `host` and `port` in the
+board's Wi-Fi file.
+
+**Joining.** Copy `firmware/wifi.example.json` to `firmware/wifi.json` and fill in `ssid` and `pass`.
+`firmware/wifi.json` is gitignored, and so is the generated `firmware/src/wifi_secrets.h`.
+PlatformIO runs `firmware/gen_wifi_secrets.py` before each build and compiles those values into the
+firmware. The password is not written to git. Leave `host` empty to follow the beacon. Flash as
+usual (`pio run -e waveshare_s3_lcd7 -t upload`, or `-e cyd`); this slice does not change the
+serial protocol. Both board environments share `firmware/src/wifi_link.cpp`.
+
+**One session.** USB wins. On the Waveshare board, an open native USB port is the session and Wi-Fi
+stays quiet. On a CYD (USB-UART) the board treats USB as the session for 15 seconds after the host
+last spoke. The daemon also keeps a single session per board id and closes the Wi-Fi connection
+when that id is already on a COM port. `config.json` `displays` entries still match the board id,
+whether the link is `wifi:192.168.x.x:...` or a serial port.
+
+### Later: control-panel photos
+
+The next content slice is showing the control-panel photos the systems this kit already
+supports already have: MAME, R-Cade, and PinUP Popper artwork, and the same kind of image
+on the other frontends. Not a new protocol. This slice only carries the existing card JSON
+over Wi-Fi or USB.
 
 ## License
 This kit is yours to use and change. It uses TFT_eSPI (FreeBSD/MIT-style), XPT2046_Touchscreen (MIT),

@@ -4,6 +4,7 @@
 // serial ports) is in board.h / board_cyd.cpp / board_ws_s3_lcd7.cpp; this file is shared.
 //
 // Serial protocol (115200 baud, newline-delimited JSON, one object per line):
+// Wi-Fi uses the same lines on one TCP session (see wifi_link.cpp). USB wins while the host is on USB.
 //   {"cmd":"table","title":"Medieval Madness","ts":<local epoch s, optional>,"cards":[{"type":"instructions","title":"Rules","text":"..."}, ...]}
 //   {"cmd":"idle"}        bare idle: attract playlist using the saved (or built-in default) idle config
 //   {"cmd":"idle","ts":<local epoch s>,"cabinet":"Crews Pinball","screens":[...],"selected":"Table"}
@@ -36,6 +37,7 @@
 
 #include <Arduino.h>
 #include "board.h"
+#include "wifi_link.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
 
@@ -1183,8 +1185,8 @@ void touchToScreen(int rx, int ry, int &sx, int &sy) {
 }
 
 void emitLine(JsonDocument &d) {
-  serializeJson(d, HOST);
-  HOST.println();
+  serializeJson(d, linkOut());
+  linkOut().println();
 }
 
 // ---------- Keypad (touch mini-keyboard) ----------
@@ -1755,8 +1757,8 @@ void reply(const char *cmd, bool ok, const char *err = nullptr, const char *extr
   r["ok"] = ok;
   if (err) r["err"] = err;
   if (extraKey) r[extraKey] = extraVal;
-  serializeJson(r, HOST);
-  HOST.println();
+  serializeJson(r, linkOut());
+  linkOut().println();
 }
 
 // Leave keypad / calibration screens (a table or idle push always wins).
@@ -1834,8 +1836,8 @@ void handleLine(const String &line) {
     r["ok"] = true;
     r["screens"] = icfg.count;
     r["clock"] = clockValid;
-    serializeJson(r, HOST);
-    HOST.println();
+    serializeJson(r, linkOut());
+    linkOut().println();
   } else if (!strcmp(cmd, "brightness")) {
     int v = doc["value"] | -1;
     if (v < 0 || v > 255) { reply("brightness", false, "value must be 0-255"); return; }
@@ -1975,8 +1977,18 @@ void handleLine(const String &line) {
 }
 
 void pollSerial() {
-  while (HOST.available()) {
-    char ch = (char)HOST.read();
+  if (linkSessionChanged()) {
+    rxLine = "";
+    rxOverflow = false;
+  }
+  while (linkAvailable()) {
+    int got = linkRead();
+    if (got < 0) break;
+    if (linkSessionChanged()) {
+      rxLine = "";
+      rxOverflow = false;
+    }
+    char ch = (char)got;
     if (ch == '\r') continue;
     if (ch == '\n') {
       if (rxOverflow) {
@@ -2097,9 +2109,20 @@ void pollTouch() {
 }
 
 // ---------- Setup / loop ----------
+void sendReadyLine() {
+  JsonDocument r;
+  r["ready"] = true;
+  r["device"] = "cyd-pinball-cards";
+  r["fw"] = FW_VERSION;
+  addIdentity(r);
+  emitLine(r);
+}
+
 void setup() {
   // Big RX ring buffer (set before begin): a full 6 KB line can arrive while a screen is drawn
   boardBeginSerial(RX_BUFFER);
+  linkBegin();
+  linkOnWifiSession(sendReadyLine);
   rxLine.reserve(1024);
   randomSeed(esp_random());
 
@@ -2157,15 +2180,11 @@ void setup() {
   tableStartMs = millis();
   drawCard();
   lastRotate = millis();
-  JsonDocument r;
-  r["ready"] = true;
-  r["device"] = "cyd-pinball-cards";
-  r["fw"] = FW_VERSION;
-  addIdentity(r);
-  emitLine(r);
+  sendReadyLine();
 }
 
 void loop() {
+  linkPoll();
   pollSerial();
   pollTouch();
   unsigned long now = millis();
