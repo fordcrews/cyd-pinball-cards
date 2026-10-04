@@ -545,7 +545,69 @@ def table_for_board(data: dict, board: Board | None) -> dict:
         cards = list(sec)
     cards = [c for c in cards if not isinstance(c, dict) or not c.get("roles")
              or displays.role_listed(board, c.get("roles"))]
+    if board is not None and displays.is_content_role(board.role):
+        # control_panel, howtoplay, picture, pictureboxart, videoofplay, keyboard:
+        # only the matching cards, never the shared playlist.
+        cards = [c for c in cards if displays.card_matches_content_role(c, board.role)]
     return {**data, "title": title, "cards": cards}
+
+
+def message_for_table(data: dict, board: Board | None, with_clock: bool = True) -> dict | None:
+    """One board's table command. A keyboard role gets {"cmd":"keypad"} when a keypad card
+    is in the content, and nothing when there is not. Other content roles get only their cards.
+    A content role with nothing to show gets None (do not fall back to every card)."""
+    part = table_for_board(data, board)
+    cards = [c for c in (part.get("cards") or []) if isinstance(c, dict)]
+    if board is not None and displays._fold(board.role) == "keyboard":
+        kept = [c for c in cards if displays.card_matches_content_role(c, "keyboard")]
+        if not kept:
+            return None
+        cfg = {}
+        for c in kept:
+            if isinstance(c.get("layout"), dict):
+                cfg = c["layout"]
+                break
+            if isinstance(c.get("pages"), list):
+                cfg = {"pages": c["pages"]}
+                break
+        return build_keypad_msg(cfg) if cfg else {"cmd": "keypad"}
+    msg = build_table_msg(part, with_clock=with_clock)
+    if board is not None and displays.is_content_role(board.role) and not msg.get("cards"):
+        return None
+    return msg
+
+
+def specialize_message(msg: dict, board: Board | None) -> dict | None:
+    """Fan-out of one already-built idle/table: content-role boards do not all get the same
+    payload. Other commands, and boards without a content role, are unchanged. A keyboard
+    role is sent the keypad only when a keypad card is in the message."""
+    if not isinstance(msg, dict) or board is None or not displays.is_content_role(board.role):
+        return msg
+    role = displays._fold(board.role)
+    cmd = msg.get("cmd")
+    if cmd == "table":
+        cards = [c for c in (msg.get("cards") or []) if isinstance(c, dict)]
+        kept = [c for c in cards if displays.card_matches_content_role(c, role)]
+        if role == "keyboard":
+            if not kept:
+                return None
+            return message_for_table({"title": msg.get("title", ""), "cards": kept}, board, with_clock=False) or {"cmd": "keypad"}
+        if not kept:
+            return None
+        out = dict(msg)
+        out["cards"] = [{k: v for k, v in c.items() if k != "roles"} for c in kept]
+        return out
+    if cmd == "idle":
+        screens = [s for s in (msg.get("screens") or []) if isinstance(s, dict)]
+        kept = [s for s in screens if displays.screen_matches_content_role(s, role)]
+        if role == "keyboard" and kept:
+            return {"cmd": "keypad"}
+        if not kept:
+            return None
+        out = dict(msg)
+        out["screens"] = [{k: v for k, v in s.items() if k != "roles"} for s in kept]
+        return out
+    return msg
 
 
 def idle_cfg_for_board(cfg: dict, board: Board | None, cards_dir: Path, base: Path | None = None) -> dict:
@@ -569,6 +631,9 @@ def idle_cfg_for_board(cfg: dict, board: Board | None, cards_dir: Path, base: Pa
             out["screens"] = [sc for sc in out.get("screens", [])
                               if not isinstance(sc, dict) or not sc.get("roles")
                               or displays.role_listed(board, sc.get("roles"))]
+        if displays.is_content_role(board.role):
+            out["screens"] = [sc for sc in out.get("screens", [])
+                              if displays.screen_matches_content_role(sc, board.role)]
     out.pop("displays", None)
     return out
 
@@ -1073,11 +1138,11 @@ def main(argv=None) -> int:
         data, src, info = find_rom_card(rom, cards_dir, args.system, args.game_name, args.rom_name, default)
         log(f"rom '{info['rom']}' system={info['system'] or '?'} -> {rel_name(src, cards_dir)} ({info['match']})",
             args.quiet)
-        plan.append(lambda b, d=data: build_table_msg(table_for_board(d, b), with_clock=not no_clock))
+        plan.append(lambda b, d=data: message_for_table(d, b, with_clock=not no_clock))
     elif args.table:
         data, src = find_table(args.table, cards_dir, st.default_card)
         log(f"table '{args.table}' -> {src.name if src else '(generated title card)'}", args.quiet)
-        plan.append(lambda b, d=data: build_table_msg(table_for_board(d, b), with_clock=not no_clock))
+        plan.append(lambda b, d=data: message_for_table(d, b, with_clock=not no_clock))
     if not args.assign:
         if args.cal is not None:
             try:

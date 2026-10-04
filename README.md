@@ -736,6 +736,22 @@ pricing, right = instructions, top = controls. Regenerate with `python docs/mult
    ```
    `--assign` takes an id, a port or the current name. Roles are free text; `right`, `left`,
    `top`, `bottom`, `center` get their own colour on the identify screen.
+
+   Six content roles give each display its own job, so wireless boards do not all show the same
+   cards. Set them in config.json `displays` by board id (`name` plus `role`):
+
+   | role | what that display shows |
+   | --- | --- |
+   | `control_panel` | control-panel photo, or a controls card |
+   | `howtoplay` | how to play |
+   | `picture` | a still picture |
+   | `pictureboxart` | box art |
+   | `videoofplay` | a video of play |
+   | `keyboard` | the touch keypad, only when the content includes a keypad card |
+
+   Any other role still works as before. A content-role board with no matching card is skipped
+   instead of getting every card.
+
 5. Or keep the identity on the host, in config.json (host values win over the board's):
    ```json
    {

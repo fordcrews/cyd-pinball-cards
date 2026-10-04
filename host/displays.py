@@ -8,6 +8,10 @@ tested with 5 simulated boards; there is no hard limit in the code).
   the id "port:<port name>" (e.g. port:COM5, port:ttyUSB0) and the role "all".
 * config.json "displays" maps board ids (or "port:COM5" for old firmware) to name / role /
   rotation / keypad / idle_config, so the identity can also live on the host. Host config wins.
+* Content roles (config.json displays[id].role): control_panel, howtoplay, picture,
+  pictureboxart, videoofplay, keyboard. Those boards get only the matching card or idle
+  screen. keyboard gets the keypad only when a keypad card is in the content. Other roles
+  (left, right, top, ...) are unchanged.
 * Targeting (--target): "all" (default), or a comma list of roles, names, ids or ports.
 * Direct fan-out (no daemon): every port is opened in its own thread, pinged for its identity,
   sent its own messages, and closed again, so all boards update in parallel.
@@ -38,6 +42,59 @@ BOARD_TYPES = {"cyd": "ESP32-2432S028R (CYD) 320x240", "ws-s3-7": "Waveshare ESP
 BAUD = 115200
 GENERIC_ROLES = {"", "all", "*", "any"}   # a board with one of these roles gets the generic content
 TESTED_MAX_DISPLAYS = 5
+# Assignable content roles for config.json "displays"[board id].role (name is free text).
+# A board with one of these shows only the matching card or idle screen, not the whole playlist.
+# keyboard gets the keypad only when that content includes a keypad card.
+# Any other role (left, right, top, ...) is unchanged.
+CONTENT_ROLES = (
+    "control_panel",   # control-panel photo, or a controls card
+    "howtoplay",       # how to play
+    "picture",         # a still picture
+    "pictureboxart",   # box art
+    "videoofplay",     # a video of play
+    "keyboard",        # touch keypad, when a keypad card is in the content
+)
+CONTENT_ROLE_TYPES = {
+    "control_panel": frozenset({"controls", "buttons", "control", "control_panel", "cpanel"}),
+    "howtoplay": frozenset({"instructions", "howto", "howtoplay", "how_to_play", "rules"}),
+    "picture": frozenset({"picture", "image", "photo"}),
+    "pictureboxart": frozenset({"pictureboxart", "boxart", "box_art", "flyer"}),
+    "videoofplay": frozenset({"video", "videoofplay", "video_of_play"}),
+    "keyboard": frozenset({"keyboard", "keypad"}),
+}
+
+
+def is_content_role(role) -> bool:
+    return _fold(role) in CONTENT_ROLE_TYPES
+
+
+def _listed_for_role(roles, role: str) -> bool:
+    toks = _tokens(roles)
+    if not toks:
+        return False
+    if any(t in ("all", "*", "any") for t in toks):
+        return True
+    return role in toks
+
+
+def _matches_content_role(item, role) -> bool:
+    """An explicit roles list wins. Otherwise the card/screen type picks the content role."""
+    if not isinstance(item, dict) or not is_content_role(role):
+        return False
+    role = _fold(role)
+    if item.get("roles"):
+        return _listed_for_role(item.get("roles"), role)
+    return _fold(item.get("type")) in CONTENT_ROLE_TYPES[role]
+
+
+def card_matches_content_role(card, role) -> bool:
+    """Raw or built card belongs on a board whose role is one of CONTENT_ROLES."""
+    return _matches_content_role(card, role)
+
+
+def screen_matches_content_role(screen, role) -> bool:
+    """Idle screen belongs on a content-role board."""
+    return _matches_content_role(screen, role)
 
 
 def port_name(port: str) -> str:

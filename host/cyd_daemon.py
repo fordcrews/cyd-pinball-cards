@@ -6,7 +6,9 @@ Runs on Windows (PinUP Popper, RetroBat, ...) and Linux (Batocera, RetroPie, ...
   * Holds the serial ports of all connected displays (1-5 CYDs; a port can only be opened by one
     program at a time). It finds every CYD (USB VID:PID), asks each for its identity (id, name,
     role; firmware 1.3.0), notices displays being plugged in or out, and reconnects.
-  * Routes cyd_push messages: each display gets its own messages (per-role cards), all displays in
+  * Routes cyd_push messages: each display gets its own messages (per-role cards). Content roles
+    control_panel, howtoplay, picture, pictureboxart, videoofplay and keyboard do not share one
+    payload; keyboard gets the keypad only when a keypad card is in the content. All displays in
     parallel, so a game change updates every screen within about a second.
   * Turns {"evt":"key",...} lines from a display's touch keypad into real key presses (from any
     display, or only the ones listed in config.json "keypad_roles"):
@@ -756,7 +758,17 @@ class Daemon:
                 if not targets:
                     return {"ok": False, "err": "no display connected" if not self.boards()
                             else f"no display matches target {req.get('target')!r}", "acks": []}
-                sends = [{"board": b.id, "messages": msgs} for b in targets]
+                sends = []
+                for b in targets:
+                    one = []
+                    for m in msgs:
+                        sm = cyd_push.specialize_message(m, b)
+                        if sm:
+                            one.append(sm)
+                    if one:
+                        sends.append({"board": b.id, "messages": one})
+                if not sends:
+                    return {"ok": False, "err": "no display takes these messages", "acks": []}
             if not isinstance(sends, list) or not all(
                     isinstance(e, dict) and isinstance(e.get("messages"), list)
                     and all(isinstance(m, dict) and m.get("cmd") for m in e["messages"]) for e in sends):

@@ -199,6 +199,35 @@ class WifiDaemon(BusCase):
         self.assertEqual([(b.id, b.port) for b in d.boards()], [("cyd-house", "FAKE1")])
         self.assertTrue(board.closed)
 
+    def test_content_roles_get_different_payloads(self):
+        self.write_config({"displays": {
+            "cyd-panel": {"name": "control_panel", "role": "control_panel"},
+            "cyd-how": {"name": "howtoplay", "role": "howtoplay"},
+            "cyd-key": {"name": "keyboard", "role": "keyboard"},
+        }})
+        d = self.start()
+        hub = d.start_wifi(0, beacon_targets=[], beacon_interval=60)
+        boards = [DialIn(hub.tcp_port, ident) for ident in ("cyd-panel", "cyd-how", "cyd-key")]
+        for b in boards:
+            self.addCleanup(b.close)
+        self.assertTrue(wait_until(lambda: {b.id for b in d.boards()} == {"cyd-panel", "cyd-how", "cyd-key"}, 3))
+        msg = {"cmd": "table", "title": "Simulator", "cards": [
+            {"type": "controls", "roles": ["control_panel"], "title": "CONTROL PANEL", "text": "stick"},
+            {"type": "instructions", "roles": ["howtoplay"], "title": "HOW TO PLAY", "text": "rules"},
+            {"type": "keypad", "roles": ["keyboard"], "title": "KEYBOARD", "text": "keys"},
+        ]}
+        r = d.handle_request({"op": "send", "messages": [msg], "timeout": 2})
+        self.assertTrue(r["ok"], r)
+
+        def shown(board):
+            return [m for m in board.lines if m.get("cmd") in ("table", "keypad")]
+
+        self.assertTrue(wait_until(lambda: all(shown(b) for b in boards), 2))
+        self.assertEqual([c["title"] for c in shown(boards[0])[-1]["cards"]], ["CONTROL PANEL"])
+        self.assertEqual([c["title"] for c in shown(boards[1])[-1]["cards"]], ["HOW TO PLAY"])
+        self.assertEqual(shown(boards[2])[-1]["cmd"], "keypad")
+        self.assertNotIn("cards", shown(boards[2])[-1])
+
 
 if __name__ == "__main__":
     unittest.main()
