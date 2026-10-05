@@ -23,3 +23,8 @@ config.json
 # Wi-Fi credentials (copy firmware/wifi.example.json). Never commit SSIDs or passwords.
 firmware/wifi.json
 firmware/src/wifi_secrets.h
+
+# portable .NET SDK used to build the LaunchBox plugin
+.tools/
+frontends/launchbox/plugin/bin/
+frontends/launchbox/plugin/obj/
