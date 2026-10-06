@@ -85,6 +85,7 @@ cyd-pinball-cards/
 |---|---|---|
 | 1 per display | **ESP32-2432S028R "Cheap Yellow Display"** | Any 2.8" CYD with resistive touch. Micro-USB and dual USB (micro + USB-C) versions both work. See the note on the ST7789 variant below. |
 | alternative | **Waveshare ESP32-S3-Touch-LCD-7** (touch version) | 7" 800×480 instead of 2.8"; needs a good 5 V supply (~450 mA). See [its section](#waveshare-esp32-s3-touch-lcd-7). |
+| alternative | **ESP32-3248S035R** ("3.5 inch CYD", also LCDwiki E32R35T) | 3.5" 480x320 ST7796, resistive touch; env `cyd35`. See [its section](#esp32-3248s035r-35-cyd). |
 | 1 per display | USB data cable (micro-USB or USB-C to USB-A) | It must be a **data** cable. Cables of 1 m or less are the most reliable inside a cabinet. |
 | optional (recommended for 3–5 displays) | Powered USB 2.0 hub | Each CYD draws roughly 100–150 mA with the backlight on full, so 5 boards need up to about 750 mA. See [USB and power](#usb-and-power). |
 | optional | 3D-printed shroud / thin bezel, M2/M3 screws | See Mounting. |
@@ -146,6 +147,20 @@ the text doesn't fit. The idle clock uses TFT_eSPI's large digit font (Font 8, 7
 title, blue for rules, green for cost, purple for idle. The header shows a card counter (`2/4`).
 These fonts only cover **ASCII**, so avoid accented characters and symbols like `¢`. Write `25c`
 instead of `25¢`.
+
+## ESP32-3248S035R (3.5" CYD)
+
+Env `cyd35` builds the same firmware for the 3.5" "Cheap Yellow Display": ESP32-WROOM-32 (4 MB,
+no PSRAM), CH340 USB, ST7796 480x320 panel on HSPI (MISO 12, MOSI 13, SCLK 14, CS 15, DC 2),
+backlight GPIO 27, XPT2046 resistive touch on the same SPI bus (CS 33). The board reports itself
+as `"board":"cyd35"`, 480x320, and takes pictures like the 2.8" CYD (JPEG up to 48 KB, kept to
+about 34 KB). No prebuilt image: a local build bakes in your `firmware/wifi.json`, so build it yourself.
+
+    cd firmware
+    pio run -e cyd35 -t upload --upload-port COMx
+
+Touch uses the 2.8" defaults until you calibrate it (`python host/cyd_push.py --calibrate`).
+If colours look inverted, the panel batch needs `-DTFT_INVERSION_ON=1` (or `-DTFT_RGB_ORDER=TFT_BGR`).
 
 ## Waveshare ESP32-S3-Touch-LCD-7
 

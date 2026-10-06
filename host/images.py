@@ -41,12 +41,14 @@ ACK_TIMEOUT = 6.0           # per picture line: room for a Wi-Fi retransmit (a U
 
 # Fallback geometry for boards whose hello has no w/h (they cannot show images anyway, but the
 # numbers keep tests and dry runs honest). Landscape (rotation 1/3) sizes.
-BOARD_SIZES = {"cyd": (320, 240), "ws-s3-7": (800, 480)}
-BOARD_STRIP = {"cyd": 24, "ws-s3-7": 48}
-BOARD_IMG_MAX = {"cyd": 32 * 1024, "ws-s3-7": 200 * 1024}
+BOARD_SIZES = {"cyd": (320, 240), "cyd35": (480, 320), "ws-s3-7": (800, 480)}
+BOARD_STRIP = {"cyd": 24, "cyd35": 24, "ws-s3-7": 48}
+BOARD_IMG_MAX = {"cyd": 32 * 1024, "cyd35": 32 * 1024, "ws-s3-7": 200 * 1024}
 # Even when a board could take more, keep pictures small: every byte costs time on a 115200 baud
 # UART (about 11 KB/s of JPEG after base64). Quality steps down until the JPEG fits.
-BYTE_BUDGET = {"cyd": 28 * 1024, "ws-s3-7": 90 * 1024}
+# cyd35 (3.5" 480x320, no PSRAM): same heap as the 2.8" CYD, so the same ceiling; more pixels
+# just means a lower JPEG quality.
+BYTE_BUDGET = {"cyd": 28 * 1024, "cyd35": 34 * 1024, "ws-s3-7": 90 * 1024}
 
 
 def _ver(v) -> tuple:

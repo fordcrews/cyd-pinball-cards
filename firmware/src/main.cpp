@@ -79,6 +79,15 @@
 #ifndef TOUCH_Y_MAX
 #define TOUCH_Y_MAX 3800
 #endif
+// Native landscape size of the panel (resistive touch + calibration work in this space):
+// 320x240 on the 2.8" CYD, 480x320 on the 3.5" ESP32-3248S035 (env cyd35).
+#if defined(TFT_WIDTH) && defined(TFT_HEIGHT)
+#define NATIVE_LW (TFT_WIDTH > TFT_HEIGHT ? TFT_WIDTH : TFT_HEIGHT)
+#define NATIVE_LH (TFT_WIDTH > TFT_HEIGHT ? TFT_HEIGHT : TFT_WIDTH)
+#else
+#define NATIVE_LW 320
+#define NATIVE_LH 240
+#endif
 // Hold a finger on the idle/card screen this long to open the keypad (0 = disabled)
 #ifndef LONGPRESS_KEYPAD_MS
 #define LONGPRESS_KEYPAD_MS 2000
@@ -1266,18 +1275,19 @@ void saveCal() {
 }
 
 // Touch is always read in the controller's native orientation (XPT2046 lib rotation 1 = landscape,
-// which matches the CYD panel). Raw -> 320x240 landscape via the calibration, then rotated to the
-// current display rotation using the same transforms the XPT2046 library applies.
+// which matches the CYD panel). Raw -> native landscape (NATIVE_LW x NATIVE_LH) via the calibration,
+// then rotated to the current display rotation using the same transforms the XPT2046 library applies.
 void touchToScreen(int rx, int ry, int &sx, int &sy) {
-  int lx = (int32_t)(rx - tcal.xMin) * 320 / (tcal.xMax - tcal.xMin);
-  int ly = (int32_t)(ry - tcal.yMin) * 240 / (tcal.yMax - tcal.yMin);
-  lx = constrain(lx, 0, 319);
-  ly = constrain(ly, 0, 239);
+  const int LW = NATIVE_LW, LH = NATIVE_LH;
+  int lx = (int32_t)(rx - tcal.xMin) * LW / (tcal.xMax - tcal.xMin);
+  int ly = (int32_t)(ry - tcal.yMin) * LH / (tcal.yMax - tcal.yMin);
+  lx = constrain(lx, 0, LW - 1);
+  ly = constrain(ly, 0, LH - 1);
   switch (st.rotation & 3) {
     case 1: sx = lx; sy = ly; break;
-    case 3: sx = 319 - lx; sy = 239 - ly; break;
-    case 0: sx = 239 - ly; sy = lx; break;
-    default: sx = ly; sy = 319 - lx; break;
+    case 3: sx = LW - 1 - lx; sy = LH - 1 - ly; break;
+    case 0: sx = LH - 1 - ly; sy = lx; break;
+    default: sx = ly; sy = LW - 1 - lx; break;
   }
 }
 
@@ -1652,7 +1662,7 @@ void kpTick(unsigned long now) {
 }
 
 // ---------- On-device touch calibration ----------
-static const int16_t CAL_PTS[4][2] = {{20, 20}, {299, 20}, {299, 219}, {20, 219}};
+static const int16_t CAL_PTS[4][2] = {{20, 20}, {NATIVE_LW - 21, 20}, {NATIVE_LW - 21, NATIVE_LH - 21}, {20, NATIVE_LH - 21}};
 struct CalRun {
   uint8_t step = 0;
   int32_t rx[4], ry[4];
@@ -1664,12 +1674,12 @@ void calDrawTarget() {
   tft.setTextColor(COL_TEXT);
   tft.setTextDatum(MC_DATUM);
   useFont(F_SB12);
-  tft.drawString("TOUCH CALIBRATION", 160, 90);
+  tft.drawString("TOUCH CALIBRATION", NATIVE_LW / 2, NATIVE_LH / 2 - 30);
   useFont(F_S9);
   tft.setTextColor(COL_ACCENT);
-  tft.drawString("Tap the centre of the cross (" + String(cal.step + 1) + "/4)", 160, 125);
+  tft.drawString("Tap the centre of the cross (" + String(cal.step + 1) + "/4)", NATIVE_LW / 2, NATIVE_LH / 2 + 5);
   tft.setTextColor(COL_DIM);
-  tft.drawString("use a stylus or fingernail", 160, 150);
+  tft.drawString("use a stylus or fingernail", NATIVE_LW / 2, NATIVE_LH / 2 + 30);
   tft.setTextDatum(TL_DATUM);
   int x = CAL_PTS[cal.step][0], y = CAL_PTS[cal.step][1];
   tft.drawFastHLine(x - 14, y, 29, COL_RED);
@@ -1697,7 +1707,7 @@ void calEnd(bool ok, const char *err) {
   tft.setTextDatum(MC_DATUM);
   useFont(F_SB12);
   tft.setTextColor(ok ? COL_GREEN : COL_RED);
-  tft.drawString(ok ? "CALIBRATED" : "CALIBRATION FAILED", 160, 110);
+  tft.drawString(ok ? "CALIBRATED" : "CALIBRATION FAILED", NATIVE_LW / 2, NATIVE_LH / 2 - 10);
   tft.setTextDatum(TL_DATUM);
   delay(1200);
   boardSetRotation(st.rotation);
@@ -1719,9 +1729,9 @@ void calSample(int32_t rx, int32_t ry) {
   float kx = (xr - xl) / (CAL_PTS[1][0] - CAL_PTS[0][0]), ky = (yb - yt) / (CAL_PTS[2][1] - CAL_PTS[1][1]);
   TouchCal c;
   c.xMin = (int16_t)lroundf(xl - CAL_PTS[0][0] * kx);
-  c.xMax = (int16_t)lroundf(c.xMin + 320 * kx);
+  c.xMax = (int16_t)lroundf(c.xMin + NATIVE_LW * kx);
   c.yMin = (int16_t)lroundf(yt - CAL_PTS[0][1] * ky);
-  c.yMax = (int16_t)lroundf(c.yMin + 240 * ky);
+  c.yMax = (int16_t)lroundf(c.yMin + NATIVE_LH * ky);
   if (!calValid(c)) { calEnd(false, "implausible readings (axes swapped or missed a target?)"); return; }
   tcal = c;
   saveCal();
@@ -1839,7 +1849,7 @@ bool applyIdentity(JsonDocument &doc, bool allowId, String &err) {
 }
 
 void addIdentity(JsonDocument &r) {
-  r["board"] = BOARD_KIND;  // fw 1.4.0: "cyd" | "ws-s3-7"
+  r["board"] = BOARD_KIND;  // fw 1.4.0: "cyd" | "ws-s3-7"; "cyd35" = 3.5" ESP32-3248S035
   r["id"] = boardId();
   r["name"] = ident.name;
   r["role"] = ident.role;

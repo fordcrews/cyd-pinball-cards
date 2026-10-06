@@ -511,5 +511,25 @@ class Logging(unittest.TestCase):
         self.assertIn("img_max", main)
 
 
+class Cyd35Geometry(unittest.TestCase):
+    """3.5" ESP32-3248S035R (env cyd35): 480x320, no PSRAM, so a CYD-sized JPEG budget."""
+
+    def test_reported_size_and_fallback(self):
+        b = displays.make_board("COM16", {"id": "cyd-03616c", "fw": "1.5.0", "board": "cyd35", "rotation": 1,
+                                          "w": 480, "h": 320, "img_max": 49152, "strip": 24}, {})
+        g = images.board_geometry(b)
+        self.assertEqual((b.hw, g["w"], g["h"], g["strip"]), ("cyd35", 480, 320, 24))
+        self.assertEqual(g["budget"], images.BYTE_BUDGET["cyd35"])
+        self.assertLessEqual(g["budget"], 48 * 1024)
+        g = images.board_geometry({"hw": "cyd35", "fw": "1.5.0", "rotation": 0})
+        self.assertEqual((g["w"], g["h"]), (320, 480))
+
+    def test_firmware_env_exists(self):
+        root = Path(__file__).resolve().parent.parent / "firmware"
+        ini = (root / "platformio.ini").read_text(encoding="utf-8")
+        self.assertIn("[env:cyd35]", ini)
+        self.assertIn("-DST7796_DRIVER=1", ini)
+        self.assertIn("BOARD_KIND_STR", (root / "src" / "board.h").read_text(encoding="utf-8"))
+
 if __name__ == "__main__":
     unittest.main()

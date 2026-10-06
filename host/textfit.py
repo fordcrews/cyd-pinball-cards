@@ -54,6 +54,7 @@ SANSBOLD24 = (
 
 FACES = {   # hw -> (scale, regular face for F_S9, bold face for F_SB12)
     "cyd": (1, SANS9, SANSBOLD12),
+    "cyd35": (1, SANS9, SANSBOLD12),   # 3.5" 480x320: same fonts (UI_SCALE 1), more room
     "ws-s3-7": (2, SANS18, SANSBOLD24),
 }
 

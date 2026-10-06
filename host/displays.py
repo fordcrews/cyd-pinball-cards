@@ -39,7 +39,8 @@ KNOWN_VID_PID = {
     (0x1A86, 0x55D3): "CH343",
 }
 # Board types reported by firmware >= 1.4.0 in ping/hello/ready ("board"); older firmware = CYD
-BOARD_TYPES = {"cyd": "ESP32-2432S028R (CYD) 320x240", "ws-s3-7": "Waveshare ESP32-S3-Touch-LCD-7 800x480"}
+BOARD_TYPES = {"cyd": "ESP32-2432S028R (CYD) 320x240", "cyd35": "ESP32-3248S035R (3.5\" CYD) 480x320",
+               "ws-s3-7": "Waveshare ESP32-S3-Touch-LCD-7 800x480"}
 BAUD = 115200
 GENERIC_ROLES = {"", "all", "*", "any"}   # a board with one of these roles gets the generic content
 TESTED_MAX_DISPLAYS = 5

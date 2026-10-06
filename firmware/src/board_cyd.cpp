@@ -2,14 +2,24 @@
 // XPT2046 resistive touch on VSPI, PWM backlight on TFT_BL. Pins come from platformio.ini [env:cyd].
 #include "board.h"
 #if !defined(BOARD_WS_S3_LCD7)
-#include <XPT2046_Touchscreen.h>
 #include <TJpg_Decoder.h>
+#if !defined(CYD_TOUCH_SHARED_SPI)
+#include <XPT2046_Touchscreen.h>
+#endif
 
 #define BL_CHANNEL 0
 
 TFT_eSPI tft;
+#if defined(CYD_TOUCH_SHARED_SPI)
+// ESP32-3248S035R / E32R35T: the XPT2046 sits on the display's SPI bus (TOUCH_CS), so TFT_eSPI's
+// own touch reader is used (it shares the bus safely). Raw axes match XPT2046_Touchscreen rotation 1.
+#ifndef TOUCH_Z_MIN
+#define TOUCH_Z_MIN 350
+#endif
+#else
 static SPIClass touchSpi(VSPI);
 static XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
+#endif
 
 void boardBeginSerial(size_t rxBuf) {
   // Big RX ring buffer (must be set before begin): a full 6 KB line can arrive while a screen
@@ -28,19 +38,31 @@ void boardInitDisplay(uint8_t rotation, uint8_t brightness) {
   tft.init();
   tft.setRotation(rotation);
   tft.fillScreen(TFT_BLACK);
+#if !defined(CYD_TOUCH_SHARED_SPI)
   touchSpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
   ts.begin(touchSpi);
   ts.setRotation(1);  // always native orientation; main.cpp touchToScreen() applies the display rotation
+#endif
 }
 
 void boardSetRotation(uint8_t rotation) { tft.setRotation(rotation); }
 
 bool boardReadTouch(TouchSample &t) {
+#if defined(CYD_TOUCH_SHARED_SPI)
+  uint16_t z = tft.getTouchRawZ();
+  if (z < TOUCH_Z_MIN) return false;
+  uint16_t rx = 0, ry = 0;
+  tft.getTouchRaw(&rx, &ry);
+  t.rawX = rx;
+  t.rawY = ry;
+  t.z = z;
+#else
   if (!ts.touched()) return false;
   TS_Point p = ts.getPoint();
   t.rawX = p.x;
   t.rawY = p.y;
   t.z = p.z;
+#endif
   t.x = t.y = 0;  // mapped with the calibration in main.cpp
   return true;
 }
