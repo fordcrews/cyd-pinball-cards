@@ -3,6 +3,7 @@
 #include "board.h"
 #if !defined(BOARD_WS_S3_LCD7)
 #include <XPT2046_Touchscreen.h>
+#include <TJpg_Decoder.h>
 
 #define BL_CHANNEL 0
 
@@ -44,4 +45,19 @@ bool boardReadTouch(TouchSample &t) {
   return true;
 }
 bool boardUsbHostOpen() { return false; }  // CH340/CP210x: the UART is up whenever the cable is powered
+
+// TJpgDec hands over one decoded MCU block (16x16 or 8x8 RGB565) at a time, so only a ~3 KB work
+// area is needed besides the JPEG itself: fine without PSRAM.
+static bool jpegBlock(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
+  if (y >= tft.height()) return false;  // below the screen: stop decoding
+  tft.pushImage(x, y, w, h, bitmap);
+  return true;
+}
+
+bool boardDrawJpeg(const uint8_t *data, size_t len, int x, int y) {
+  TJpgDec.setJpgScale(1);
+  TJpgDec.setSwapBytes(true);
+  TJpgDec.setCallback(jpegBlock);
+  return TJpgDec.drawJpg(x, y, data, len) == JDR_OK;
+}
 #endif

@@ -23,6 +23,13 @@
 //   {"cmd":"cal","reset":true}  |  {"cmd":"cal","debug":true|false}      touch calibration values
 //   {"cmd":"calibrate"}   on-device 4-point touch calibration (tap the crosshairs)
 //                         (capacitive GT911 board: cal/calibrate are no-ops that report "touch":"capacitive")
+//   {"cmd":"image","op":"begin","size":N,"w":W,"h":H,"crc":CRC32[,"chunks":K][,"title":"Joust"]}
+//   {"cmd":"image","op":"chunk","seq":0,"data":"<base64>"}   ... one ack each ({"ack":"image","ok":true,"seq":0})
+//   {"cmd":"image","op":"end"}     check size + CRC-32, decode the baseline JPEG, draw it centred
+//                         (title strip along the bottom when "title" was given). The host has already
+//                         fitted the picture to this screen (host/images.py); hello reports w, h,
+//                         img_max (largest JPEG accepted) and strip (title strip height).
+//   {"cmd":"image","op":"show"[,"crc":C]}   redraw the picture still held in RAM  |  {"cmd":"image","op":"abort"}
 // Events (device -> host, unsolicited):
 //   {"evt":"key","key":"alt+f4"[,"mods":["ctrl","shift","alt","win"]]}   keypad button released
 //   {"evt":"keypad","state":"on"|"off","source":"touch"}   keypad opened (long-press) / EXIT tapped
@@ -30,7 +37,8 @@
 //   {"evt":"touch","x":..,"y":..}   a tap that is not a keypad key (host shows the keypad on this board)
 //   {"evt":"touch","raw_x":..,"raw_y":..,"x":..,"y":..}   only while cal debug is on
 // Replies: {"ack":"<cmd>","ok":true[, ...]} or {"ack":"<cmd>","ok":false,"err":"..."}
-// Boot line: {"ready":true,"device":"cyd-pinball-cards","fw":"1.4.0","board":"cyd","id":"cyd-a1b2c3","name":"","role":""}
+// Boot line: {"ready":true,"device":"cyd-pinball-cards","fw":"1.5.0","board":"cyd","id":"cyd-a1b2c3","name":"","role":"",
+//             "w":320,"h":240,"img_max":49152,"strip":24,...}
 //
 // "ts" is the host's LOCAL wall-clock time as seconds since 1970-01-01 00:00 (i.e. local time
 // encoded as if it were UTC). The ESP32 has no RTC, so the clock only runs after a host sent it,
@@ -41,6 +49,7 @@
 #include "wifi_link.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include "mbedtls/base64.h"
 
 #ifndef CYD_ROTATION
 #define CYD_ROTATION 1
@@ -79,7 +88,7 @@
 #define IDENTIFY_MS 5000
 #endif
 
-#define FW_VERSION "1.4.0"
+#define FW_VERSION "1.5.0"
 #define MAX_CARDS 8
 #define MAX_IDLE_SCREENS 12
 #define MAX_LINE 6144         // longest accepted JSON line (bytes)
@@ -1003,8 +1012,95 @@ void idleTick(unsigned long now) {
   }
 }
 
+// ---------- Pictures (fw 1.5.0) ----------
+// The host fits the picture to this screen and sends a small baseline JPEG as base64 chunks, one
+// ack each (host/images.py). The JPEG stays in RAM so an overlay (keypad, identify) or a rotation
+// can redraw it; a table or idle push frees it. No PSRAM on the CYD: the buffer is capped and a
+// heap reserve is kept for Wi-Fi, JSON and the decoder.
+#define IMG_STRIP_H S(24)
+#if defined(BOARD_HAS_PSRAM)
+#define IMG_MAX_BYTES (256 * 1024)
+#define IMG_HEAP_RESERVE 0
+#else
+#define IMG_MAX_BYTES (48 * 1024)
+#define IMG_HEAP_RESERVE (28 * 1024)
+#endif
+
+struct Picture {
+  uint8_t *buf = nullptr;
+  size_t size = 0, got = 0;
+  int seq = 0;
+  uint32_t crc = 0;
+  int w = 0, h = 0;
+  String title;
+  bool complete = false;  // buf holds a whole, CRC-checked JPEG
+  bool showing = false;   // the picture is the current content (instead of cards / idle)
+  unsigned long drawMs = 0;
+} pic;
+
+void pictureFree() {
+  if (pic.buf) free(pic.buf);
+  pic = Picture();
+}
+
+size_t pictureMax() {
+#if defined(BOARD_HAS_PSRAM)
+  return IMG_MAX_BYTES;
+#else
+  size_t blk = ESP.getMaxAllocHeap();
+  size_t m = blk > IMG_HEAP_RESERVE ? blk - IMG_HEAP_RESERVE : 0;
+  return m < IMG_MAX_BYTES ? m : IMG_MAX_BYTES;
+#endif
+}
+
+uint8_t *pictureAlloc(size_t n) {
+#if defined(BOARD_HAS_PSRAM)
+  uint8_t *p = (uint8_t *)heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (p) return p;
+#endif
+  return (uint8_t *)malloc(n);
+}
+
+uint32_t crc32Of(const uint8_t *p, size_t n) {  // same as zlib.crc32
+  uint32_t c = 0xFFFFFFFFu;
+  while (n--) {
+    c ^= *p++;
+    for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+  }
+  return ~c;
+}
+
+bool drawPicture() {
+  int W = tft.width(), H = tft.height();
+  bool strip = pic.title.length() > 0;
+  int areaH = strip ? H - IMG_STRIP_H : H;
+  tft.fillScreen(COL_BG);
+  int x = (W - pic.w) / 2, y = (areaH - pic.h) / 2;
+  if (x < 0) x = 0;
+  if (y < 0) y = 0;
+  unsigned long t0 = millis();
+  bool ok = pic.buf && pic.complete && boardDrawJpeg(pic.buf, pic.size, x, y);
+  pic.drawMs = millis() - t0;
+  if (strip) {
+    tft.fillRect(0, H - IMG_STRIP_H, W, IMG_STRIP_H, COL_DARK);
+    tft.drawFastHLine(0, H - IMG_STRIP_H, W, COL_ACCENT);
+    useFont(F_SB9);
+    tft.setTextColor(COL_TEXT, COL_DARK);
+    tft.setTextDatum(MC_DATUM);
+    String t = pic.title;
+    while (t.length() > 1 && tft.textWidth(t) > W - S(12)) t.remove(t.length() - 1);
+    tft.drawString(t, W / 2, H - IMG_STRIP_H / 2 + 1);
+    tft.setTextDatum(TL_DATUM);
+  }
+  return ok;
+}
+
 // ---------- Cards ----------
 void drawCard() {
+  if (pic.showing && pic.complete) {
+    drawPicture();
+    return;
+  }
   if (st.idle || st.cardCount == 0) {
     idleStart();
     return;
@@ -1749,6 +1845,10 @@ void addIdentity(JsonDocument &r) {
   r["role"] = ident.role;
   r["rotation"] = st.rotation;
   r["keypad"] = ident.keypad;
+  r["w"] = tft.width();      // fw 1.5.0: screen size in this rotation, for host-side picture fitting
+  r["h"] = tft.height();
+  r["img_max"] = (uint32_t)pictureMax();
+  r["strip"] = IMG_STRIP_H;
 }
 
 // ---------- Serial ----------
@@ -1780,7 +1880,86 @@ const char *modeName() {
   if (ui == UI_KEYPAD) return "keypad";
   if (ui == UI_CAL) return "calibrate";
   if (ui == UI_IDENT) return "identify";
+  if (pic.showing) return "image";
   return st.idle ? "idle" : "table";
+}
+
+void handleImage(JsonDocument &doc) {
+  const char *op = doc["op"] | "";
+  JsonDocument r;
+  r["ack"] = "image";
+  r["op"] = op;
+  bool ok = false;
+  const char *err = nullptr;
+  if (!strcmp(op, "begin")) {
+    size_t size = doc["size"] | 0;
+    pictureFree();  // one buffer: the old picture goes first (it matters on the no-PSRAM CYD)
+    size_t mx = pictureMax();
+    r["max"] = mx;
+    if (!size) err = "size missing";
+    else if (size > mx) err = "too big";
+    else if (!(pic.buf = pictureAlloc(size))) err = "out of memory";
+    else {
+      pic.size = size;
+      pic.crc = doc["crc"] | 0;
+      pic.w = doc["w"] | 0;
+      pic.h = doc["h"] | 0;
+      pic.title = cleanText(doc["title"] | "", 80, false);
+      ok = true;
+    }
+  } else if (!strcmp(op, "chunk")) {
+    int seq = doc["seq"] | -1;
+    const char *data = doc["data"] | "";
+    r["seq"] = seq;
+    if (!pic.buf || pic.complete) err = "no transfer";
+    else if (seq >= 0 && seq == pic.seq - 1) ok = true;  // repeat of the last chunk (lost ack): already stored
+    else if (seq != pic.seq) { err = "out of order"; r["want"] = pic.seq; }
+    else {
+      size_t olen = 0;
+      int rc = mbedtls_base64_decode(pic.buf + pic.got, pic.size - pic.got, &olen,
+                                     (const unsigned char *)data, strlen(data));
+      if (rc) err = "bad base64 or more data than size";
+      else {
+        pic.got += olen;
+        pic.seq++;
+        ok = true;
+      }
+    }
+    r["got"] = (uint32_t)pic.got;
+  } else if (!strcmp(op, "end")) {
+    if (!pic.buf || pic.got != pic.size) { err = "incomplete"; r["got"] = (uint32_t)pic.got; }
+    else if (pic.crc && crc32Of(pic.buf, pic.size) != pic.crc) err = "crc mismatch";
+    else {
+      pic.complete = true;
+      leaveOverlay();  // like a table push, a new picture wins over keypad / identify
+      pic.showing = true;
+      if (drawPicture()) {
+        ok = true;
+        r["ms"] = (uint32_t)pic.drawMs;
+        r["bytes"] = (uint32_t)pic.size;
+      } else {
+        err = "jpeg decode failed";
+        pictureFree();
+        drawCard();  // back to what was there before
+      }
+    }
+  } else if (!strcmp(op, "show")) {
+    uint32_t crc = doc["crc"] | 0;
+    if (pic.complete && pic.buf && (!crc || crc == pic.crc)) {
+      leaveOverlay();
+      pic.showing = true;
+      ok = drawPicture();
+      if (!ok) err = "jpeg decode failed";
+    } else err = "no such picture";
+  } else if (!strcmp(op, "abort")) {
+    if (!pic.complete) pictureFree();
+    ok = true;
+  } else {
+    err = "unknown op";
+  }
+  r["ok"] = ok;
+  if (err) r["err"] = err;
+  emitLine(r);
 }
 
 void replyCal(const char *ack) {
@@ -1803,6 +1982,7 @@ void handleLine(const String &line) {
   if (!strcmp(cmd, "table")) {
     if (doc["ts"].is<uint32_t>()) setClock(doc["ts"].as<uint32_t>());
     leaveOverlay();
+    pictureFree();
     loadTableFromDoc(doc);
     lastTitle = st.tableTitle;
     lastTs = clockValid ? clockNow() : 0;
@@ -1829,6 +2009,7 @@ void handleLine(const String &line) {
       prefs.end();
     }
     leaveOverlay();
+    pictureFree();
     st.idle = true;
     saveIdle(true);
     drawCard();
@@ -1956,6 +2137,8 @@ void handleLine(const String &line) {
       saveCal();
     }
     replyCal("cal");
+  } else if (!strcmp(cmd, "image")) {
+    handleImage(doc);
   } else if (!strcmp(cmd, "calibrate")) {
 #if TOUCH_CAPACITIVE
     JsonDocument r;
@@ -2204,6 +2387,8 @@ void loop() {
     calTick(now);
   } else if (ui == UI_IDENT) {
     if ((long)(now - identUntil) >= 0) endIdentify();
+  } else if (pic.showing) {
+    // a still picture: nothing to animate or rotate
   } else if (!st.idle) {
     if (st.cardCount > 1 && CARD_ROTATE_MS > 0 && now - lastRotate >= CARD_ROTATE_MS) {
       lastRotate = now;

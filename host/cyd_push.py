@@ -78,6 +78,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import serialport  # noqa: E402  (pyserial, or a termios fallback on Linux)
 import displays    # noqa: E402  (multi-display: identity, targeting, direct fan-out)
 from displays import Board  # noqa: E402
+import images      # noqa: E402  (pictures: fit, JPEG, chunked transfer; fw 1.5.0)
 
 # Known USB-serial bridges used on CYD boards: CH340, CH9102, CP2102
 KNOWN_VID_PID = displays.KNOWN_VID_PID
@@ -577,6 +578,10 @@ def message_for_table(data: dict, board: Board | None, with_clock: bool = True) 
     return msg
 
 
+# Content roles that show a picture when a card carries an "image" path (howtoplay stays text).
+IMAGE_ROLES = frozenset({"control_panel", "picture", "pictureboxart", "videoofplay"})
+
+
 def specialize_message(msg: dict, board: Board | None) -> dict | None:
     """Fan-out of one already-built idle/table: content-role boards do not all get the same
     payload. Other commands, and boards without a content role, are unchanged. A keyboard
@@ -595,7 +600,12 @@ def specialize_message(msg: dict, board: Board | None) -> dict | None:
         if not kept:
             return None
         out = dict(msg)
-        out["cards"] = [{k: v for k, v in c.items() if k != "roles"} for c in kept]
+        out["cards"] = [{k: v for k, v in c.items() if k not in ("roles", "image")} for c in kept]
+        # A card with an "image" path on a picture role becomes a picture (fw 1.5.0); the cards
+        # stay as the text fallback for a missing file, an old board or a failed transfer.
+        pic = next((c["image"] for c in kept if isinstance(c.get("image"), str) and c["image"].strip()), None)
+        if pic and role in IMAGE_ROLES:
+            return {"cmd": "image", "path": pic, "title": msg.get("title", ""), "fallback": out}
         return out
     if cmd == "idle":
         screens = [s for s in (msg.get("screens") or []) if isinstance(s, dict)]
@@ -917,31 +927,45 @@ def daemon_request(obj: dict, timeout: float = 5.0, port: int | None = None) -> 
 def send(port: str, messages: list[dict], timeout: float, quiet: bool) -> bool:
     ok_all = True
     ser = open_serial(port)
+
+    def request(msg: dict, t: float, echo: bool = True) -> dict:
+        line = json.dumps(msg, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ser.write(line.encode("utf-8"))
+        ser.flush()
+        deadline = time.time() + t
+        while time.time() < deadline:
+            raw = ser.readline().decode("utf-8", "replace").strip()
+            if not raw:
+                continue
+            try:
+                resp = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(resp, dict) and "ack" in resp:
+                if msg.get("cmd") == "image" and not images.ack_matches(msg, resp):
+                    continue              # stale answer to a retried picture chunk
+                if echo:
+                    log(f"{port}: {raw}", quiet)
+                return resp
+        return {"ack": msg.get("cmd"), "ok": False, "err": f"no ack within {t}s"}
+
     try:
         time.sleep(0.1)
         ser.reset_input_buffer()
+        board = None
         for msg in messages:
-            line = json.dumps(msg, ensure_ascii=False, separators=(",", ":")) + "\n"
-            ser.write(line.encode("utf-8"))
-            ser.flush()
-            deadline = time.time() + timeout
-            acked = False
-            while time.time() < deadline:
-                raw = ser.readline().decode("utf-8", "replace").strip()
-                if not raw:
-                    continue
-                try:
-                    resp = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if "ack" in resp:
-                    acked = True
-                    log(f"{port}: {raw}", quiet)
-                    ok_all &= bool(resp.get("ok"))
-                    break
-            if not acked:
+            if images.is_image_msg(msg):   # picture: fit/encode/chunk here (no daemon to do it)
+                if board is None:
+                    hello = request({"cmd": "hello"}, timeout, echo=False)
+                    board = displays.make_board(port, hello if hello.get("ok") else {})
+                res = images.deliver(lambda m, t: request(m, t, echo=False), msg, board, timeout)
+                log(f"{port}: {images.describe(res)}", quiet)
+                ok_all &= bool(res.get("ok"))
+                continue
+            resp = request(msg, timeout)
+            if "no ack" in str(resp.get("err", "")):
                 log(f"{port}: no ack for cmd={msg.get('cmd')} within {timeout}s", quiet)
-                ok_all = False
+            ok_all &= bool(resp.get("ok"))
     finally:
         ser.close()
     return ok_all

@@ -124,6 +124,10 @@ class Board:
     board_name: str = ""          # as stored on the board
     board_role: str = ""
     hw: str = ""                  # board type from firmware >= 1.4.0: "cyd" | "ws-s3-7" ("" = older fw)
+    w: int = 0                    # screen size in the current rotation (firmware >= 1.5.0; 0 = unknown)
+    h: int = 0
+    img_max: int = 0              # largest JPEG the board accepts (firmware >= 1.5.0; 0 = no images)
+    strip: int = -1               # height of the image title strip in pixels (-1 = unknown)
     configured: bool = False      # a config.json "displays" entry applies
     cfg: dict = field(default_factory=dict)
 
@@ -157,6 +161,9 @@ def identity_from_reply(reply: dict | None, port: str) -> dict:
     out["id"] = bid or legacy_id(port)
     rot = reply.get("rotation")
     out["rotation"] = int(rot) if isinstance(rot, int) else None
+    for k, default in (("w", 0), ("h", 0), ("img_max", 0), ("strip", -1)):
+        v = reply.get(k)
+        out[k] = int(v) if isinstance(v, int) and not isinstance(v, bool) else default
     return out
 
 
@@ -181,6 +188,7 @@ def make_board(port: str, reply: dict | None, displays: dict | None = None) -> B
     return Board(port=port, id=ident["id"], name=name, role=role, fw=ident["fw"], mode=ident["mode"],
                  keypad=keypad, rotation=ident["rotation"], legacy=ident["legacy"],
                  board_name=ident["board_name"], board_role=ident["board_role"], hw=ident["hw"],
+                 w=ident["w"], h=ident["h"], img_max=ident["img_max"], strip=ident["strip"],
                  configured=bool(cfg), cfg=cfg)
 
 

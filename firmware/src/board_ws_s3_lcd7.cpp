@@ -177,4 +177,8 @@ bool boardReadTouch(TouchSample &t) {
   t.z = 1000;  // capacitive: no pressure; treat every sample as a firm press
   return true;
 }
+
+bool boardDrawJpeg(const uint8_t *data, size_t len, int x, int y) {
+  return lcd.drawJpg(data, (uint32_t)len, x, y);  // frame buffer is in PSRAM; JPEG from RAM
+}
 #endif

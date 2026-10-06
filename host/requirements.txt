@@ -1,4 +1,5 @@
 pyserial>=3.5    # Windows: required. Linux: optional (built-in termios fallback in serialport.py)
+Pillow>=10      # pictures on the boards (firmware 1.5.0): fit + JPEG; without it pictures fall back to text
 psutil>=5.9      # optional: cyd_daemon.py process watch (falls back to /proc on Linux, tasklist on Windows)
 # evdev          # optional, Linux only: key injection via python-evdev (else the built-in /dev/uinput writer).
 #                # Prefer the distro package: sudo apt install python3-evdev

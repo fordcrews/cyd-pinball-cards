@@ -63,13 +63,40 @@ def test_build_table_msg_specializes_per_content_role():
     assert msg["title"] == "Galaga"
 
     import cyd_push
+    want_image = {"control_panel": r"C:\x\cp.png", "pictureboxart": r"C:\x\box.jpg",
+                  "picture": r"C:\x\ss.png", "videoofplay": r"C:\x\ss.png"}   # video: a still for now
     for role in ("control_panel", "howtoplay", "picture", "pictureboxart", "videoofplay"):
         board = displays.Board(port="t", id="t-" + role, role=role, name=role)
         specialized = cyd_push.specialize_message(msg, board)
         assert specialized is not None, role
-        assert specialized.get("cards"), role
-        assert len(specialized["cards"]) == 1, role
-        assert "roles" not in specialized["cards"][0]
+        if role in want_image:
+            assert specialized["cmd"] == "image", role
+            assert specialized["path"] == want_image[role], role
+            assert specialized["title"] == "Galaga"
+            text = specialized["fallback"]          # shown if the picture cannot be
+        else:
+            assert specialized["cmd"] == "table", role
+            text = specialized
+        assert len(text["cards"]) == 1, role
+        assert "roles" not in text["cards"][0]
+        assert "image" not in text["cards"][0]
+
+
+def test_missing_media_stays_text():
+    msg = lb.build_table_msg({"title": "Qbert", "platform": "Arcade"})
+    import cyd_push
+    for role in ("control_panel", "picture", "pictureboxart", "videoofplay"):
+        out = cyd_push.specialize_message(msg, displays.Board(port="t", id="t", role=role))
+        assert out["cmd"] == "table", role
+    cp = cyd_push.specialize_message(msg, displays.Board(port="t", id="t", role="control_panel"))
+    assert "No Arcade - Control Panel image" in cp["cards"][0]["text"]
+
+
+def test_video_role_uses_box_art_when_no_screenshot():
+    cards = lb.build_cards({"title": "Joust", "box_front": r"C:\x\box.jpg", "video_path": r"C:\x\j.mp4"})
+    video = next(c for c in cards if "videoofplay" in c["roles"])
+    assert video["image"] == r"C:\x\box.jpg"
+    assert "still" in video["text"]
 
 
 def test_select_vs_launch_wording():

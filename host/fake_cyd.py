@@ -3,8 +3,9 @@
 fake_cyd.py - simulate CYD boards running cyd-pinball-cards firmware, so cyd_daemon.py /
 cyd_push.py can be tested without hardware.
 
-* FakeBoard: the protocol (fw 1.4.0 with board type + id/name/role/rotation/keypad, identify, config, set_id,
-  hello - or fw 1.2.0 without any identity, for backward-compatibility tests).
+* FakeBoard: the protocol (fw 1.5.0 with board type + id/name/role/rotation/keypad, identify, config, set_id,
+  hello, screen size and the chunked "image" command - or fw 1.2.0 without any identity, for
+  backward-compatibility tests).
 * FakeCyd: one board on a pseudo-terminal (Linux/macOS only). link="/tmp/x/cyd-left" adds a
   symlink to the PTY, so a daemon given that path sees unplug()/re-plug like a real USB device.
 * FakeBus: boards on made-up port names ("FAKE1"...) with in-memory serial handles; install()
@@ -39,7 +40,7 @@ class FakeBoard:
     thread; `delay` (seconds, or a dict cmd -> seconds) simulates the time a real board spends
     drawing, so timing / parallel fan-out can be tested."""
 
-    def __init__(self, fw: str = "1.4.0", id: str | None = None, name: str = "", role: str = "",
+    def __init__(self, fw: str = "1.5.0", id: str | None = None, name: str = "", role: str = "",
                  rotation: int = 1, keypad: bool = True, delay=0.0, log=None, mac: str | None = None,
                  board: str = "cyd"):
         self.fw = fw
@@ -55,6 +56,8 @@ class FakeBoard:
         self.received: list[dict] = []
         self.received_at: list[float] = []
         self.out = lambda data: None
+        self.pictures: list[bytes] = []      # JPEGs drawn (fw 1.5.0 image command)
+        self._img = None                     # [size, crc, bytearray, next seq, complete]
         self._buf = b""
         self._q: queue.Queue = queue.Queue()
         threading.Thread(target=self._worker, daemon=True).start()
@@ -69,9 +72,54 @@ class FakeBoard:
 
     def identity(self) -> dict:
         ident = {"id": self.id, "name": self.name, "role": self.role, "rotation": self.rotation, "keypad": self.keypad}
-        if tuple(int(x) for x in self.fw.split(".")[:2]) >= (1, 4):
+        ver = tuple(int(x) for x in self.fw.split(".")[:2])
+        if ver >= (1, 4):
             ident = {"board": self.board, **ident}
+        if ver >= (1, 5):
+            w, h = (800, 480) if self.board == "ws-s3-7" else (320, 240)
+            if self.rotation in (0, 2):
+                w, h = h, w
+            ident.update({"w": w, "h": h, "img_max": 256 * 1024 if self.board == "ws-s3-7" else 48 * 1024,
+                          "strip": 48 if self.board == "ws-s3-7" else 24})
         return ident
+
+    def _image(self, d: dict) -> dict:
+        import base64
+        import zlib
+        op = d.get("op")
+        r = {"ack": "image", "op": op, "ok": True}
+        if op == "begin":
+            self._img = [int(d.get("size") or 0), d.get("crc"), bytearray(), 0, False]
+        elif op == "chunk":
+            if not self._img or self._img[4]:
+                return {**r, "ok": False, "err": "no transfer"}
+            seq = d.get("seq")
+            r["seq"] = seq
+            if seq == self._img[3]:
+                self._img[2] += base64.b64decode(d.get("data", ""))
+                self._img[3] += 1
+            elif seq != self._img[3] - 1:
+                return {**r, "ok": False, "err": "out of order", "want": self._img[3]}
+        elif op == "end":
+            if not self._img or len(self._img[2]) != self._img[0]:
+                return {**r, "ok": False, "err": "incomplete"}
+            if self._img[1] and zlib.crc32(bytes(self._img[2])) != self._img[1]:
+                return {**r, "ok": False, "err": "crc mismatch"}
+            self._img[4] = True
+            self.pictures.append(bytes(self._img[2]))
+            self.mode = self.prev = "image"
+            r.update({"ms": 1, "bytes": self._img[0]})
+        elif op == "show":
+            if not self._img or not self._img[4] or d.get("crc") not in (None, 0, self._img[1]):
+                return {**r, "ok": False, "err": "no such picture"}
+            self.pictures.append(bytes(self._img[2]))
+            self.mode = self.prev = "image"
+        elif op == "abort":
+            if self._img and not self._img[4]:
+                self._img = None
+        else:
+            return {**r, "ok": False, "err": "unknown op"}
+        return r
 
     def emit(self, obj: dict):
         self.out((json.dumps(obj, separators=(",", ":")) + "\n").encode())
@@ -113,7 +161,10 @@ class FakeBoard:
             time.sleep(wait)
         if self.mode == "identify" and cmd not in ("ping", "hello", "config", "set_id", "identify"):
             self.mode = getattr(self, "prev_ui", self.prev)      # any other command ends identify
-        if cmd in ("idle", "table"):
+        if cmd == "image" and tuple(int(x) for x in self.fw.split(".")[:2]) >= (1, 5):
+            self.emit(self._image(d))
+        elif cmd in ("idle", "table"):
+            self._img = None
             self.mode = self.prev = cmd
             self.emit({"ack": cmd, "ok": True, **({"cards": len(d.get("cards") or []) or 1} if cmd == "table" else {})})
         elif cmd == "keypad":

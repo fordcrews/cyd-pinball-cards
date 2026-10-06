@@ -2,8 +2,8 @@
 
 Drives the cyd-pinball-cards Wi-Fi/USB boards from **LaunchBox 14** (and Big Box) on
 Windows. On game **select** and **launch**, each content role gets matching LaunchBox
-media (as text cards today; image pixels on the board are the next step). On **exit**,
-boards return to the idle playlist.
+media: real pictures on firmware 1.5.0 boards, text on older ones. On **exit**, boards
+return to the idle playlist.
 
 ## What you need
 
@@ -69,11 +69,15 @@ nothing is listening it starts `host\cyd_daemon.py` with `DAEMON_ARGS` from
 
 | Role | On select / launch |
 |---|---|
-| `control_panel` | “SELECTED” / “NOW PLAYING” + Arcade - Control Panel path (or “none found”) |
-| `howtoplay` | LaunchBox Notes (else manual path) |
-| `pictureboxart` | Box - Front path |
-| `picture` | Screenshot - Gameplay path |
-| `videoofplay` | Video path (still text; board cannot play video yet) |
+| `control_panel` | Arcade - Control Panel picture (else Controls Information), game title strip |
+| `howtoplay` | LaunchBox Notes (else manual path), as text |
+| `pictureboxart` | Box - Front picture |
+| `picture` | Screenshot - Gameplay picture |
+| `videoofplay` | A still (gameplay screenshot, else box art); video does not play yet |
+
+Pictures are fitted to each board, sent as a small JPEG in acked chunks by the daemon, and
+fall back to a text card when the file is missing or the board's firmware is older than 1.5.0.
+A picture to the 7" over its USB UART takes about 6 s; to the 2.8" over Wi-Fi under 1 s.
 | `keyboard` | Keypad (tap any other role’s screen for 10s keypad overlay) |
 
 On game exit → idle / attract playlist (`cards/_idle_arcade.json` when present).
@@ -108,4 +112,5 @@ without the plugin or a custom watcher.
 
 ## Not done yet
 
-* Real image / video pixels on the ESP32 (paths are sent as text)
+* Video playback on the boards (`videoofplay` shows a still)
+* Notes come from the plugin; the CLI with `--resolve-media` finds media but not notes

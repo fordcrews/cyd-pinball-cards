@@ -269,6 +269,10 @@ documents grow on the heap as needed (no fixed document size); a full idle confi
 | keypad exit | `{"cmd":"keypad","exit":true}` (back to the previous screen) | `{"ack":"keypad","ok":true}` |
 | cal | `{"cmd":"cal"}`, `{"cmd":"cal","x_min":200,"x_max":3700,"y_min":240,"y_max":3800}`, `{"cmd":"cal","reset":true}`, `{"cmd":"cal","debug":true}` | `{"ack":"cal","ok":true,"x_min":200,"x_max":3700,"y_min":240,"y_max":3800,"debug":false}` (capacitive board: `{"ack":"cal","ok":true,"touch":"capacitive",...}`) |
 | calibrate | `{"cmd":"calibrate"}` (on-device, tap 4 crosses) | `{"ack":"calibrate","ok":true}`, later `{"evt":"cal",...}` |
+| image begin (1.5.0) | `{"cmd":"image","op":"begin","size":47169,"w":800,"h":270,"crc":3735928559,"chunks":16,"title":"Joust"}` | `{"ack":"image","op":"begin","ok":true,"max":262144}` (`"err":"too big"` / `"out of memory"`) |
+| image chunk | `{"cmd":"image","op":"chunk","seq":0,"data":"<base64, up to 4096 chars>"}` | `{"ack":"image","op":"chunk","ok":true,"seq":0,"got":3072}` (a repeated last `seq` is acked again, not stored twice) |
+| image end | `{"cmd":"image","op":"end"}` | `{"ack":"image","op":"end","ok":true,"ms":189,"bytes":47169}` after the CRC-32 check, JPEG decode and draw |
+| image show / abort | `{"cmd":"image","op":"show","crc":...}` (redraw the picture still in RAM), `{"cmd":"image","op":"abort"}` | `{"ack":"image","op":"show","ok":true}` |
 
 Events the display sends on its own (one JSON object per line, `evt` instead of `ack`):
 
@@ -309,6 +313,29 @@ Existing host scripts ignore lines without `ack`, so the new events don't distur
     `controls` / `buttons` → `instructions`, `moves` / `tips` → `rules`, `credits` / `pricing` → `cost`.
 * Tapping the screen (on release) moves to the next card and restarts the auto-rotate timer.
   Holding it for 2 s opens the touch keypad.
+
+### Pictures (firmware 1.5.0)
+
+The boards draw real pictures (LaunchBox control panel, box art, screenshots). The host does the
+image work and the board only decodes a small JPEG, over USB or Wi-Fi alike:
+
+* `hello` / `ping` / `ready` also report `w` and `h` (screen size in the current rotation),
+  `img_max` (largest JPEG the board takes: 256 KB in PSRAM on the 7"; on the 2.8" CYD, which has no
+  PSRAM, up to 48 KB while keeping 28 KB of heap free) and `strip` (title strip height, 24 / 48 px).
+* `host/images.py` fits the picture into the screen (aspect kept; the board centres it on black,
+  so it is letterboxed), leaves room for the title strip, and encodes a baseline JPEG at quality 70.
+  It steps the quality down if the JPEG is over the byte budget (28 KB CYD, 90 KB 7").
+* It is sent as `begin`, base64 `chunk`s of 3 KB with one ack each, then `end`. The board checks
+  size and CRC-32 and decodes with TJpg_Decoder (CYD, one 16x16 block at a time) or LovyanGFX
+  `drawJpg` (7"). The JPEG stays in RAM so the keypad overlay or a rotation can redraw it; `table`
+  and `idle` free it.
+* Front ends send one high-level message and the daemon expands it per board:
+  `{"cmd":"image","path":"...png","title":"Joust","fallback":{"cmd":"table",...}}`. In a `table`,
+  a card with an `"image"` path becomes this message on the `control_panel`, `pictureboxart`,
+  `picture` and `videoofplay` roles. `howtoplay` stays text. If the file is missing, the board's
+  firmware is older or the transfer fails, the text `fallback` is shown instead.
+* Measured: a 46 KB 800x270 control panel takes about 6 s to the 7" over its 115200 baud UART
+  (draw 190 ms). A 7–14 KB picture takes 0.4–0.6 s to the CYD over Wi-Fi (draw 50–85 ms).
 
 ## Idle / attract screens
 
@@ -898,14 +925,21 @@ last spoke. The daemon also keeps a single session per board id and closes the W
 when that id is already on a COM port. `config.json` `displays` entries still match the board id,
 whether the link is `wifi:192.168.x.x:...` or a serial port.
 
-### Later: control-panel photos
+**Dialing (1.5.0).** A board dials the cabinet after 3 s, then backs off (doubling, up to 60 s)
+after each failed dial or refused session. Once a USB host has sent it a command since boot, it
+dials at most every 2 minutes, so a board whose session is on USB no longer knocks every 3 s.
+The daemon logs a refused Wi-Fi session at most once a minute per board, and its `--log` file
+rotates to `<name>.1` at 2 MB. Wi-Fi modem sleep is off and the board reads the socket in blocks,
+so a request/ack round trip is about 25 ms.
 
-The next content slice is showing the control-panel photos the systems this kit already
-supports already have: MAME, R-Cade, and PinUP Popper artwork, and the same kind of image
-on the other frontends. Not a new protocol. This slice only carries the existing card JSON
-over Wi-Fi or USB.
+### Control-panel photos
+
+Pictures are in (see "Pictures (firmware 1.5.0)" above). LaunchBox is the first front end that
+sends them; the same `"image"` card key works from any front end that knows its artwork paths.
 
 ## License
 This kit is yours to use and change. It uses TFT_eSPI (FreeBSD/MIT-style), XPT2046_Touchscreen (MIT),
-ArduinoJson (MIT), and optionally pyserial (BSD), psutil (BSD) and python-evdev (BSD). It contains no
-Pixelcade code or assets, and no game artwork.
+ArduinoJson (MIT), TJpg_Decoder (FreeBSD-style, CYD pictures), LovyanGFX (FreeBSD, 7"), Pillow (MIT-CMU,
+host-side picture fitting), and optionally pyserial (BSD), psutil (BSD) and python-evdev (BSD). It
+contains no Pixelcade code or assets, and no game artwork (pictures are read from your own front end's
+media folders at run time).

@@ -2,9 +2,18 @@
 """LaunchBox / Big Box -> cyd-pinball-cards bridge.
 
 Builds per-role table cards from a LaunchBox game (title, notes, media paths) and
-sends them to a running cyd_daemon on 127.0.0.1:47291. Firmware today draws text
-cards; image and video paths are included in the card text until image display
-lands on the boards.
+sends them to a running cyd_daemon on 127.0.0.1:47291. Picture roles get the real
+artwork (firmware 1.5.0 "image" command; the daemon fits it to each board, encodes a
+small JPEG and sends it in acked chunks over USB or Wi-Fi):
+
+  control_panel  Arcade - Control Panel (else Arcade - Controls Information)
+  pictureboxart  Box - Front
+  picture        Screenshot - Gameplay
+  videoofplay    a still for now (gameplay screenshot, else box art); no video playback
+  howtoplay      text: LaunchBox notes, else the manual path
+
+Each picture card also carries text, which a board shows when the file is missing, its
+firmware is older, or the transfer fails.
 
 Used by:
   * the CydPinballCards LaunchBox plugin (writes a JSON event file, then runs this)
@@ -130,9 +139,14 @@ def _clip(text: str, n: int = 400) -> str:
 
 
 def _path_note(path: str | None, kind: str) -> str:
+    """Text fallback for a picture card (shown only when the picture cannot be)."""
     if path:
-        return f"{kind}:\n{path}\n\n(Image display on the board is the next step; path shown as text.)"
-    return f"No {kind} found in LaunchBox for this game."
+        return f"{kind}:\n{path}"
+    return f"No {kind} image in LaunchBox for this game."
+
+
+def _image(path) -> str | None:
+    return str(path) if path and str(path).strip() else None
 
 
 def build_cards(event: dict) -> list[dict]:
@@ -148,6 +162,7 @@ def build_cards(event: dict) -> list[dict]:
     screenshot = event.get("screenshot")
     video_path = event.get("video_path")
     manual_path = event.get("manual_path")
+    video_still = screenshot or box_front    # until the boards can play video
 
     howto = notes
     if not howto and manual_path:
@@ -164,6 +179,7 @@ def build_cards(event: dict) -> list[dict]:
             + (f"\n{platform}" if platform else "")
             + "\n\n"
             + _path_note(control_panel, "Arcade - Control Panel"),
+            "image": _image(control_panel),
         },
         {
             "type": "instructions",
@@ -176,18 +192,22 @@ def build_cards(event: dict) -> list[dict]:
             "roles": ["pictureboxart"],
             "title": "BOX ART",
             "text": f"{title}\n\n" + _path_note(box_front, "Box - Front"),
+            "image": _image(box_front),
         },
         {
             "type": "picture",
             "roles": ["picture"],
             "title": "PICTURE",
             "text": f"{title}\n\n" + _path_note(screenshot, "Screenshot - Gameplay"),
+            "image": _image(screenshot),
         },
         {
             "type": "video",
             "roles": ["videoofplay"],
             "title": "VIDEO OF PLAY",
-            "text": f"{title}\n\n" + _path_note(video_path, "Video"),
+            "text": f"{title}\n\n" + _path_note(video_path, "Video")
+            + ("\n\n(Video does not play on the boards yet; showing a still.)" if video_still else ""),
+            "image": _image(video_still),
         },
         {
             "type": "keypad",
@@ -216,6 +236,8 @@ def build_table_msg(event: dict) -> dict:
             "text": cyd_push.to_ascii(c.get("text", "")),
             "roles": [str(r) for r in (c.get("roles") or [])],
         }
+        if c.get("image"):
+            entry["image"] = str(c["image"])   # the daemon turns this card into a picture
         cards.append(entry)
     msg = {"cmd": "table", "title": cyd_push.to_ascii(title), "cards": cards}
     msg["ts"] = cyd_push.local_epoch()
@@ -226,7 +248,11 @@ def send_table(event: dict, dry_run: bool = False) -> dict | None:
     msg = build_table_msg(event)
     if dry_run:
         return {"ok": True, "dry_run": True, "message": msg}
-    return cyd_push.daemon_request({"op": "send", "messages": [msg], "wait": True}, timeout=8.0)
+    # Pictures take a few seconds per board on a 115200 baud UART; boards are served in parallel.
+    return cyd_push.daemon_request({"op": "send", "messages": [msg], "wait": True}, timeout=SEND_TIMEOUT)
+
+
+SEND_TIMEOUT = 90.0
 
 
 def send_idle(dry_run: bool = False) -> dict | None:
@@ -305,7 +331,10 @@ def _summary(res: dict | None) -> str:
         return "daemon not reachable on 127.0.0.1:47291"
     parts = []
     for r in res.get("results") or []:
-        parts.append(f"{r.get('board')}[{r.get('role')}]={'ok' if r.get('ok') else 'FAILED'}")
+        shown = [a.get("shown") for a in (r.get("acks") or []) if isinstance(a, dict) and a.get("shown")]
+        secs = [a.get("secs") for a in (r.get("acks") or []) if isinstance(a, dict) and a.get("shown") == "image"]
+        extra = f"({shown[-1]}{', %ss' % secs[-1] if secs and secs[-1] is not None else ''})" if shown else ""
+        parts.append(f"{r.get('board')}[{r.get('role')}]={'ok' if r.get('ok') else 'FAILED'}{extra}")
     return ("ok " if res.get("ok") else "FAILED ") + " ".join(parts)
 
 

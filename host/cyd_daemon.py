@@ -65,6 +65,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cyd_push  # noqa: E402  (shared config loading / message builders / port detection)
 import displays  # noqa: E402  (multi-display identity + targeting)
+import images    # noqa: E402  (pictures: fit, JPEG, chunked transfer with acks)
 import keymap    # noqa: E402
 
 DEFAULT_WATCH = ["PinUpMenuSetup.exe"]   # PinUP Popper setup/config tool (TO-VERIFY on your install)
@@ -72,6 +73,9 @@ DEFAULT_WATCH = ["PinUpMenuSetup.exe"]   # PinUP Popper setup/config tool (TO-VE
 RECONNECT_S = 2.0      # how often to look for new / re-plugged displays
 IGNORE_S = 30.0        # a port that did not answer like a CYD is left alone this long
 TOUCH_KEYPAD_S = 10.0  # after a touch, return a non-keyboard display to its role this many seconds later
+LOG_MAX_BYTES = 2 * 1024 * 1024   # --log file is rotated to <name>.1 at this size
+REFUSED_LOG_S = 60.0   # "USB is the session" for a board dialing in over Wi-Fi: once per this many seconds
+IMAGE_JOB_S = 60.0     # extra wait per picture in a cyd_push hand-off (a 7" picture over a UART is ~8 s)
 
 
 def _ver(v: str) -> tuple:
@@ -86,10 +90,26 @@ def ts() -> str:
 
 
 class Logger:
-    def __init__(self, verbose: bool = False, logfile: Path | None = None):
+    def __init__(self, verbose: bool = False, logfile: Path | None = None, max_bytes: int = LOG_MAX_BYTES):
         self.verbose = verbose
-        self.fh = open(logfile, "a", encoding="utf-8") if logfile else None
+        self.path = Path(logfile) if logfile else None
+        self.max_bytes = max_bytes
         self.lock = threading.Lock()
+        self.fh = None
+        if self.path:
+            self._rotate_if_big()
+            self.fh = open(self.path, "a", encoding="utf-8")
+
+    def _rotate_if_big(self) -> None:
+        # Keep one old copy (<log>.1); a chatty board can no longer grow the log without bound.
+        try:
+            if self.path.is_file() and self.path.stat().st_size >= self.max_bytes:
+                if self.fh:
+                    self.fh.close()
+                    self.fh = None
+                self.path.replace(self.path.with_name(self.path.name + ".1"))
+        except OSError:
+            pass
 
     def __call__(self, msg: str, debug: bool = False) -> None:
         if debug and not self.verbose:
@@ -103,6 +123,16 @@ class Logger:
             if self.fh:
                 self.fh.write(line + "\n")
                 self.fh.flush()
+                try:
+                    big = self.fh.tell() >= self.max_bytes
+                except (OSError, ValueError):
+                    big = False
+                if big:
+                    self._rotate_if_big()
+                    try:
+                        self.fh = open(self.path, "a", encoding="utf-8")
+                    except OSError:
+                        self.fh = None
 
 
 # ---------------------------------------------------------------- process watcher
@@ -188,6 +218,8 @@ class BoardLink:
         self.stop = threading.Event()
         self.fw: str | None = None
         self.last_ready: dict | None = None
+        self.img_cache: dict = {}       # CRC of the picture the board holds (redraw instead of resend)
+        self.content_gen = 0            # bumped per content hand-off; a stale queued picture is skipped
 
     @property
     def connected(self) -> bool:
@@ -277,8 +309,9 @@ class BoardLink:
                 self.log(f"write to {self.port} failed: {e}")
                 return False
 
-    def request(self, msg: dict, timeout: float = 3.0) -> dict:
-        """Write one command and wait for its ack (other lines keep flowing to on_line)."""
+    def request(self, msg: dict, timeout: float = 3.0, accept=None) -> dict:
+        """Write one command and wait for its ack (other lines keep flowing to on_line).
+        accept(ack) -> bool skips stale acks (e.g. the second answer to a retried picture chunk)."""
         with self.io_lock:
             while not self.acks.empty():
                 self.acks.get_nowait()
@@ -290,9 +323,11 @@ class BoardLink:
                 if left <= 0:
                     return {"ack": msg.get("cmd"), "ok": False, "err": f"no ack within {timeout}s"}
                 try:
-                    return self.acks.get(timeout=left)
+                    ack = self.acks.get(timeout=left)
                 except queue.Empty:
                     continue
+                if accept is None or accept(ack):
+                    return ack
 
     # ---- FIFO send worker
     def submit(self, fn) -> threading.Event:
@@ -346,6 +381,8 @@ class Daemon:
         self.last_by_role: dict[str, tuple[dict, float]] = {}   # role -> (last table/idle msg, time)
         self.last_content: dict[str, dict] = {}                  # board id -> last idle/table message
         self.touch_until: dict[str, float] = {}                  # board id -> monotonic deadline for role return
+        self._refused: dict[str, tuple] = {}                     # board id -> (last log time, refusals since)
+        self._refused_lock = threading.Lock()
         self.touch_keypad_s = TOUCH_KEYPAD_S
         self.state_lock = threading.RLock()
         self.setup_running: str | None = None  # name of the watched process that is running
@@ -480,7 +517,7 @@ class Daemon:
             wifi_new = str(lk.port).startswith("wifi:")
             wifi_old = str(other.port).startswith("wifi:")
             if wifi_new and not wifi_old:
-                self.log(f"wifi {board.id} from {lk.port} closed; USB on {other.port} is the session")
+                self._log_refused(board.id, lk.port, other.port)
                 lk.close()
                 return False
             if wifi_old and not wifi_new:
@@ -501,6 +538,18 @@ class Daemon:
         self.links[lk.port] = lk
         self._warned_wait = False
         return True
+
+    def _log_refused(self, board_id: str, wifi_port: str, usb_port: str) -> None:
+        # A board on USB that also dials in over Wi-Fi is refused each time; log that once a minute.
+        now = time.monotonic()
+        with self._refused_lock:
+            last, n = self._refused.get(board_id, (None, 0))
+            if last is not None and now - last < REFUSED_LOG_S:
+                self._refused[board_id] = (last, n + 1)
+                return
+            self._refused[board_id] = (now, 0)
+        more = f" ({n} more since the last note)" if n else ""
+        self.log(f"wifi {board_id} from {wifi_port} closed; USB on {usb_port} is the session{more}")
 
     def adopt_wifi(self, conn, addr) -> None:
         # Handshake one inbound wireless display. USB with the same id stays; this socket is closed.
@@ -598,11 +647,27 @@ class Daemon:
         cfg = cyd_push.idle_cfg_for_board(cfg, board, self.cards_dir, self.base)
         return cyd_push.build_idle_msg(cfg, cabinet=self.st.cabinet, subtitle=self.st.subtitle)
 
+    def deliver(self, lk: BoardLink, msg: dict, timeout: float) -> dict:
+        """One message to one board. A picture request is fitted, encoded and sent in acked chunks
+        (text fallback when it cannot be shown); everything else is one request/ack."""
+        if images.is_image_msg(msg):
+            return images.deliver(
+                lambda m, t: lk.request(m, timeout=t, accept=lambda a, m=m: images.ack_matches(m, a)),
+                msg, lk.board, timeout, cache=lk.img_cache)
+        if msg.get("cmd") in ("table", "idle"):
+            lk.img_cache.clear()          # the board frees its picture for other content
+        return lk.request(msg, timeout=timeout)
+
+    @staticmethod
+    def _result_text(msg: dict, r: dict) -> str:
+        if images.is_image_msg(msg):
+            return ("ok " if r.get("ok") else "FAILED ") + images.describe(r)
+        return "ok" if r.get("ok") else "FAILED " + str(r.get("err", ""))
+
     def send_to(self, lk: BoardLink, msg: dict, why: str = "", timeout: float | None = None) -> dict:
-        r = lk.request(msg, timeout=timeout or self.args.timeout)
+        r = self.deliver(lk, msg, timeout or self.args.timeout)
         who = lk.board.id if lk.board else lk.port
-        self.log(f"-> {who} {msg.get('cmd')}{' (' + why + ')' if why else ''}: "
-                 f"{'ok' if r.get('ok') else 'FAILED ' + str(r.get('err', ''))}")
+        self.log(f"-> {who} {msg.get('cmd')}{' (' + why + ')' if why else ''}: {self._result_text(msg, r)}")
         if r.get("ok"):
             self._track(lk, msg)
         return r
@@ -614,7 +679,7 @@ class Daemon:
             return
         if cmd == "keypad":
             b.mode = "idle" if msg.get("exit") else "keypad"
-        elif cmd in ("idle", "table"):
+        elif cmd in ("idle", "table", "image"):
             b.mode = cmd
             self.last_by_role[b.role] = (msg, time.time())
             with self.state_lock:
@@ -738,7 +803,8 @@ class Daemon:
             if obj.get("raw_x") is None and obj.get("raw_y") is None:
                 self.note_touch(lk, opened=True)
         elif obj.get("ready"):
-            self.log(f"display {who} (re)booted, fw {obj.get('fw')}")
+            # A Wi-Fi session also opens with a ready line; before the handshake that is not a reboot.
+            self.log(f"display {who} (re)booted, fw {obj.get('fw')}", debug=b is None)
             if b is not None:
                 b.mode = "unknown"
                 if obj.get("id"):
@@ -807,16 +873,25 @@ class Daemon:
                 continue
             res = {"board": lk.board.id, "port": lk.port, "role": lk.board.role, "acks": [], "ok": True}
             results.append(res)
+            gen = None
+            if any(m.get("cmd") in ("table", "idle", "image") for m in msgs):
+                with self.state_lock:
+                    lk.content_gen += 1
+                    gen = lk.content_gen
 
-            def job(lk=lk, msgs=msgs, res=res):
+            def job(lk=lk, msgs=msgs, res=res, gen=gen):
                 for m in msgs:
-                    r = lk.request(m, timeout=timeout)
+                    if images.is_image_msg(m) and gen is not None and lk.content_gen != gen:
+                        # newer content is already queued (fast scrolling): skip this picture
+                        res["acks"].append({"ack": "image", "ok": True, "skipped": True})
+                        self.log(f"-> {lk.board.id} image (from cyd_push): skipped, newer content queued")
+                        continue
+                    r = self.deliver(lk, m, timeout)
                     res["acks"].append(r)
                     res["ok"] &= bool(r.get("ok"))
                     if r.get("ok"):
                         self._track(lk, m)
-                    self.log(f"-> {lk.board.id} {m.get('cmd')} (from cyd_push): "
-                             f"{'ok' if r.get('ok') else 'FAILED ' + str(r.get('err', ''))}")
+                    self.log(f"-> {lk.board.id} {m.get('cmd')} (from cyd_push): {self._result_text(m, r)}")
                 # an idle push (e.g. a game closed) while setup is still open: back to the keypad
                 with self.state_lock:
                     if (msgs and msgs[-1].get("cmd") == "idle" and self.setup_running and not self.manual_exit
@@ -825,7 +900,9 @@ class Daemon:
             jobs.append(lk.submit(job))
         if not wait:
             return {"ok": bool(results) and all("err" not in r for r in results), "queued": len(jobs), "results": [{k: v for k, v in r.items() if k != "acks"} for r in results]}
-        limit = time.time() + timeout * max((len(e.get("messages") or []) for e in sends), default=1) + 5
+        limit = time.time() + max((timeout * len(e.get("messages") or [])
+                                   + IMAGE_JOB_S * sum(1 for m in (e.get("messages") or []) if images.is_image_msg(m))
+                                   for e in sends), default=timeout) + 5
         for done in jobs:
             done.wait(max(0.0, limit - time.time()))
         acks = [a for r in results for a in r["acks"]]
