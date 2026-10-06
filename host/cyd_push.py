@@ -79,6 +79,7 @@ import serialport  # noqa: E402  (pyserial, or a termios fallback on Linux)
 import displays    # noqa: E402  (multi-display: identity, targeting, direct fan-out)
 from displays import Board  # noqa: E402
 import images      # noqa: E402  (pictures: fit, JPEG, chunked transfer; fw 1.5.0)
+import textfit     # noqa: E402  (long text cards split into pages that fit each display)
 
 # Known USB-serial bridges used on CYD boards: CH340, CH9102, CP2102
 KNOWN_VID_PID = displays.KNOWN_VID_PID
@@ -547,7 +548,7 @@ def table_for_board(data: dict, board: Board | None) -> dict:
     cards = [c for c in cards if not isinstance(c, dict) or not c.get("roles")
              or displays.role_listed(board, c.get("roles"))]
     if board is not None and displays.is_content_role(board.role):
-        # control_panel, howtoplay, picture, pictureboxart, videoofplay, keyboard:
+        # control_panel, howtoplay, picture, pictureboxart, videoofplay, gallery, keyboard:
         # only the matching cards, never the shared playlist.
         cards = [c for c in cards if displays.card_matches_content_role(c, board.role)]
     return {**data, "title": title, "cards": cards}
@@ -579,7 +580,27 @@ def message_for_table(data: dict, board: Board | None, with_clock: bool = True) 
 
 
 # Content roles that show a picture when a card carries an "image" path (howtoplay stays text).
-IMAGE_ROLES = frozenset({"control_panel", "picture", "pictureboxart", "videoofplay"})
+IMAGE_ROLES = frozenset({"control_panel", "picture", "pictureboxart", "videoofplay", "gallery"})
+GALLERY_INTERVAL_S = 9.0   # seconds each gallery picture stays up (counted after it is drawn)
+
+
+def gallery_items(cards: list) -> list[dict]:
+    """[{"path","title"}] from cards' "images" lists (strings or {"path","title"}), then "image"."""
+    out, seen = [], set()
+    for c in cards:
+        if not isinstance(c, dict):
+            continue
+        raw = list(c.get("images") or [])
+        if isinstance(c.get("image"), str):
+            raw.append(c["image"])
+        for it in raw:
+            path, title = (it, "") if isinstance(it, str) else \
+                (str((it or {}).get("path") or ""), str((it or {}).get("title") or ""))
+            path = path.strip()
+            if path and path not in seen:
+                seen.add(path)
+                out.append({"path": path, "title": title})
+    return out
 
 
 def specialize_message(msg: dict, board: Board | None) -> dict | None:
@@ -600,7 +621,23 @@ def specialize_message(msg: dict, board: Board | None) -> dict | None:
         if not kept:
             return None
         out = dict(msg)
-        out["cards"] = [{k: v for k, v in c.items() if k not in ("roles", "image")} for c in kept]
+        out["cards"] = [{k: v for k, v in c.items() if k not in ("roles", "image", "images", "interval")}
+                        for c in kept]
+        # "fit": true (a long LaunchBox description): as many pages as this display needs
+        out["cards"] = textfit.expand_cards(out["cards"], board)
+        if role == "gallery":
+            # Several pictures in turn: the daemon shows one, waits, shows the next (repeats until
+            # the next content push). Missing files are skipped there; the cards are the fallback.
+            items = gallery_items(kept)
+            if not items:
+                return out
+            title = msg.get("title", "")
+            for it in items:
+                it["title"] = it["title"] or title
+            interval = next((c.get("interval") for c in kept if isinstance(c.get("interval"), (int, float))),
+                            GALLERY_INTERVAL_S)
+            return {"cmd": "gallery", "title": title, "items": items, "interval": float(interval),
+                    "fallback": out}
         # A card with an "image" path on a picture role becomes a picture (fw 1.5.0); the cards
         # stay as the text fallback for a missing file, an old board or a failed transfer.
         pic = next((c["image"] for c in kept if isinstance(c.get("image"), str) and c["image"].strip()), None)
@@ -954,6 +991,8 @@ def send(port: str, messages: list[dict], timeout: float, quiet: bool) -> bool:
         ser.reset_input_buffer()
         board = None
         for msg in messages:
+            if msg.get("cmd") == "gallery":   # no daemon to rotate it: the first picture only
+                msg = images.gallery_first(msg)
             if images.is_image_msg(msg):   # picture: fit/encode/chunk here (no daemon to do it)
                 if board is None:
                     hello = request({"cmd": "hello"}, timeout, echo=False)

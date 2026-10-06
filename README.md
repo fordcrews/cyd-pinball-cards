@@ -334,6 +334,12 @@ image work and the board only decodes a small JPEG, over USB or Wi-Fi alike:
   a card with an `"image"` path becomes this message on the `control_panel`, `pictureboxart`,
   `picture` and `videoofplay` roles. `howtoplay` stays text. If the file is missing, the board's
   firmware is older or the transfer fails, the text `fallback` is shown instead.
+* A card with an `"images"` list becomes `{"cmd":"gallery","items":[{"path","title"},...],
+  "interval":9,"fallback":...}` on the `gallery` role. The daemon shows the items in turn, each
+  for `interval` seconds after it is drawn, until the next content push; missing files are
+  skipped. Over USB gallery pictures are capped at 40 KB. A tap stops a transfer at once.
+* A text card with `"fit": true` is split per display into pages that its firmware draws in full
+  (`host/textfit.py` repeats the firmware's word wrap with the same fonts): `HOW TO PLAY 1/3`, ...
 * Measured: a 46 KB 800x270 control panel takes about 6 s to the 7" over its 115200 baud UART
   (draw 190 ms). A 7–14 KB picture takes 0.4–0.6 s to the CYD over Wi-Fi (draw 50–85 ms).
 
@@ -764,7 +770,7 @@ pricing, right = instructions, top = controls. Regenerate with `python docs/mult
    `--assign` takes an id, a port or the current name. Roles are free text; `right`, `left`,
    `top`, `bottom`, `center` get their own colour on the identify screen.
 
-   Six content roles give each display its own job, so wireless boards do not all show the same
+   Seven content roles give each display its own job, so wireless boards do not all show the same
    cards. Set them in config.json `displays` by board id (`name` plus `role`):
 
    | role | what that display shows |
@@ -773,7 +779,8 @@ pricing, right = instructions, top = controls. Regenerate with `python docs/mult
    | `howtoplay` | how to play |
    | `picture` | a still picture |
    | `pictureboxart` | box art |
-   | `videoofplay` | a video of play |
+   | `videoofplay` | a video of play (a still: the boards cannot play video) |
+   | `gallery` | box art, gameplay screenshot and a video still in turn, about 9 s each |
    | `keyboard` | the touch keypad, only when the content includes a keypad card |
 
    Any other role still works as before. A content-role board with no matching card is skipped

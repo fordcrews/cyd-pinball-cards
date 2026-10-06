@@ -41,7 +41,7 @@ class SimMessages(unittest.TestCase):
 
     def test_content_role_names(self):
         self.assertEqual(displays.CONTENT_ROLES, (
-            "control_panel", "howtoplay", "picture", "pictureboxart", "videoofplay", "keyboard"))
+            "control_panel", "howtoplay", "picture", "pictureboxart", "videoofplay", "gallery", "keyboard"))
 
     def test_roles_do_not_share_cards(self):
         panel = cyd_sim.messages_for_role("card", "control_panel")
@@ -49,12 +49,14 @@ class SimMessages(unittest.TestCase):
         pic = cyd_sim.messages_for_role("card", "picture")
         art = cyd_sim.messages_for_role("card", "pictureboxart")
         vid = cyd_sim.messages_for_role("card", "videoofplay")
+        gal = cyd_sim.messages_for_role("card", "gallery")
         keys = cyd_sim.messages_for_role("card", "keyboard")
         self.assertEqual([c["title"] for c in panel[0]["cards"]], ["CONTROL PANEL"])
         self.assertEqual([c["title"] for c in how[0]["cards"]], ["HOW TO PLAY"])
         self.assertEqual([c["title"] for c in pic[0]["cards"]], ["PICTURE"])
         self.assertEqual([c["title"] for c in art[0]["cards"]], ["BOX ART"])
         self.assertEqual([c["title"] for c in vid[0]["cards"]], ["VIDEO OF PLAY"])
+        self.assertEqual([c["title"] for c in gal[0]["cards"]], ["GALLERY"])
         self.assertEqual(keys, [{"cmd": "keypad"}])
         self.assertNotIn("JOYSTICK", json.dumps(how))
 
@@ -80,7 +82,7 @@ class SimMessages(unittest.TestCase):
         other = cyd_push.specialize_message(msg, Board(port="c", id="cyd-x", role="right"))
         self.assertEqual([c["title"] for c in panel["cards"]], ["CONTROL PANEL"])
         self.assertEqual([c["title"] for c in how["cards"]], ["HOW TO PLAY"])
-        self.assertEqual(len(other["cards"]), 6)  # not a content role: unchanged
+        self.assertEqual(len(other["cards"]), 7)  # not a content role: unchanged
 
     def test_assignments_do_not_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:

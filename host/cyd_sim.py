@@ -6,13 +6,13 @@ Sends a short idle playlist, then a text card, through a running cyd_daemon
 This script never opens a serial port and never reads Wi-Fi credentials.
 
 Each board is sent only the card for its content role (config.json "displays").
-Roles: control_panel, howtoplay, picture, pictureboxart, videoofplay, keyboard.
+Roles: control_panel, howtoplay, picture, pictureboxart, videoofplay, gallery, keyboard.
 keyboard gets the keypad only when a keypad card is in the sample.
 
 A run writes assignments for the two known boards when they are not already in
 config.json (the 7 inch stays assigned even if it is offline):
 
-  cyd-1e37f4  name control_panel  role control_panel
+  cyd-1e37f4  name gallery        role gallery
   cyd-2bee08  name howtoplay      role howtoplay
 
   python cyd_sim.py
@@ -35,7 +35,7 @@ import displays  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 # Known boards on the bench. Assignments are by id, not by the address they dialed in from.
 LIVE_ASSIGNMENTS = {
-    "cyd-1e37f4": {"name": "control_panel", "role": "control_panel"},
+    "cyd-1e37f4": {"name": "gallery", "role": "gallery"},
     "cyd-2bee08": {"name": "howtoplay", "role": "howtoplay"},
 }
 
@@ -58,6 +58,8 @@ def sample_idle_cfg() -> dict:
              "text": "Idle box art stand-in.", "duration": 8},
             {"type": "text", "roles": ["videoofplay"], "title": "VIDEO OF PLAY",
              "text": "Idle video stand-in. This screen cannot play video.", "duration": 8},
+            {"type": "text", "roles": ["gallery"], "title": "GALLERY",
+             "text": "Idle gallery stand-in. Box art, gameplay and video stills rotate here.", "duration": 8},
             {"type": "text", "roles": ["keyboard"], "title": "KEYBOARD",
              "text": "Keypad", "duration": 8},
         ],
@@ -79,6 +81,8 @@ def sample_table_data() -> dict:
              "text": "Box art stand-in."},
             {"type": "video", "roles": ["videoofplay"], "title": "VIDEO OF PLAY",
              "text": "Video stand-in. This screen cannot play video."},
+            {"type": "gallery", "roles": ["gallery"], "title": "GALLERY",
+             "text": "Gallery stand-in. A frontend sends box art, gameplay and a video still."},
             {"type": "keypad", "roles": ["keyboard"], "title": "KEYBOARD",
              "text": "Keypad"},
         ],

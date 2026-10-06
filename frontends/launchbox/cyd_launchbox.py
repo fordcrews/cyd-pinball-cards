@@ -6,11 +6,21 @@ sends them to a running cyd_daemon on 127.0.0.1:47291. Picture roles get the rea
 artwork (firmware 1.5.0 "image" command; the daemon fits it to each board, encodes a
 small JPEG and sends it in acked chunks over USB or Wi-Fi):
 
+  gallery        Box - Front, then Screenshot - Gameplay, then a still from the game's video,
+                 about 9 s each, round and round until the next pick (the daemon rotates them;
+                 missing pictures are skipped)
   control_panel  Arcade - Control Panel (else Arcade - Controls Information)
   pictureboxart  Box - Front
   picture        Screenshot - Gameplay
-  videoofplay    a still for now (gameplay screenshot, else box art); no video playback
-  howtoplay      text: LaunchBox notes, else the manual path
+  videoofplay    a still from the video (else gameplay screenshot, else box art); the boards
+                 cannot play video
+  howtoplay      text: genre, players, maker, year, controls (MAME metadata), manual name, then
+                 the LaunchBox notes; split into pages that fit the display ("HOW TO PLAY 1/3")
+
+Video stills: ffmpeg (on PATH, else LaunchBox/ThirdParty/FFMPEG/ffmpeg.exe) grabs one frame of
+Videos/<Platform>[/Recordings|Trailer|Theme]/<Title>-01.mp4 into %TEMP%/cyd-pinball-cards/
+video-stills (cached). The extra text comes from Data/Platforms/<Platform>.xml and
+Metadata/MAME.xml, read only; nothing in LaunchBox is changed.
 
 Each picture card also carries text, which a board shows when the file is missing, its
 firmware is older, or the transfer fails.
@@ -23,12 +33,19 @@ Used by:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import mmap
 import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]  # cyd-pinball-cards/
@@ -47,9 +64,12 @@ IMAGE_CATEGORIES = {
 }
 
 
+LB_BAD_CHARS = re.compile(r"[\\/:*?\"<>|']")   # LaunchBox writes these as "_" in media file names
+
+
 def sanitize_title(title: str) -> str:
-    """Match LaunchBox's on-disk image stem (colon -> underscore)."""
-    return (title or "").replace(":", "_").strip()
+    """Match LaunchBox's on-disk media stem (colon, apostrophe, ... -> underscore)."""
+    return LB_BAD_CHARS.sub("_", (title or "").strip())
 
 
 def find_media_file(launchbox_home: Path, platform: str, title: str, categories: tuple[str, ...]) -> str | None:
@@ -64,32 +84,226 @@ def find_media_file(launchbox_home: Path, platform: str, title: str, categories:
         folder = base / cat
         if not folder.is_dir():
             continue
-        # Prefer -01, then any -NN, then exact stem.
-        candidates = sorted(folder.glob(stem + "-01.*"))
-        if not candidates:
-            candidates = sorted(folder.glob(stem + "-*.*"))
-        if not candidates:
-            candidates = sorted(folder.glob(stem + ".*"))
-        for c in candidates:
-            if c.is_file():
-                return str(c)
+        # The category folder, then its region folders (North America first).
+        regions = sorted((d for d in folder.iterdir() if d.is_dir()),
+                         key=lambda d: (d.name not in PREFERRED_REGIONS,
+                                        PREFERRED_REGIONS.index(d.name) if d.name in PREFERRED_REGIONS else 0,
+                                        d.name))
+        for where in [folder] + regions:
+            # Prefer -01, then any -NN, then exact stem.
+            candidates = sorted(where.glob(glob_escape(stem) + "-01.*"))
+            if not candidates:
+                candidates = sorted(where.glob(glob_escape(stem) + "-*.*"))
+            if not candidates:
+                candidates = sorted(where.glob(glob_escape(stem) + ".*"))
+            for c in candidates:
+                if c.is_file():
+                    return str(c)
     return None
+
+
+PREFERRED_REGIONS = ("North America", "United States", "World", "Europe")
+
+
+def glob_escape(stem: str) -> str:
+    return re.sub(r"([\[\]*?])", r"[\1]", stem)
+
+
+VIDEO_FOLDERS = ("", "Recordings", "Video", "Trailer", "Theme")   # gameplay recordings first
+VIDEO_EXTS = {".mp4", ".m4v", ".mkv", ".avi", ".flv", ".webm", ".mov", ".wmv", ".mpg", ".mpeg"}
 
 
 def find_video(launchbox_home: Path, platform: str, title: str) -> str | None:
     if not launchbox_home or not platform or not title:
         return None
     stem = sanitize_title(title)
-    for folder in (
-        launchbox_home / "Videos" / platform,
-        launchbox_home / "Videos" / platform / "Video",
-    ):
+    for sub in VIDEO_FOLDERS:
+        folder = launchbox_home / "Videos" / platform / sub if sub else launchbox_home / "Videos" / platform
         if not folder.is_dir():
             continue
-        for c in list(folder.glob(stem + "-01.*")) + list(folder.glob(stem + ".*")):
-            if c.is_file():
+        for c in sorted(folder.glob(glob_escape(stem) + "-01.*")) + sorted(folder.glob(glob_escape(stem) + ".*")):
+            if c.is_file() and c.suffix.lower() in VIDEO_EXTS:
                 return str(c)
     return None
+
+
+# ---- video stills (the boards cannot play video; one frame stands in)
+STILL_SEEK_S = ("6", "2", "0")     # try a frame a few seconds in (past fades), else the start
+STILL_TIMEOUT_S = 20.0
+STILL_KEEP = 300                   # cached stills kept in %TEMP%/cyd-pinball-cards/video-stills
+
+
+def find_ffmpeg(launchbox_home: Path | None = None) -> str | None:
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    if launchbox_home:
+        for p in (launchbox_home / "ThirdParty" / "FFMPEG" / "ffmpeg.exe",
+                  launchbox_home / "ThirdParty" / "FFMPEG" / "bin" / "ffmpeg.exe"):
+            if p.is_file():
+                return str(p)
+    return None
+
+
+def video_still(video_path, launchbox_home: Path | None = None, cache_dir: Path | None = None,
+                ffmpeg: str | None = None) -> str | None:
+    """JPEG of one frame of the video (cached by path, size and time), or None without ffmpeg."""
+    if not video_path:
+        return None
+    src = Path(str(video_path))
+    if not src.is_file():
+        return None
+    st = src.stat()
+    key = hashlib.sha1(f"{src.resolve()}|{st.st_size}|{int(st.st_mtime)}".encode("utf-8", "replace")).hexdigest()[:20]
+    cache = cache_dir or (LOG_DIR / "video-stills")
+    out = cache / f"{key}.jpg"
+    if out.is_file() and out.stat().st_size > 0:
+        return str(out)
+    exe = ffmpeg or find_ffmpeg(launchbox_home)
+    if not exe:
+        return None
+    cache.mkdir(parents=True, exist_ok=True)
+    tmp = cache / f"{key}.{os.getpid()}.tmp.jpg"
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)   # pythonw: no console window flashes
+    for ss in STILL_SEEK_S:
+        cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-ss", ss, "-i", str(src),
+               "-frames:v", "1", "-vf", "scale='min(800,iw)':-2", "-q:v", "3", str(tmp)]
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=STILL_TIMEOUT_S, creationflags=flags)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if tmp.is_file() and tmp.stat().st_size > 0:
+            tmp.replace(out)
+            _prune(cache)
+            return str(out)
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    return None
+
+
+def _prune(cache: Path) -> None:
+    try:
+        files = sorted(cache.glob("*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in files[STILL_KEEP:]:
+            old.unlink()
+    except OSError:
+        pass
+
+
+# ---- extra game text from LaunchBox's own files (read only)
+XML_MAX_BYTES = 400 * 1024 * 1024    # a huge combined platform file is skipped (too slow to search)
+INFO_FIELDS = ("Notes", "Genre", "PlayMode", "MaxPlayers", "Developer", "Publisher", "ReleaseDate",
+               "ManualPath", "ApplicationPath", "Series")
+
+
+def _platform_xml(launchbox_home: Path, platform: str) -> Path | None:
+    base = launchbox_home / "Data" / "Platforms"
+    for name in (platform, platform.replace(" ", "_"), re.sub(r'[\\/:*?"<>|]', "_", platform)):
+        p = base / f"{name}.xml"
+        if p.is_file():
+            return p
+    return None
+
+
+def _game_block(mm, needle: bytes):
+    """Bytes of the <Game> element that contains needle, or None."""
+    pos = mm.find(needle)
+    while pos >= 0:
+        start = mm.rfind(b"<Game>", 0, pos)
+        if start >= 0 and mm.rfind(b"</Game>", start, pos) < 0:
+            end = mm.find(b"</Game>", pos)
+            if end > 0:
+                return mm[start:end + len(b"</Game>")]
+        pos = mm.find(needle, pos + 1)
+    return None
+
+
+def game_info(launchbox_home: Path | None, platform: str, title: str, application_path: str = "") -> dict:
+    """Notes, genre, players, maker, year and manual of one game from Data/Platforms/<platform>.xml."""
+    if not launchbox_home or not platform or not title:
+        return {}
+    xml = _platform_xml(launchbox_home, platform)
+    if xml is None or xml.stat().st_size > XML_MAX_BYTES or xml.stat().st_size == 0:
+        return {}
+    needles = []
+    if application_path:
+        needles.append(b"<ApplicationPath>" + xml_escape(application_path).encode("utf-8") + b"</ApplicationPath>")
+    needles.append(b"<Title>" + xml_escape(title).encode("utf-8") + b"</Title>")
+    try:
+        with xml.open("rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            block = None
+            for n in needles:
+                block = _game_block(mm, n)
+                if block:
+                    break
+    except (OSError, ValueError):
+        return {}
+    if not block:
+        return {}
+    try:
+        el = ET.fromstring(block)
+    except ET.ParseError:
+        return {}
+    return {f: (el.findtext(f) or "").strip() for f in INFO_FIELDS if (el.findtext(f) or "").strip()}
+
+
+def mame_controls(launchbox_home: Path | None, application_path: str) -> list[str]:
+    """Controller names for a MAME rom (Metadata/MAME.xml ControllerSupport), e.g. Horizontal Joystick."""
+    if not launchbox_home or not application_path:
+        return []
+    rom = Path(str(application_path).replace("\\", "/")).stem.lower()
+    if not re.fullmatch(r"[a-z0-9_]{1,20}", rom):
+        return []
+    xml = launchbox_home / "Metadata" / "MAME.xml"
+    if not xml.is_file() or xml.stat().st_size == 0:
+        return []
+    needle = b"<FileName>" + rom.encode("ascii") + b"</FileName>"
+    names: list[str] = []
+    try:
+        with xml.open("rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            pos = mm.find(needle)
+            while pos >= 0:
+                start = mm.rfind(b"<ControllerSupport>", max(0, pos - 600), pos)
+                if start >= 0 and mm.rfind(b"</ControllerSupport>", start, pos) < 0:
+                    end = mm.find(b"</ControllerSupport>", pos)
+                    m = re.search(rb"<ControllerName>([^<]*)</ControllerName>", mm[start:end])
+                    if m:
+                        name = m.group(1).decode("utf-8", "replace").strip()
+                        if name and name not in names:
+                            names.append(name)
+                pos = mm.find(needle, pos + 1)
+    except (OSError, ValueError):
+        return []
+    return names
+
+
+def enrich(event: dict, launchbox_home: Path | None) -> dict:
+    """Add the extra how-to-play text and a video still. Never fails a selection."""
+    out = dict(event)
+    try:
+        info = game_info(launchbox_home, str(out.get("platform") or ""), str(out.get("title") or ""),
+                         str(out.get("application_path") or ""))
+        for k, v in info.items():
+            key = {"Notes": "notes", "Genre": "genre", "PlayMode": "play_mode", "MaxPlayers": "max_players",
+                   "Developer": "developer", "Publisher": "publisher", "ReleaseDate": "release_date",
+                   "ManualPath": "manual_path_xml", "Series": "series"}.get(k)
+            if key and not out.get(key):
+                out[key] = v
+        if not out.get("controls"):
+            out["controls"] = mame_controls(launchbox_home, str(out.get("application_path") or info.get("ApplicationPath") or ""))
+    except Exception as e:  # metadata is a bonus; the pictures still go out
+        log_line(f"metadata for {out.get('title')!r} failed: {type(e).__name__}: {e}")
+    if not out.get("video_path"):
+        out["video_path"] = find_video(launchbox_home, str(out.get("platform") or ""), str(out.get("title") or ""))
+    if out.get("video_path") and not out.get("video_still"):
+        try:
+            out["video_still"] = video_still(out["video_path"], launchbox_home)
+        except Exception as e:
+            log_line(f"video still for {out.get('title')!r} failed: {type(e).__name__}: {e}")
+    return out
 
 
 def find_manual(launchbox_home: Path, platform: str, title: str) -> str | None:
@@ -99,7 +313,7 @@ def find_manual(launchbox_home: Path, platform: str, title: str) -> str | None:
     folder = launchbox_home / "Manuals" / platform
     if not folder.is_dir():
         return None
-    for c in list(folder.glob(stem + "-01.*")) + list(folder.glob(stem + ".*")):
+    for c in list(folder.glob(glob_escape(stem) + "-01.*")) + list(folder.glob(glob_escape(stem) + ".*")):
         if c.is_file():
             return str(c)
     return None
@@ -131,6 +345,9 @@ def resolve_media(event: dict, launchbox_home: Path | None) -> dict:
     return out
 
 
+NOTES_MAX = 2500    # characters of LaunchBox notes (the board shows at most 8 pages)
+
+
 def _clip(text: str, n: int = 400) -> str:
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if len(text) <= n:
@@ -153,7 +370,6 @@ def build_cards(event: dict) -> list[dict]:
     """Role-tagged cards for specialize_message / content-role boards."""
     title = str(event.get("title") or "Unknown").strip() or "Unknown"
     platform = str(event.get("platform") or "").strip()
-    notes = _clip(str(event.get("notes") or ""), 500)
     launched = bool(event.get("launched") or event.get("event_name") == "launch")
     phase = "NOW PLAYING" if launched else "SELECTED"
 
@@ -161,16 +377,27 @@ def build_cards(event: dict) -> list[dict]:
     box_front = event.get("box_front")
     screenshot = event.get("screenshot")
     video_path = event.get("video_path")
-    manual_path = event.get("manual_path")
-    video_still = screenshot or box_front    # until the boards can play video
+    still = event.get("video_still")         # one frame of the video (ffmpeg), if any
+    video_card_image = still or screenshot or box_front    # the boards cannot play video
 
-    howto = notes
-    if not howto and manual_path:
-        howto = f"Manual:\n{manual_path}"
-    if not howto:
-        howto = f"No notes or manual in LaunchBox for {title}."
+    gallery = []
+    if box_front:
+        gallery.append({"path": str(box_front), "title": title})
+    if screenshot:
+        gallery.append({"path": str(screenshot), "title": f"{title} - gameplay"})
+    if still:
+        gallery.append({"path": str(still), "title": f"{title} - video"})
+    have = [n for n, p in (("box art", box_front), ("gameplay", screenshot), ("video still", still)) if p]
 
     cards = [
+        {
+            "type": "gallery",
+            "roles": ["gallery"],
+            "title": "GALLERY",
+            "text": f"{phase}: {title}" + (f"\n{platform}" if platform else "") + "\n\n"
+            + ("Pictures: " + ", ".join(have) if have else "No box art, screenshot or video in LaunchBox."),
+            "images": gallery,
+        },
         {
             "type": "controls",
             "roles": ["control_panel"],
@@ -185,7 +412,8 @@ def build_cards(event: dict) -> list[dict]:
             "type": "instructions",
             "roles": ["howtoplay"],
             "title": "HOW TO PLAY",
-            "text": f"{title}\n\n{howto}",
+            "text": howto_text(event),
+            "fit": True,          # pages that fit the display (cyd_push.specialize_message)
         },
         {
             "type": "pictureboxart",
@@ -206,8 +434,8 @@ def build_cards(event: dict) -> list[dict]:
             "roles": ["videoofplay"],
             "title": "VIDEO OF PLAY",
             "text": f"{title}\n\n" + _path_note(video_path, "Video")
-            + ("\n\n(Video does not play on the boards yet; showing a still.)" if video_still else ""),
-            "image": _image(video_still),
+            + ("\n\n(Video does not play on the boards; showing a still.)" if video_card_image else ""),
+            "image": _image(video_card_image),
         },
         {
             "type": "keypad",
@@ -216,6 +444,40 @@ def build_cards(event: dict) -> list[dict]:
         },
     ]
     return cards
+
+
+def _year(date: str) -> str:
+    m = re.match(r"(\d{4})", str(date or ""))
+    return m.group(1) if m else ""
+
+
+def howto_text(event: dict) -> str:
+    """Description for the howtoplay display: facts first, then the LaunchBox notes."""
+    title = str(event.get("title") or "Unknown").strip() or "Unknown"
+    lines = [title]
+    genre = str(event.get("genre") or "").replace(";", ",").strip()
+    players = str(event.get("play_mode") or "").strip()
+    if not players and str(event.get("max_players") or "").strip() not in ("", "0"):
+        players = f"{event['max_players']} player" + ("" if str(event["max_players"]) == "1" else "s")
+    facts = "  |  ".join(x for x in (genre, players) if x)
+    if facts:
+        lines.append(facts)
+    maker = str(event.get("developer") or event.get("publisher") or "").strip()
+    year = _year(event.get("release_date") or "")
+    if maker or year:
+        lines.append(", ".join(x for x in (maker, year) if x))
+    controls = event.get("controls") or []
+    if isinstance(controls, str):
+        controls = [controls]
+    if controls:
+        lines.append("Controls: " + ", ".join(str(c) for c in controls))
+    manual = event.get("manual_path") or event.get("manual_path_xml")
+    if manual:
+        lines.append("Manual: " + Path(str(manual).replace("\\", "/")).name)
+    notes = _clip(str(event.get("notes") or ""), NOTES_MAX)
+    if not notes:
+        notes = f"No description in LaunchBox for {title}."
+    return "\n".join(lines) + "\n\n" + notes
 
 
 def build_table_msg(event: dict) -> dict:
@@ -238,6 +500,10 @@ def build_table_msg(event: dict) -> dict:
         }
         if c.get("image"):
             entry["image"] = str(c["image"])   # the daemon turns this card into a picture
+        if c.get("images"):
+            entry["images"] = [dict(i, title=cyd_push.to_ascii(i.get("title", ""))) for i in c["images"]]
+        if c.get("fit"):
+            entry["fit"] = True                # split into pages per display
         cards.append(entry)
     msg = {"cmd": "table", "title": cyd_push.to_ascii(title), "cards": cards}
     msg["ts"] = cyd_push.local_epoch()
@@ -321,6 +587,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="LaunchBox install root (for --resolve-media)")
     ap.add_argument("--resolve-media", action="store_true",
                     help="fill missing media paths from LaunchBox Images/Videos/Manuals")
+    ap.add_argument("--no-extras", action="store_true",
+                    help="skip the LaunchBox metadata lookup and the video still")
     ap.add_argument("--dry-run", action="store_true", help="print the message; do not contact the daemon")
     ap.add_argument("-q", "--quiet", action="store_true")
     return ap
@@ -389,6 +657,9 @@ def _main(args) -> int:
     if not str(event.get("title") or "").strip():
         print("error: title required", file=sys.stderr)
         return 2
+
+    if not args.no_extras:
+        event = enrich(event, lb)
 
     res = send_table(event, dry_run=args.dry_run)
     if args.dry_run:

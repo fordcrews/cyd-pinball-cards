@@ -7,9 +7,12 @@ Runs on Windows (PinUP Popper, RetroBat, ...) and Linux (Batocera, RetroPie, ...
     program at a time). It finds every CYD (USB VID:PID), asks each for its identity (id, name,
     role; firmware 1.3.0), notices displays being plugged in or out, and reconnects.
   * Routes cyd_push messages: each display gets its own messages (per-role cards). Content roles
-    control_panel, howtoplay, picture, pictureboxart, videoofplay and keyboard do not share one
-    payload; keyboard gets the keypad only when a keypad card is in the content. All displays in
-    parallel, so a game change updates every screen within about a second.
+    control_panel, howtoplay, picture, pictureboxart, videoofplay, gallery and keyboard do not
+    share one payload; keyboard gets the keypad only when a keypad card is in the content. All
+    displays in parallel, so a game change updates every screen within about a second.
+  * Rotates gallery displays: box art, gameplay screenshot and a video still in turn, about 9 s
+    each after the picture is drawn, until the next game. Missing pictures are skipped. A touch
+    stops the transfer at once for the keypad; 10 s later the gallery picks up where it was.
   * Turns {"evt":"key",...} lines from a display's touch keypad into real key presses (from any
     display, or only the ones listed in config.json "keypad_roles"):
     Windows SendInput into the foreground window (ctypes, no admin rights, no extra packages);
@@ -76,6 +79,8 @@ TOUCH_KEYPAD_S = 10.0  # after a touch, return a non-keyboard display to its rol
 LOG_MAX_BYTES = 2 * 1024 * 1024   # --log file is rotated to <name>.1 at this size
 REFUSED_LOG_S = 60.0   # "USB is the session" for a board dialing in over Wi-Fi: once per this many seconds
 IMAGE_JOB_S = 60.0     # extra wait per picture in a cyd_push hand-off (a 7" picture over a UART is ~8 s)
+GALLERY_USB_MAX_BYTES = 40 * 1024   # gallery pictures over USB: about 5 s each at 115200 baud
+GALLERY_STOP_CMDS = ("table", "idle", "image", "keypad", "calibrate")   # these end a gallery rotation
 
 
 def _ver(v: str) -> tuple:
@@ -220,6 +225,12 @@ class BoardLink:
         self.last_ready: dict | None = None
         self.img_cache: dict = {}       # CRC of the picture the board holds (redraw instead of resend)
         self.content_gen = 0            # bumped per content hand-off; a stale queued picture is skipped
+        self.gallery: Gallery | None = None        # rotation running on this board
+        self.gallery_last: tuple | None = None     # (item paths, index shown) of the last rotation
+
+    @property
+    def is_wifi(self) -> bool:
+        return str(self.port).startswith("wifi:")
 
     @property
     def connected(self) -> bool:
@@ -352,6 +363,25 @@ class BoardLink:
             job = self.jobs.get_nowait()
             if job:
                 job[1].set()
+
+
+class Gallery:
+    """One board's picture rotation (a {"cmd":"gallery"} message)."""
+
+    def __init__(self, msg: dict):
+        self.msg = msg
+        self.items = [i for i in (msg.get("items") or []) if isinstance(i, dict) and i.get("path")]
+        try:
+            self.interval = max(2.0, float(msg.get("interval") or cyd_push.GALLERY_INTERVAL_S))
+        except (TypeError, ValueError):
+            self.interval = cyd_push.GALLERY_INTERVAL_S
+        self.key = tuple(str(i["path"]) for i in self.items)
+        self.idx = 0               # next item to show
+        self.shown: int | None = None   # item on the screen now
+        self.bad: set[int] = set()      # missing / unreadable files: skipped from now on
+        self.next_at = float("inf")    # set once the first picture is up (the 9 s start then)
+        self.busy = False
+        self.stopped = False
 
 
 # ---------------------------------------------------------------- daemon
@@ -649,7 +679,12 @@ class Daemon:
 
     def deliver(self, lk: BoardLink, msg: dict, timeout: float) -> dict:
         """One message to one board. A picture request is fitted, encoded and sent in acked chunks
-        (text fallback when it cannot be shown); everything else is one request/ack."""
+        (text fallback when it cannot be shown); a gallery starts a rotation; everything else is
+        one request/ack."""
+        if msg.get("cmd") == "gallery":
+            return self.start_gallery(lk, msg, timeout)
+        if msg.get("cmd") in GALLERY_STOP_CMDS:
+            self.stop_gallery(lk)
         if images.is_image_msg(msg):
             return images.deliver(
                 lambda m, t: lk.request(m, timeout=t, accept=lambda a, m=m: images.ack_matches(m, a)),
@@ -658,8 +693,131 @@ class Daemon:
             lk.img_cache.clear()          # the board frees its picture for other content
         return lk.request(msg, timeout=timeout)
 
+    # ---- gallery: several pictures in turn on one board
+    def stop_gallery(self, lk: BoardLink) -> None:
+        with self.state_lock:
+            g = lk.gallery
+            if g is None:
+                return
+            g.stopped = True
+            lk.gallery = None
+            if g.shown is not None:
+                lk.gallery_last = (g.key, g.shown)   # a touch-keypad return resumes on this picture
+
+    def _gallery_cancelled(self, lk: BoardLink, g: Gallery, touch: bool) -> bool:
+        if g.stopped or lk.gallery is not g:
+            return True
+        b = lk.board
+        return bool(touch and b is not None and b.id in self.touch_until)
+
+    def _gallery_show(self, lk: BoardLink, g: Gallery, timeout: float, touch: bool = True) -> dict:
+        """Show the next picture that works, starting at g.idx. touch: a tap cancels the transfer."""
+        n = len(g.items)
+        last: dict = {"ack": "image", "ok": False, "shown": "none", "err": "no pictures"}
+        for k in range(n):
+            i = (g.idx + k) % n
+            if i in g.bad:
+                continue
+            item = g.items[i]
+            m = {"cmd": "image", "path": item["path"], "title": item.get("title") or g.msg.get("title", "")}
+            if not lk.is_wifi:
+                m["max_bytes"] = GALLERY_USB_MAX_BYTES
+            r = images.deliver(
+                lambda mm, t: lk.request(mm, timeout=t, accept=lambda a, mm=mm: images.ack_matches(mm, a)),
+                m, lk.board, timeout, cache=lk.img_cache,
+                cancelled=lambda: self._gallery_cancelled(lk, g, touch))
+            r = dict(r, item=i + 1, items=n)
+            if r.get("cancelled"):
+                return r
+            if r.get("shown") == "image":
+                g.shown = i
+                g.idx = (i + 1) % n
+                g.next_at = time.monotonic() + g.interval
+                return r
+            if "bytes" not in r:      # the file could not be read: never try it again
+                g.bad.add(i)
+            self.log(f"-> {lk.board.id if lk.board else lk.port} gallery {i + 1}/{n} skipped: "
+                     f"{r.get('err') or r.get('why') or 'not shown'}")
+            last = r
+        return last
+
+    def start_gallery(self, lk: BoardLink, msg: dict, timeout: float) -> dict:
+        """First picture now; poll_galleries shows the rest. Nothing showable: the text fallback."""
+        self.stop_gallery(lk)
+        g = Gallery(msg)
+        b = lk.board
+        with self.state_lock:
+            if b is not None:
+                self.touch_until.pop(b.id, None)      # new content wins over the touch keypad
+            if lk.gallery_last and lk.gallery_last[0] == g.key and 0 <= lk.gallery_last[1] < len(g.items):
+                g.idx = lk.gallery_last[1]            # same game again: the picture it holds, a redraw
+            lk.gallery = g
+        fb = msg.get("fallback") if isinstance(msg.get("fallback"), dict) else None
+        if g.items and images.supports_images(b) and b is not None and b.mode in ("idle", "table", "unknown") \
+                and fb and fb.get("cmd"):
+            # The attract playlist (or other cards) would keep drawing while the picture loads.
+            lk.img_cache.clear()
+            lk.request(fb, timeout=timeout)
+        r = self._gallery_show(lk, g, timeout) if g.items else \
+            {"ok": False, "shown": "none", "err": "no pictures"}
+        if r.get("cancelled"):
+            return dict(r, ack="gallery", ok=True)    # replaced or stopped: still the content to return to
+        if r.get("shown") != "image":
+            with self.state_lock:
+                if lk.gallery is g:
+                    lk.gallery = None
+            g.stopped = True
+            if fb and fb.get("cmd"):
+                lk.img_cache.clear()
+                f = lk.request(fb, timeout=timeout) or {}
+                return {"ack": "gallery", "ok": bool(f.get("ok")), "shown": "text",
+                        "why": r.get("err") or r.get("why") or "no picture could be shown"}
+            return dict(r, ack="gallery")
+        return dict(r, ack="gallery", ok=True)
+
+    def poll_galleries(self) -> None:
+        """Queue the next picture on every board whose gallery is due (not while its keypad is up)."""
+        now = time.monotonic()
+        with self.links_lock:
+            links = list(self.links.values())
+        for lk in links:
+            g = lk.gallery
+            b = lk.board
+            if g is None or b is None or g.busy or g.stopped or now < g.next_at:
+                continue
+            if b.id in self.touch_until or b.mode == "keypad" or self._setup_wants_keypad(b):
+                continue
+            good = [i for i in range(len(g.items)) if i not in g.bad]
+            if len(good) <= 1:
+                g.next_at = now + g.interval        # one picture: nothing to rotate
+                continue
+            g.busy = True
+
+            def step(lk=lk, g=g):
+                try:
+                    if g.stopped or lk.gallery is not g:
+                        return
+                    r = self._gallery_show(lk, g, self.args.timeout)
+                    who = lk.board.id if lk.board else lk.port
+                    if r.get("cancelled"):
+                        g.next_at = time.monotonic() + 1.0
+                        self.log(f"-> {who} gallery {r.get('item')}/{r.get('items')}: {images.describe(r)}")
+                        return
+                    if r.get("shown") != "image":
+                        g.next_at = time.monotonic() + g.interval
+                    self.log(f"-> {who} gallery {r.get('item')}/{r.get('items')} (rotation): "
+                             f"{'ok ' if r.get('ok') else 'FAILED '}{images.describe(r)}")
+                finally:
+                    g.busy = False
+
+            lk.submit(step)
+
     @staticmethod
     def _result_text(msg: dict, r: dict) -> str:
+        if msg.get("cmd") == "gallery":
+            if r.get("shown") == "image":
+                return f"ok gallery {r.get('item')}/{r.get('items')} " + images.describe(r)
+            return ("ok " if r.get("ok") else "FAILED ") + "gallery " + images.describe(r)
         if images.is_image_msg(msg):
             return ("ok " if r.get("ok") else "FAILED ") + images.describe(r)
         return "ok" if r.get("ok") else "FAILED " + str(r.get("err", ""))
@@ -669,23 +827,25 @@ class Daemon:
         who = lk.board.id if lk.board else lk.port
         self.log(f"-> {who} {msg.get('cmd')}{' (' + why + ')' if why else ''}: {self._result_text(msg, r)}")
         if r.get("ok"):
-            self._track(lk, msg)
+            self._track(lk, msg, r)
         return r
 
-    def _track(self, lk: BoardLink, msg: dict):
+    def _track(self, lk: BoardLink, msg: dict, r: dict | None = None):
         cmd = msg.get("cmd")
         b = lk.board
         if b is None:
             return
         if cmd == "keypad":
             b.mode = "idle" if msg.get("exit") else "keypad"
-        elif cmd in ("idle", "table", "image"):
+        elif cmd in ("idle", "table", "image", "gallery"):
             b.mode = cmd
             self.last_by_role[b.role] = (msg, time.time())
             with self.state_lock:
                 self.last_content[b.id] = msg
-                # a real content push wins over the temporary touch keypad
-                self.touch_until.pop(b.id, None)
+                # a real content push wins over the temporary touch keypad (unless a tap
+                # interrupted this very picture: then the keypad is what comes next)
+                if not (r or {}).get("cancelled"):
+                    self.touch_until.pop(b.id, None)
         elif cmd == "calibrate":
             b.mode = "calibrate"
 
@@ -874,14 +1034,16 @@ class Daemon:
             res = {"board": lk.board.id, "port": lk.port, "role": lk.board.role, "acks": [], "ok": True}
             results.append(res)
             gen = None
-            if any(m.get("cmd") in ("table", "idle", "image") for m in msgs):
+            if any(m.get("cmd") in ("table", "idle", "image", "gallery") for m in msgs):
                 with self.state_lock:
                     lk.content_gen += 1
                     gen = lk.content_gen
+                self.stop_gallery(lk)      # a rotation picture still loading gives way at once
 
             def job(lk=lk, msgs=msgs, res=res, gen=gen):
                 for m in msgs:
-                    if images.is_image_msg(m) and gen is not None and lk.content_gen != gen:
+                    if (images.is_image_msg(m) or m.get("cmd") == "gallery") and gen is not None \
+                            and lk.content_gen != gen:
                         # newer content is already queued (fast scrolling): skip this picture
                         res["acks"].append({"ack": "image", "ok": True, "skipped": True})
                         self.log(f"-> {lk.board.id} image (from cyd_push): skipped, newer content queued")
@@ -890,7 +1052,7 @@ class Daemon:
                     res["acks"].append(r)
                     res["ok"] &= bool(r.get("ok"))
                     if r.get("ok"):
-                        self._track(lk, m)
+                        self._track(lk, m, r)
                     self.log(f"-> {lk.board.id} {m.get('cmd')} (from cyd_push): {self._result_text(m, r)}")
                 # an idle push (e.g. a game closed) while setup is still open: back to the keypad
                 with self.state_lock:
@@ -901,7 +1063,8 @@ class Daemon:
         if not wait:
             return {"ok": bool(results) and all("err" not in r for r in results), "queued": len(jobs), "results": [{k: v for k, v in r.items() if k != "acks"} for r in results]}
         limit = time.time() + max((timeout * len(e.get("messages") or [])
-                                   + IMAGE_JOB_S * sum(1 for m in (e.get("messages") or []) if images.is_image_msg(m))
+                                   + IMAGE_JOB_S * sum(1 for m in (e.get("messages") or [])
+                                                       if images.is_image_msg(m) or m.get("cmd") == "gallery")
                                    for e in sends), default=timeout) + 5
         for done in jobs:
             done.wait(max(0.0, limit - time.time()))
@@ -926,6 +1089,7 @@ class Daemon:
                     return {"ok": False, "err": "no display connected" if not self.boards()
                             else f"no display matches target {req.get('target')!r}", "acks": []}
                 sends = []
+                content = any(m.get("cmd") in ("table", "idle") for m in msgs)
                 for b in targets:
                     one = []
                     for m in msgs:
@@ -934,6 +1098,12 @@ class Daemon:
                             one.append(sm)
                     if one:
                         sends.append({"board": b.id, "messages": one})
+                    elif content:
+                        # e.g. the game closed and a gallery display has no idle screen: stop
+                        # rotating (the last picture stays up)
+                        lk = self.link_for(b.id)
+                        if lk is not None:
+                            self.stop_gallery(lk)
                 if not sends:
                     return {"ok": False, "err": "no display takes these messages", "acks": []}
             if not isinstance(sends, list) or not all(
@@ -1058,6 +1228,7 @@ def main(argv=None) -> int:
     try:
         while True:
             d.poll_touch_keypads()
+            d.poll_galleries()
             time.sleep(0.5)
     except KeyboardInterrupt:
         log("stopping")

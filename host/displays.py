@@ -9,8 +9,9 @@ tested with 5 simulated boards; there is no hard limit in the code).
 * config.json "displays" maps board ids (or "port:COM5" for old firmware) to name / role /
   rotation / keypad / idle_config, so the identity can also live on the host. Host config wins.
 * Content roles (config.json displays[id].role): control_panel, howtoplay, picture,
-  pictureboxart, videoofplay, keyboard. Those boards get only the matching card or idle
-  screen. keyboard gets the keypad only when a keypad card is in the content. Other roles
+  pictureboxart, videoofplay, gallery, keyboard. Those boards get only the matching card or idle
+  screen. gallery rotates box art, gameplay screenshot and a video still (the daemon does it).
+  keyboard gets the keypad only when a keypad card is in the content. Other roles
   (left, right, top, ...) are unchanged.
 * Targeting (--target): "all" (default), or a comma list of roles, names, ids or ports.
 * Direct fan-out (no daemon): every port is opened in its own thread, pinged for its identity,
@@ -52,6 +53,7 @@ CONTENT_ROLES = (
     "picture",         # a still picture
     "pictureboxart",   # box art
     "videoofplay",     # a video of play
+    "gallery",         # box art, gameplay screenshot, video still in turn (about 9 s each)
     "keyboard",        # touch keypad, when a keypad card is in the content
 )
 CONTENT_ROLE_TYPES = {
@@ -60,6 +62,7 @@ CONTENT_ROLE_TYPES = {
     "picture": frozenset({"picture", "image", "photo"}),
     "pictureboxart": frozenset({"pictureboxart", "boxart", "box_art", "flyer"}),
     "videoofplay": frozenset({"video", "videoofplay", "video_of_play"}),
+    "gallery": frozenset({"gallery", "slideshow"}),
     "keyboard": frozenset({"keyboard", "keypad"}),
 }
 

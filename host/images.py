@@ -194,11 +194,15 @@ def ack_matches(msg: dict, ack: dict) -> bool:
     return True
 
 
-def send_chunks(request, msgs: list[dict], timeout: float = 3.0, retries: int = 1) -> dict:
-    """Send begin/chunk/end with request(msg, timeout) -> ack. Stops at the first failure."""
+def send_chunks(request, msgs: list[dict], timeout: float = 3.0, retries: int = 1, cancelled=None) -> dict:
+    """Send begin/chunk/end with request(msg, timeout) -> ack. Stops at the first failure, or
+    before the next line when cancelled() turns true (a touch wants the keypad now)."""
     t0 = time.monotonic()
     last: dict = {}
     for m in msgs:
+        if cancelled is not None and cancelled():
+            return {"ok": False, "err": "cancelled", "cancelled": True,
+                    "secs": round(time.monotonic() - t0, 2), "ack": last}
         tries = 0
         while True:
             last = request(m, timeout) or {}
@@ -242,13 +246,17 @@ def prepare(msg: dict, board) -> tuple[bytes, tuple[int, int], int, dict]:
             raise FileNotFoundError(str(p))
         src = p
     q = int(msg.get("quality") or DEFAULT_QUALITY)
-    jpeg, size, q = encode_jpeg(src, g["w"], box_h, quality=q, max_bytes=g["budget"])
+    budget = g["budget"]
+    if isinstance(msg.get("max_bytes"), int) and msg["max_bytes"] > 0:
+        budget = min(budget, msg["max_bytes"])     # e.g. a gallery on a slow USB link
+    jpeg, size, q = encode_jpeg(src, g["w"], box_h, quality=q, max_bytes=budget)
     if len(jpeg) > g["img_max"]:
         raise ValueError(f"image {len(jpeg)} B is larger than the board buffer {g['img_max']} B")
     return jpeg, size, q, g
 
 
-def deliver(request, msg: dict, board, timeout: float = 3.0, cache: dict | None = None) -> dict:
+def deliver(request, msg: dict, board, timeout: float = 3.0, cache: dict | None = None,
+            cancelled=None) -> dict:
     """Show msg's picture on one board, else its text fallback. request(msg, timeout) -> ack.
 
     cache (per board, optional) remembers the CRC the board holds, so re-showing the same picture
@@ -267,7 +275,14 @@ def deliver(request, msg: dict, board, timeout: float = 3.0, cache: dict | None 
         if r.get("ok"):
             return {**base, "ok": True, "shown": "image", "cached": True, "chunks": 0, "secs": 0.0}
     msgs = chunk_messages(jpeg, w, h, str(msg.get("title") or ""))
-    res = send_chunks(request, msgs, timeout)
+    res = send_chunks(request, msgs, timeout, cancelled=cancelled)
+    if res.get("cancelled"):
+        if cache is not None:
+            cache.pop("crc", None)
+        if len(res.get("ack") or {}):        # a transfer was started: drop it on the board
+            request({"cmd": "image", "op": "abort"}, timeout)
+        return {**base, "ok": False, "shown": "none", "cancelled": True, "err": "cancelled",
+                "secs": res["secs"]}
     if res["ok"]:
         if cache is not None:
             cache["crc"] = crc
@@ -280,6 +295,19 @@ def deliver(request, msg: dict, board, timeout: float = 3.0, cache: dict | None 
     out = _fallback(request, msg, timeout, res.get("err", "image transfer failed"))
     out.update({k: v for k, v in base.items() if k != "ack"})
     out["secs"] = res["secs"]
+    return out
+
+
+def gallery_first(msg: dict) -> dict:
+    """A gallery message as one picture (its first item), for senders that cannot rotate."""
+    items = [i for i in (msg.get("items") or []) if isinstance(i, dict) and i.get("path")]
+    fb = msg.get("fallback")
+    if not items:
+        return fb if isinstance(fb, dict) and fb.get("cmd") else {"cmd": "table", "title": msg.get("title", ""),
+                                                                 "cards": []}
+    out = {"cmd": "image", "path": items[0]["path"], "title": items[0].get("title") or msg.get("title", "")}
+    if isinstance(fb, dict):
+        out["fallback"] = fb
     return out
 
 
@@ -297,6 +325,8 @@ def describe(res: dict) -> str:
         return (f"image {res.get('w')}x{res.get('h')} q{res.get('quality')} {res.get('bytes', 0) / 1024:.1f} KB "
                 f"in {res.get('chunks')} chunks, {res.get('secs')} s"
                 + (f", draw {res.get('draw_ms')} ms" if res.get("draw_ms") is not None else ""))
+    if res.get("cancelled"):
+        return f"image cancelled after {res.get('secs')} s (touch)"
     if res.get("shown") == "text":
         return f"text fallback ({res.get('why')})"
     return f"nothing shown ({res.get('err')})"

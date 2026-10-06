@@ -9,8 +9,9 @@ return to the idle playlist.
 
 * LaunchBox install (this machine: `C:\Users\fcrews\LaunchBox`, v14.0.1)
 * `cyd_daemon.py` running (listens on `127.0.0.1:47291` and Wi-Fi `47311`)
-* Boards assigned roles in `config.json` (`control_panel`, `howtoplay`, `picture`,
+* Boards assigned roles in `config.json` (`gallery`, `control_panel`, `howtoplay`, `picture`,
   `pictureboxart`, `videoofplay`, `keyboard`)
+* Optional: ffmpeg (on PATH, or LaunchBox's own `ThirdParty\FFMPEG\ffmpeg.exe`) for video stills
 
 ## Integration method: LaunchBox plugin
 
@@ -69,16 +70,30 @@ nothing is listening it starts `host\cyd_daemon.py` with `DAEMON_ARGS` from
 
 | Role | On select / launch |
 |---|---|
+| `gallery` | Box - Front, then Screenshot - Gameplay, then a still from the game's video, about 9 s each, round and round until the next pick; missing ones are skipped |
+| `howtoplay` | Genre, players, maker and year, controls (MAME metadata), manual name, then the LaunchBox Notes; split into pages that fit the screen (`HOW TO PLAY 1/3`, 12 s each) |
 | `control_panel` | Arcade - Control Panel picture (else Controls Information), game title strip |
-| `howtoplay` | LaunchBox Notes (else manual path), as text |
 | `pictureboxart` | Box - Front picture |
 | `picture` | Screenshot - Gameplay picture |
-| `videoofplay` | A still (gameplay screenshot, else box art); video does not play yet |
+| `videoofplay` | A still from the video (else gameplay screenshot, else box art) |
+| `keyboard` | Keypad (tap any other role’s screen for 10s keypad overlay) |
 
 Pictures are fitted to each board, sent as a small JPEG in acked chunks by the daemon, and
 fall back to a text card when the file is missing or the board's firmware is older than 1.5.0.
 A picture to the 7" over its USB UART takes about 6 s; to the 2.8" over Wi-Fi under 1 s.
-| `keyboard` | Keypad (tap any other role’s screen for 10s keypad overlay) |
+Gallery pictures over USB are kept to 40 KB (about 5 s each); over Wi-Fi they use the full budget.
+The 9 s count starts once a picture is drawn. A tap on the gallery display stops a running
+transfer and shows the keypad; 10 s after the last touch the gallery comes back on the picture it
+was showing (a redraw, no new transfer) and carries on. On game exit the rotation stops and the
+last picture stays up.
+
+**Video:** the boards cannot play video. When a game has a video (`Videos\<Platform>\`, or its
+`Recordings`, `Trailer` or `Theme` folder) and ffmpeg is found, one frame from about 6 s in is
+saved to `%TEMP%\cyd-pinball-cards\video-stills` (cached) and joins the gallery. No ffmpeg, no
+video: that step is skipped.
+
+The extra how-to-play text is read from `Data\Platforms\<Platform>.xml` and
+`Metadata\MAME.xml` (read only, nothing in LaunchBox is changed). `--no-extras` skips it.
 
 On game exit → idle / attract playlist (`cards/_idle_arcade.json` when present).
 
@@ -112,5 +127,5 @@ without the plugin or a custom watcher.
 
 ## Not done yet
 
-* Video playback on the boards (`videoofplay` shows a still)
-* Notes come from the plugin; the CLI with `--resolve-media` finds media but not notes
+* Video playback on the boards (`gallery` and `videoofplay` show a still from the video)
+* Manuals are PDFs; the how-to-play screen names the manual but does not show its pages
