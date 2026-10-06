@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -236,8 +239,26 @@ def send_idle(dry_run: bool = False) -> dict | None:
     return cyd_push.daemon_request({"op": "send", "messages": [msg], "wait": True}, timeout=8.0)
 
 
+LOG_DIR = Path(tempfile.gettempdir()) / "cyd-pinball-cards"
+LOG_MAX = 512 * 1024
+
+
+def log_line(text: str) -> None:
+    """Append to %TEMP%/cyd-pinball-cards/launchbox.log (pythonw has no console)."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        path = LOG_DIR / "launchbox.log"
+        if path.is_file() and path.stat().st_size > LOG_MAX:
+            path.replace(path.with_suffix(".log.1"))
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(time.strftime("%H:%M:%S ") + text.rstrip() + "\n")
+    except OSError:
+        pass
+
+
 def load_event_file(path: Path) -> dict:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    # utf-8-sig: .NET's Encoding.UTF8 writes a BOM, and json.loads rejects a BOM.
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(data, dict):
         raise ValueError("event file must be a JSON object")
     return data
@@ -279,16 +300,40 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _summary(res: dict | None) -> str:
+    if not res:
+        return "daemon not reachable on 127.0.0.1:47291"
+    parts = []
+    for r in res.get("results") or []:
+        parts.append(f"{r.get('board')}[{r.get('role')}]={'ok' if r.get('ok') else 'FAILED'}")
+    return ("ok " if res.get("ok") else "FAILED ") + " ".join(parts)
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    try:
+        return _main(args)
+    except Exception as e:  # pythonw swallows tracebacks; keep a trail for LaunchBox runs
+        log_line(f"error: {type(e).__name__}: {e}")
+        raise
+
+
+def _main(args) -> int:
     if args.idle:
         res = send_idle(dry_run=args.dry_run)
+        if not args.dry_run:
+            log_line(f"idle -> {_summary(res)}")
         if not args.quiet:
             print(json.dumps(res, ensure_ascii=False) if res else "daemon not reachable")
         return 0 if res and res.get("ok") else 1
 
     if args.event_file:
         event = load_event_file(args.event_file)
+        if args.event_file.parent == LOG_DIR and args.event_file.name.startswith("lb-event-"):
+            try:
+                os.remove(args.event_file)   # plugin temp file; one per selection
+            except OSError:
+                pass
     else:
         event = {
             "event_name": "launch" if args.launch else args.event_name,
@@ -320,6 +365,7 @@ def main(argv=None) -> int:
     if args.dry_run:
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0
+    log_line(f"{event.get('event_name') or 'select'} {event.get('title')!r} -> {_summary(res)}")
     if not args.quiet:
         print(json.dumps(res, ensure_ascii=False) if res else "daemon not reachable")
     return 0 if res and res.get("ok") else 1

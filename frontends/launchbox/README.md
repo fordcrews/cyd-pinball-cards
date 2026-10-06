@@ -52,6 +52,19 @@ LaunchBox is already open, quit it yourself and start it again.
 
 Uninstall: delete the folder `LaunchBox\Plugins\CydPinballCards\`.
 
+## Daemon auto-start
+
+When LaunchBox starts (and before each push) the plugin checks `127.0.0.1:47291`. If
+nothing is listening it starts `host\cyd_daemon.py` with `DAEMON_ARGS` from
+`cyd_launchbox.cfg`. Set `AUTOSTART_DAEMON=0` there to turn it off.
+
+## Troubleshooting
+
+* `%TEMP%\cyd-pinball-cards\plugin.log`: plugin loaded, each select / launch / exit, autostart
+* `%TEMP%\cyd-pinball-cards\launchbox.log`: what `cyd_launchbox.py` sent and each board's ack
+* Desktop LaunchBox 14 raises `SelectionChanged` on every game pick (no Big Box needed).
+  Picks are debounced 300 ms so only the game you stop on is sent.
+
 ## What each display shows
 
 | Role | On select / launch |
@@ -96,4 +109,3 @@ without the plugin or a custom watcher.
 ## Not done yet
 
 * Real image / video pixels on the ESP32 (paths are sent as text)
-* Auto-start of `cyd_daemon` from LaunchBox (run the daemon separately or from Startup)

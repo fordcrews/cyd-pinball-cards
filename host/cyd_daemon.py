@@ -320,6 +320,12 @@ class BoardLink:
 
 
 # ---------------------------------------------------------------- daemon
+def _wifi_host(port) -> str:
+    """"wifi:192.168.30.52:59888" -> "192.168.30.52" ("" for USB ports)."""
+    s = str(port)
+    return s[5:].rsplit(":", 1)[0] if s.startswith("wifi:") else ""
+
+
 class Daemon:
     def __init__(self, args, log: Logger, injector=None):
         self.args = args
@@ -479,6 +485,12 @@ class Daemon:
                 return False
             if wifi_old and not wifi_new:
                 self.log(f"wifi {board.id} on {other.port} dropped; USB on {lk.port} is the session")
+                self.links.pop(other.port, None)
+                other.close()
+            elif wifi_old and wifi_new and _wifi_host(other.port) == _wifi_host(lk.port):
+                # Same board dialing back in (reset / Wi-Fi blip): the old socket is half-open
+                # and would swallow sends, so the new session replaces it.
+                self.log(f"wifi {board.id} reconnected from {lk.port}; dropping stale {other.port}")
                 self.links.pop(other.port, None)
                 other.close()
             else:

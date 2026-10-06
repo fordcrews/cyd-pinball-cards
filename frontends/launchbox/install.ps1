@@ -33,7 +33,21 @@ if (-not $dll) { throw "CydPinballCards.dll not found after build" }
 
 $dest = Join-Path $Lb "Plugins\CydPinballCards"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
-Copy-Item -Force $dll (Join-Path $dest "CydPinballCards.dll")
+$target = Join-Path $dest "CydPinballCards.dll"
+if (Test-Path $target) {
+  # Back up outside Plugins (LaunchBox loads every DLL under Plugins).
+  $bk = Join-Path $env:USERPROFILE ("cyd-backups\CydPinballCards-plugin-" + (Get-Date -Format yyyyMMdd-HHmmss))
+  New-Item -ItemType Directory -Force -Path $bk | Out-Null
+  Copy-Item $target $bk
+  try { Copy-Item -Force $dll $target -ErrorAction Stop }
+  catch {
+    # LaunchBox is running and holds the DLL: rename it aside; the new one loads on restart.
+    Rename-Item $target ("CydPinballCards.dll.old-" + (Get-Date -Format yyyyMMddHHmmss))
+    Copy-Item $dll $target
+  }
+} else {
+  Copy-Item -Force $dll $target
+}
 
 $py = $null
 foreach ($name in @("pythonw.exe", "python.exe")) {
@@ -42,8 +56,15 @@ foreach ($name in @("pythonw.exe", "python.exe")) {
 }
 if (-not $py) { $py = "pythonw" }
 
-$cfgText = "# CydPinballCards LaunchBox plugin config`r`nCYD_HOME=$Repo`r`nPYTHON=$py`r`n"
-[System.IO.File]::WriteAllText((Join-Path $dest "cyd_launchbox.cfg"), $cfgText)
+$cfgPath = Join-Path $dest "cyd_launchbox.cfg"
+if (Test-Path $cfgPath) {
+  Write-Host "Keeping existing $cfgPath"
+} else {
+  $cfgText = "# CydPinballCards LaunchBox plugin config`r`nCYD_HOME=$Repo`r`nPYTHON=$py`r`n" +
+    "# Start host\cyd_daemon.py when LaunchBox starts and nothing listens on 127.0.0.1:47291 (0 = off)`r`n" +
+    "AUTOSTART_DAEMON=1`r`nDAEMON_ARGS=--profile arcade --log %TEMP%\cyd-daemon.log`r`n"
+  [System.IO.File]::WriteAllText($cfgPath, $cfgText, (New-Object System.Text.UTF8Encoding $false))
+}
 
 Write-Host "Installed to $dest"
 Write-Host "Restart LaunchBox / Big Box to load the plugin (this script did not close it)."

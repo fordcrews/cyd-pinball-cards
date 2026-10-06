@@ -117,3 +117,16 @@ def test_howtoplay_falls_back_to_manual_path():
 def test_dry_run_send_table():
     res = lb.send_table({"title": "Tempest", "notes": "vector"}, dry_run=True)
     assert res and res["ok"] and res["message"]["cmd"] == "table"
+
+
+def test_event_file_with_bom_loads(tmp_path: Path):
+    # The plugin once wrote JSON with .NET Encoding.UTF8 (BOM); that must still parse.
+    f = tmp_path / "lb-event-1.json"
+    f.write_bytes(b"\xef\xbb\xbf" + json.dumps({"event_name": "select", "title": "Pac-Land"}).encode("utf-8"))
+    assert lb.load_event_file(f)["title"] == "Pac-Land"
+
+
+def test_plugin_writes_json_without_bom():
+    src = (Path(lb.__file__).parent / "plugin" / "Plugin.cs").read_text(encoding="utf-8")
+    assert "Encoding.UTF8)" not in src and "new(false)" in src
+    assert "SystemEventTypes.SelectionChanged" in src

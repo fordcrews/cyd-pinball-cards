@@ -199,6 +199,25 @@ class WifiDaemon(BusCase):
         self.assertEqual([(b.id, b.port) for b in d.boards()], [("cyd-house", "FAKE1")])
         self.assertTrue(board.closed)
 
+    def test_same_board_redialing_replaces_stale_wifi_session(self):
+        self.write_config({"displays": {"cyd-how": {"name": "howtoplay", "role": "howtoplay"}}})
+        d = self.start()
+        hub = d.start_wifi(0, beacon_targets=[], beacon_interval=60)
+        first = DialIn(hub.tcp_port, "cyd-how")
+        self.addCleanup(first.close)
+        self.assertTrue(wait_until(lambda: [b.id for b in d.boards()] == ["cyd-how"], 3))
+        second = DialIn(hub.tcp_port, "cyd-how")   # board reset; old socket never closed cleanly
+        self.addCleanup(second.close)
+        self.assertTrue(wait_until(lambda: self.log.has("dropping stale"), 3))
+        self.assertTrue(wait_until(lambda: first.closed, 3))
+        self.assertEqual([b.id for b in d.boards()], ["cyd-how"])
+        msg = {"cmd": "table", "title": "Pac-Land", "cards": [
+            {"type": "instructions", "roles": ["howtoplay"], "title": "HOW TO PLAY", "text": "run"}]}
+        r = d.handle_request({"op": "send", "messages": [msg], "timeout": 2})
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(len(r["results"]), 1)
+        self.assertTrue(wait_until(lambda: any(m.get("cmd") == "table" for m in second.lines), 2))
+
     def test_content_roles_get_different_payloads(self):
         self.write_config({"displays": {
             "cyd-panel": {"name": "control_panel", "role": "control_panel"},
