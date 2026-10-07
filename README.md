@@ -959,6 +959,59 @@ so a request/ack round trip is about 25 ms.
 Pictures are in (see "Pictures (firmware 1.5.0)" above). LaunchBox is the first front end that
 sends them; the same `"image"` card key works from any front end that knows its artwork paths.
 
+## Night and idle screens
+
+`cyd_daemon` puts every display to sleep at night and shows a clock, the weather and news
+headlines when the arcade has not been used for a while. No firmware change: sleep is
+`{"cmd":"brightness","value":0}` (the 7" Waveshare switches its CH422G backlight off) and the
+info slides are pictures drawn on the PC for each screen size (firmware 1.5.0 `image` command).
+
+* **Quiet hours** (default 23:00 to 07:00, local time): backlights off. A touch, or a game picked
+  or launched in LaunchBox, turns them on with their normal content for `quiet_wake_minutes`
+  (default 5) after the last activity, then they sleep again.
+* **Idle** (default 60 minutes with no LaunchBox pick/launch and no touch): every display rotates
+  a big clock with the date, the current weather (Open-Meteo, no key) and the top 5 news
+  headlines (an RSS feed, default NPR News), 15 s per slide, 20 s per headline page. Each display
+  starts on a different slide.
+* Any pick, launch or touch puts every display back on its role at once. A tap on a sleeping or
+  info screen only wakes the screens; the next tap opens the keypad as usual.
+* Weather location: `weather_location` ("Memphis, TN", "Chicago", or "35.15,-90.05"). Empty: one
+  IP lookup (ipinfo.io, else ip-api.com), saved in `.cyd_cache/location.json` (city, region and
+  coordinates only). Delete that file to look it up again. Offline: the slides with no data are
+  left out and the clock keeps going.
+* Each display's last content is kept in `.cyd_cache/last_content.json`, so a restarted daemon
+  puts the current game back on the screens when they reconnect.
+
+Settings (`config.json`, every key optional; restart the daemon after a change):
+
+```json
+"night": {
+  "enabled": true,
+  "quiet_start": "23:00", "quiet_end": "07:00",
+  "idle_minutes": 60, "quiet_wake_minutes": 5,
+  "brightness": 220,
+  "slide_seconds": 15, "news_seconds": 20, "clock_24h": false,
+  "weather_location": "", "weather_units": "F", "weather_refresh_minutes": 15,
+  "news_feed": "https://feeds.npr.org/1001/rss.xml", "news_source": "NPR News",
+  "news_count": 5, "news_refresh_minutes": 20
+}
+```
+
+`"quiet_start": ""` turns the sleep off, `"idle_minutes": 0` the info slides, `"night": false`
+both (or `cyd_daemon.py --no-night`). A per-display wake brightness goes in
+`"displays": {"cyd-xxxxxx": {"brightness": 150}}`.
+
+Try it without waiting (the daemon must be running):
+
+```
+python host/cyd_night.py                  # state, idle minutes, weather place, news source
+python host/cyd_night.py info --minutes 5 # show the info slides now
+python host/cyd_night.py sleep --minutes 1
+python host/cyd_night.py wake             # back to the roles
+python host/cyd_night.py auto             # end the test, follow the schedule
+python host/cyd_night.py preview --offline --out night-preview   # PNGs for each screen size
+```
+
 ## License
 This kit is yours to use and change. It uses TFT_eSPI (FreeBSD/MIT-style), XPT2046_Touchscreen (MIT),
 ArduinoJson (MIT), TJpg_Decoder (FreeBSD-style, CYD pictures), LovyanGFX (FreeBSD, 7"), Pillow (MIT-CMU,

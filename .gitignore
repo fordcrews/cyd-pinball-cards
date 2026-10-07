@@ -28,3 +28,7 @@ firmware/src/wifi_secrets.h
 .tools/
 frontends/launchbox/plugin/bin/
 frontends/launchbox/plugin/obj/
+
+# daemon cache: weather location, last content per display, night state
+.cyd_cache/
+night-preview/

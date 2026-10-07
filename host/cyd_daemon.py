@@ -46,6 +46,13 @@ The watched process names come from --watch, else "watch_processes" in config.js
 built-in default below. TO-VERIFY on your cabinet: with the tool open, check the exact process
 name (Windows: Task Manager > Details; Linux: ps -e).
 
+Night / idle screens (host/night.py, config.json "night"): in quiet hours (23:00-07:00 by default)
+every display's backlight goes off; after 60 minutes without a LaunchBox pick/launch or a touch the
+displays rotate a big clock, the weather (Open-Meteo) and news headlines (RSS). Any pick, launch or
+touch puts them back on their roles. Test it with host/cyd_night.py info|sleep|wake|auto|status.
+The last content of each display is kept in .cyd_cache/last_content.json, so a restarted daemon puts
+the current game back on the screens when they reconnect.
+
 The daemon never accepts keystrokes over the network socket: keys only come from the displays.
 A tap, or a long-press, opens the keypad only on the display that was touched. About 10 seconds
 after the last touch there, that display goes back to its assigned cards. Touching again while
@@ -422,6 +429,33 @@ class Daemon:
         self._warned_wait = False
         self._warned_max = False
         self.wifi_hub = None
+        self.night = None                      # night.NightController (main() turns it on)
+        self.content_file: Path | None = None  # last_content survives a restart (main() sets it)
+        self._content_lock = threading.Lock()
+
+    def enable_persistence(self, path: Path) -> None:
+        """Load and keep each board's last content in path (JSON), so a restart restores it."""
+        self.content_file = Path(path)
+        try:
+            data = json.loads(self.content_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self.last_content.update({k: v for k, v in data.items() if isinstance(v, dict) and v.get("cmd")})
+        except (OSError, ValueError):
+            pass
+
+    def _save_content(self) -> None:
+        if self.content_file is None:
+            return
+        try:
+            with self.state_lock:
+                text = json.dumps(self.last_content, ensure_ascii=False)
+            with self._content_lock:          # several board workers may save at once
+                self.content_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.content_file.with_name(self.content_file.name + ".tmp")
+                tmp.write_text(text, encoding="utf-8")
+                tmp.replace(self.content_file)
+        except (OSError, TypeError, ValueError) as e:
+            self.log(f"could not save last content: {e}", debug=True)
 
     def _watch_list(self) -> list[str]:
         if self.args.no_watch:
@@ -642,13 +676,20 @@ class Daemon:
             b.rotation = want
         first_time = b.id not in self.seen_ids
         self.seen_ids.add(b.id)
-        if first_time:   # a display plugged in mid-game catches up with what its role shows now
+        night_set = bool(self.night and self.night.on_connect(lk))   # asleep / info slides: they own it
+        if first_time and not night_set:   # a display plugged in mid-game catches up with what its role shows now
             last = self.last_by_role.get(b.role) or (self.last_by_role.get("all") if b.generic else None)
             if last:
                 msg, sent = dict(last[0]), last[1]
                 if "ts" in msg:
                     msg["ts"] = int(msg["ts"] + (time.time() - sent))
                 self.send_to(lk, msg, "catch up")
+            elif self.content_file is not None and b.id in self.last_content:
+                # daemon restarted: what this display showed before (saved in .cyd_cache)
+                msg = dict(self.last_content[b.id])
+                if "ts" in msg:
+                    msg["ts"] = cyd_push.local_epoch()
+                self.send_to(lk, msg, "restored after restart")
         with self.state_lock:
             if (self.setup_running and not self.manual_exit and lk.board.mode != "keypad"
                     and cyd_push.keypad_allowed(lk.board, self.st)):
@@ -841,11 +882,14 @@ class Daemon:
             b.mode = cmd
             self.last_by_role[b.role] = (msg, time.time())
             with self.state_lock:
+                changed = self.last_content.get(b.id) is not msg
                 self.last_content[b.id] = msg
                 # a real content push wins over the temporary touch keypad (unless a tap
                 # interrupted this very picture: then the keypad is what comes next)
                 if not (r or {}).get("cancelled"):
                     self.touch_until.pop(b.id, None)
+            if changed:
+                self._save_content()
         elif cmd == "calibrate":
             b.mode = "calibrate"
 
@@ -923,6 +967,8 @@ class Daemon:
             if not allowed:
                 self.log(f"key from {who} ignored (keypad not enabled for this display; see keypad_roles)")
                 return
+            if self.night:
+                self.night.on_touch(lk, "key")
             self.note_touch(lk, opened=False)
             key, mods = str(obj.get("key", "")), obj.get("mods") or []
             try:
@@ -946,6 +992,8 @@ class Daemon:
                 with self.state_lock:
                     self.touch_until.pop(b.id, None)
             elif state == "on":
+                if self.night:
+                    self.night.on_touch(lk, "keypad")
                 self.note_touch(lk, opened=True)
         elif evt == "cal" and obj.get("touch") == "capacitive":
             self.log(f"{who} has capacitive touch: no calibration needed")
@@ -961,6 +1009,8 @@ class Daemon:
                      f"screen=({obj.get('x')},{obj.get('y')})")
             # Calibration debug samples carry raw_x/raw_y. A tap does not: show the keypad.
             if obj.get("raw_x") is None and obj.get("raw_y") is None:
+                if self.night and self.night.on_touch(lk, "tap"):
+                    return          # the tap woke the screens (sleep / info slides); no keypad
                 self.note_touch(lk, opened=True)
         elif obj.get("ready"):
             # A Wi-Fi session also opens with a ready line; before the handshake that is not a reboot.
@@ -1018,7 +1068,8 @@ class Daemon:
                 "setup_running": self.setup_running, "watch": self.watch, "dry_run": self.injector.dry_run,
                 "profile": self.st.profile, "key_backend": self.injector.backend,
                 "virtual_gamepad": self.st.virtual_gamepad,
-                "wifi_port": self.wifi_hub.tcp_port if self.wifi_hub else None}
+                "wifi_port": self.wifi_hub.tcp_port if self.wifi_hub else None,
+                "night": ({"state": self.night.state, "force": self.night.force} if self.night else None)}
 
     def run_sends(self, sends: list, timeout: float, wait: bool = True) -> dict:
         """sends: [{"board": id, "messages": [...]}]. Every board is served by its own worker thread,
@@ -1076,6 +1127,10 @@ class Daemon:
         op = req.get("op")
         if op == "status":
             return self.status()
+        if op == "night":
+            if self.night is None:
+                return {"ok": False, "err": "night mode is not running in this daemon"}
+            return self.night.handle(req)
         if op == "send":
             timeout = float(req.get("timeout", self.args.timeout))
             wait = req.get("wait", True) is not False
@@ -1110,11 +1165,16 @@ class Daemon:
                     isinstance(e, dict) and isinstance(e.get("messages"), list)
                     and all(isinstance(m, dict) and m.get("cmd") for m in e["messages"]) for e in sends):
                 return {"ok": False, "err": "sends must be a list of {\"board\":id,\"messages\":[{\"cmd\":...}]}"}
+            if self.night is not None:      # a pick / launch / exit: wake, back to the roles
+                self.night.on_content([str(e.get("board")) for e in sends])
             return self.run_sends(sends, timeout, wait)
         return {"ok": False, "err": f"unknown op {op!r}"}
 
     def shutdown(self):
         self.stop.set()
+        if self.night is not None:
+            self.night.stop.set()
+            self.night.kick.set()
         if self.wifi_hub is not None:
             self.wifi_hub.stop()
             self.wifi_hub = None
@@ -1153,6 +1213,15 @@ class _Server(socketserver.ThreadingTCPServer):
         super().server_bind()
 
 
+def cache_dir(config_src: Path | None = None) -> Path:
+    """Env CYD_CACHE_DIR, else .cyd_cache next to config.json (else the kit root); git-ignored."""
+    env = os.environ.get("CYD_CACHE_DIR")
+    if env:
+        return Path(env)
+    base = Path(config_src).resolve().parent if config_src else Path(__file__).resolve().parent.parent
+    return base / ".cyd_cache"
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="CYD keypad + serial-port daemon (see module docstring).")
     ap.add_argument("--port", action="append",
@@ -1185,6 +1254,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="LAN TCP port wireless displays dial (default 47311, env CYD_WIFI_PORT). "
                          "Not the localhost hand-off port. UDP beacon stays on 47311.")
     ap.add_argument("--no-wifi", action="store_true", help="do not listen for wireless displays")
+    ap.add_argument("--no-night", action="store_true",
+                    help="no quiet-hours sleep / idle info screens (same as config.json \"night\": false)")
     ap.add_argument("--cards-dir", type=Path, default=None)
     ap.add_argument("--keypad-config", type=Path, default=None,
                     help="default: cards/_keypad.json (arcade: _keypad_arcade.json, rcade: _keypad_rcade.json)")
@@ -1208,6 +1279,18 @@ def main(argv=None) -> int:
         return 3
     d = Daemon(args, log)
     server.daemon_ref = d
+    cache = cache_dir(d.st.config_src)
+    d.enable_persistence(cache / "last_content.json")
+    import night
+    ns = night.NightSettings.from_config(d.st.config)
+    if args.no_night:
+        ns.enabled = False
+    d.night = night.NightController(d, ns, cache_dir=cache)
+    if ns.enabled:
+        d.night.start()
+        q = ns.as_dict()
+        log(f"night: sleep {q['quiet_start'] or '-'}-{q['quiet_end'] or '-'}, info slides after "
+            f"{ns.idle_minutes:g} min idle (config.json \"night\")")
     if not args.no_wifi:
         d.start_wifi(args.wifi_port)
     log(f"cyd_daemon on {cyd_push.DAEMON_HOST}:{args.listen_port}; profile {d.st.profile}"
@@ -1229,6 +1312,10 @@ def main(argv=None) -> int:
         while True:
             d.poll_touch_keypads()
             d.poll_galleries()
+            try:
+                d.night.tick()
+            except Exception as e:
+                log(f"night tick failed: {type(e).__name__}: {e}")
             time.sleep(0.5)
     except KeyboardInterrupt:
         log("stopping")

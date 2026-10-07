@@ -233,11 +233,14 @@ def _fallback(request, msg: dict, timeout: float, why: str) -> dict:
 
 
 def prepare(msg: dict, board) -> tuple[bytes, tuple[int, int], int, dict]:
-    """JPEG for msg ("path" to any Pillow-readable file, or ready "jpeg_b64") fitted to board."""
+    """JPEG for msg ("path" to any Pillow-readable file, ready "jpeg_b64", or a Pillow image in
+    "pil") fitted to board."""
     g = board_geometry(board)
     title = str(msg.get("title") or "")
     box_h = g["h"] - (g["strip"] if title else 0)
-    if msg.get("jpeg_b64"):
+    if msg.get("pil") is not None:              # a picture drawn by the host (night info slides)
+        src = msg["pil"]
+    elif msg.get("jpeg_b64"):
         src = io.BytesIO(base64.b64decode(msg["jpeg_b64"]))
     else:
         p = msg.get("path")
@@ -316,7 +319,7 @@ def gallery_first(msg: dict) -> dict:
 def is_image_msg(msg) -> bool:
     """A high-level picture request (path / jpeg_b64), not a raw begin/chunk/end line."""
     return isinstance(msg, dict) and msg.get("cmd") == "image" and not msg.get("op") \
-        and bool(msg.get("path") or msg.get("jpeg_b64"))
+        and bool(msg.get("path") or msg.get("jpeg_b64") or msg.get("pil") is not None)
 
 
 def describe(res: dict) -> str:
