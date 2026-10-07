@@ -258,8 +258,10 @@ class NightController:
         with self.lock:
             want = self.desired()
             if want != self.state:
+                quiet = self.sched.quiet()
                 why = {"sleep": "quiet hours", "info": f"idle {self.sched.idle_s() / 60:.0f} min",
-                       "active": "quiet hours over" if self.state == "sleep" else "activity"}[want]
+                       "active": ("quiet hours over" if self.state == "sleep" and not quiet
+                                  else f"last activity {self.sched.idle_s() / 60:.0f} min ago")}[want]
                 self._go(want, why)
         if self.state == "info":
             self._poll_rotations()

@@ -90,7 +90,7 @@ def main(argv=None) -> int:
           f" info slides after {st['idle_minutes']:g} min idle; idle now {r['idle_min']:g} min ({r['last_activity']})")
     w = r.get("weather")
     print(f"weather: {r.get('weather_place') or '(location not looked up yet)'}"
-          + (f"  {w['temp']}°{w['unit']} {w['text']}" if w else ""))
+          + (f"  {w['temp']} {w['unit']}, {w['text']}" if w else ""))
     print(f"news: {r.get('news_source')}  {r.get('headlines', 0)} headlines")
     return 0
 
