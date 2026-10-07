@@ -421,7 +421,7 @@ class DirectFanout(BusCase):
         rows = {r["port"]: r for r in json.loads(out)}
         self.assertEqual((rows["FAKE1"]["hw"], rows["FAKE2"]["hw"]), ("cyd", "ws-s3-7"))
         rc, out, _ = self.push("--list-displays", "--no-daemon")
-        self.assertIn("1.5.0 (ws-s3-7)", out)
+        self.assertIn("1.6.0 (ws-s3-7)", out)
 
     def test_list_identify_assign(self):
         self.five()

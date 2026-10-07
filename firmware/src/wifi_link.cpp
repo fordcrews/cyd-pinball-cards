@@ -6,6 +6,8 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoJson.h>
+#include <lwip/sockets.h>
+#include <esp_system.h>
 
 #ifndef WIFI_USB_QUIET_MS
 #define WIFI_USB_QUIET_MS 15000UL
@@ -29,6 +31,26 @@
 #endif
 #ifndef WIFI_SHORT_SESSION_MS
 #define WIFI_SHORT_SESSION_MS 15000UL
+#endif
+
+// Session health (fw 1.6.0, see wifi_link.h)
+#ifndef WIFI_SILENCE_DROP_MS
+#define WIFI_SILENCE_DROP_MS 90000UL
+#endif
+#ifndef WIFI_KA_IDLE_S
+#define WIFI_KA_IDLE_S 10
+#endif
+#ifndef WIFI_KA_INTVL_S
+#define WIFI_KA_INTVL_S 5
+#endif
+#ifndef WIFI_KA_COUNT
+#define WIFI_KA_COUNT 3
+#endif
+#ifndef WIFI_REJOIN_MS
+#define WIFI_REJOIN_MS 30000UL
+#endif
+#ifndef WIFI_REBOOT_MS
+#define WIFI_REBOOT_MS 600000UL
 #endif
 
 static const int SRC_USB = 0;
@@ -58,6 +80,11 @@ static bool wasUp = false;          // a TCP session was open at the last poll
 static unsigned long upSince = 0;
 static bool sessionChanged = false;
 static void (*onWifiUp)() = nullptr;
+static unsigned long lastRx = 0;    // last byte from the cabinet on this session
+static bool hbArmed = false;        // the cabinet sends heartbeats: silence means the session is dead
+static bool wifiWasUp = false;
+static unsigned long wifiDownSince = 0, lastRejoin = 0;
+static uint32_t sessions = 0, silenceDrops = 0, wifiLost = 0, rejoins = 0;
 
 // Replies are collected per line and sent in one write: ArduinoJson prints byte by byte, and one
 // TCP segment per byte (Nagle + the host's delayed ACK) cost ~0.3 s per ack over Wi-Fi.
@@ -122,6 +149,7 @@ static size_t wifiBuffered() {
   int got = client.read(rxb, n > (int)sizeof rxb ? (int)sizeof rxb : n);
   if (got <= 0) return 0;
   rxLen = (size_t)got;
+  lastRx = millis();
   return rxLen;
 }
 
@@ -194,6 +222,53 @@ static void considerBeacon() {
   haveBeacon = beaconIp != IPAddress(0, 0, 0, 0);
 }
 
+static void setKeepalive() {
+  int fd = client.fd();
+  if (fd < 0) return;
+  int on = 1;
+  setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on);
+#if defined(TCP_KEEPIDLE) && defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
+  int idle = WIFI_KA_IDLE_S, intvl = WIFI_KA_INTVL_S, cnt = WIFI_KA_COUNT;
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
+#endif
+}
+
+static const char *resetReason() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "power_on";
+    case ESP_RST_EXT: return "external";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "int_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "unknown";
+  }
+}
+
+void linkHeartbeat() { hbArmed = true; }
+
+void linkStatus(JsonDocument &r) {
+  r["hb"] = (int)(WIFI_SILENCE_DROP_MS / 1000);
+  r["up"] = (uint32_t)(millis() / 1000);
+  r["reset"] = resetReason();
+  r["sessions"] = sessions;
+  r["silence_drops"] = silenceDrops;
+  r["wifi_lost"] = wifiLost;
+  r["rejoins"] = rejoins;
+  if (WiFi.status() == WL_CONNECTED) r["rssi"] = WiFi.RSSI();
+}
+
+void linkDropForTest() {
+  if (client.connected()) dropWifi(true);
+  hbArmed = false;
+}
+
 static unsigned long retryDelay() {
   unsigned long d = WIFI_RETRY_MIN_MS << (dialFails > 5 ? 5 : dialFails);
   if (d > WIFI_RETRY_MAX_MS) d = WIFI_RETRY_MAX_MS;
@@ -229,7 +304,26 @@ void linkPoll() {
     return;
   }
   if (WiFi.status() != WL_CONNECTED) {
+    unsigned long now = millis();
+    if (staStarted) {
+      if (wifiWasUp) {            // just lost the access point
+        wifiWasUp = false;
+        wifiLost++;
+        wifiDownSince = lastRejoin = now;
+        if (client.connected()) dropWifi(true);
+        hbArmed = false;
+      }
+      if (now - lastRejoin >= WIFI_REJOIN_MS) {   // auto-reconnect sometimes gives up; join again
+        lastRejoin = now;
+        rejoins++;
+        WiFi.disconnect();
+        if (WIFI_CFG_PASS[0]) WiFi.begin(WIFI_CFG_SSID, WIFI_CFG_PASS);
+        else WiFi.begin(WIFI_CFG_SSID);
+      }
+      if (now - wifiDownSince >= WIFI_REBOOT_MS && !usbHostLine) ESP.restart();
+    }
     if (!staStarted) {
+      wifiDownSince = lastRejoin = now;
       WiFi.persistent(false);  // do not copy the password into NVS; wifi.json is the source
       WiFi.mode(WIFI_STA);
       WiFi.setAutoReconnect(true);
@@ -242,11 +336,19 @@ void linkPoll() {
     }
     return;
   }
+  wifiWasUp = true;
   if (!udpOn && !useStatic) {
     udpOn = beaconUdp.begin(WIFI_BEACON_PORT);
   }
   considerBeacon();
-  if (client.connected()) return;
+  if (client.connected()) {
+    if (hbArmed && millis() - lastRx > WIFI_SILENCE_DROP_MS) {   // cabinet went quiet: dial again
+      silenceDrops++;
+      hbArmed = false;
+      dropWifi(true);
+    }
+    return;
+  }
   if ((long)(millis() - nextTry) < 0) return;
   if (!useStatic && !haveBeacon) {
     nextTry = millis() + 1000;  // no beacon heard yet
@@ -258,6 +360,10 @@ void linkPoll() {
     return;
   }
   client.setNoDelay(true);  // request/ack lines: send each one now
+  setKeepalive();
+  lastRx = millis();
+  hbArmed = false;
+  sessions++;
   wasUp = true;
   upSince = millis();
   nextTry = millis() + retryDelay();

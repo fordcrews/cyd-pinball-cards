@@ -40,7 +40,7 @@ class FakeBoard:
     thread; `delay` (seconds, or a dict cmd -> seconds) simulates the time a real board spends
     drawing, so timing / parallel fan-out can be tested."""
 
-    def __init__(self, fw: str = "1.5.0", id: str | None = None, name: str = "", role: str = "",
+    def __init__(self, fw: str = "1.6.0", id: str | None = None, name: str = "", role: str = "",
                  rotation: int = 1, keypad: bool = True, delay=0.0, log=None, mac: str | None = None,
                  board: str = "cyd"):
         self.fw = fw
@@ -52,6 +52,7 @@ class FakeBoard:
         self.log = log or (lambda *_: None)
         self.mode = "idle"
         self.prev = "idle"
+        self.boot_t = time.monotonic()
         self.ident_until = 0.0
         self.received: list[dict] = []
         self.received_at: list[float] = []
@@ -81,7 +82,14 @@ class FakeBoard:
                 w, h = h, w
             ident.update({"w": w, "h": h, "img_max": 256 * 1024 if self.board == "ws-s3-7" else 48 * 1024,
                           "strip": 48 if self.board == "ws-s3-7" else 24})
+        if ver >= (1, 6):
+            ident.update(self.link_status())
         return ident
+
+    def link_status(self) -> dict:
+        """fw 1.6.0: heartbeat capability + link counters (ping / hello / hb acks)."""
+        return {"hb": 90, "up": int(time.monotonic() - self.boot_t), "reset": "power_on", "sessions": 1,
+                "silence_drops": 0, "wifi_lost": 0, "rejoins": 0}
 
     def _image(self, d: dict) -> dict:
         import base64
@@ -175,6 +183,10 @@ class FakeBoard:
             if not self.legacy:
                 r.update(self.identity())
             self.emit(r)
+        elif cmd == "hb" and tuple(int(x) for x in self.fw.split(".")[:2]) >= (1, 6):
+            self.emit({"ack": "hb", "ok": True, **self.link_status()})
+        elif cmd == "selftest" and tuple(int(x) for x in self.fw.split(".")[:2]) >= (1, 6):
+            self.emit({"ack": "selftest", "ok": d.get("op") in ("drop", "hang")})
         elif cmd == "rotation":
             v = d.get("value", -1)
             if not isinstance(v, int) or not 0 <= v <= 3:

@@ -77,6 +77,7 @@ import cyd_push  # noqa: E402  (shared config loading / message builders / port 
 import displays  # noqa: E402  (multi-display identity + targeting)
 import images    # noqa: E402  (pictures: fit, JPEG, chunked transfer with acks)
 import keymap    # noqa: E402
+import link_health  # noqa: E402  (connect / drop / heartbeat counts per board)
 
 DEFAULT_WATCH = ["PinUpMenuSetup.exe"]   # PinUP Popper setup/config tool (TO-VERIFY on your install)
                                          # (pinball profile only; the arcade keypad file sets [])
@@ -87,6 +88,10 @@ LOG_MAX_BYTES = 2 * 1024 * 1024   # --log file is rotated to <name>.1 at this si
 REFUSED_LOG_S = 60.0   # "USB is the session" for a board dialing in over Wi-Fi: once per this many seconds
 IMAGE_JOB_S = 60.0     # extra wait per picture in a cyd_push hand-off (a 7" picture over a UART is ~8 s)
 GALLERY_USB_MAX_BYTES = 40 * 1024   # gallery pictures over USB: about 5 s each at 115200 baud
+HEARTBEAT_S = 30.0          # {"cmd":"hb"} to every Wi-Fi board with fw >= 1.6.0 this often
+HEARTBEAT_TIMEOUT_S = 8.0   # wait this long for its ack
+HEARTBEAT_MISSES = 2        # this many unanswered in a row: close the session (the board dials again)
+SILENT_DROP_GUARD_S = 150.0  # test "silent" drop: close the abandoned socket after this long anyway
 GALLERY_STOP_CMDS = ("table", "idle", "image", "keypad", "calibrate")   # these end a gallery rotation
 
 
@@ -234,6 +239,11 @@ class BoardLink:
         self.content_gen = 0            # bumped per content hand-off; a stale queued picture is skipped
         self.gallery: Gallery | None = None        # rotation running on this board
         self.gallery_last: tuple | None = None     # (item paths, index shown) of the last rotation
+        self.hb_next = 0.0              # monotonic time of the next heartbeat (fw >= 1.6.0, Wi-Fi only)
+        self.hb_busy = False
+        self.hb_miss = 0
+        self.lost_reason = ""
+        self.detached = False           # test "silent" drop: no longer in Daemon.links
 
     @property
     def is_wifi(self) -> bool:
@@ -280,6 +290,7 @@ class BoardLink:
                 raw = self.ser.readline()
             except Exception as e:
                 if not self.stop.is_set():
+                    self.lost_reason = str(e) or type(e).__name__
                     self.log(f"serial error on {self.port}: {e}")
                     self.close()
                     self.on_lost(self)
@@ -432,10 +443,12 @@ class Daemon:
         self.night = None                      # night.NightController (main() turns it on)
         self.content_file: Path | None = None  # last_content survives a restart (main() sets it)
         self._content_lock = threading.Lock()
+        self.link_stats = link_health.LinkStats()
 
     def enable_persistence(self, path: Path) -> None:
         """Load and keep each board's last content in path (JSON), so a restart restores it."""
         self.content_file = Path(path)
+        self.link_stats = link_health.LinkStats(self.content_file.with_name("link_stats.json"))
         try:
             data = json.loads(self.content_file.read_text(encoding="utf-8"))
             if isinstance(data, dict):
@@ -565,6 +578,7 @@ class Daemon:
             self.log(f"display {board.label()} connected, fw {board.fw or '?'} mode {board.mode}"
                      + (f" board {board.hw}" if board.hw else "")
                      + (" (no identity: firmware < 1.3.0, role 'all')" if board.legacy else ""))
+            self._note_connect(lk, r)
             if board.fw and _ver(str(board.fw)) < (1, 2, 0):
                 self.log("warning: firmware older than 1.2.0 has no keypad; flash firmware/bin/firmware.bin")
             threading.Thread(target=self.after_connect, args=(lk,), daemon=True).start()
@@ -588,12 +602,14 @@ class Daemon:
                 self.log(f"wifi {board.id} on {other.port} dropped; USB on {lk.port} is the session")
                 self.links.pop(other.port, None)
                 other.close()
+                self.link_stats.dropped(board.id, other.port, "USB took over")
             elif wifi_old and wifi_new and _wifi_host(other.port) == _wifi_host(lk.port):
                 # Same board dialing back in (reset / Wi-Fi blip): the old socket is half-open
                 # and would swallow sends, so the new session replaces it.
                 self.log(f"wifi {board.id} reconnected from {lk.port}; dropping stale {other.port}")
                 self.links.pop(other.port, None)
                 other.close()
+                self.link_stats.dropped(board.id, other.port, "stale session replaced by a new one")
             else:
                 self.log(f"warning: two displays report id {board.id}; calling the one on {lk.port} "
                          f"{board.id}@{displays.port_name(lk.port)} (give it its own id with --assign ... --new-id)")
@@ -642,6 +658,7 @@ class Daemon:
                     return
             self.log(f"display {board.label()} connected over wifi, fw {board.fw or '?'}"
                      + (f" board {board.hw}" if board.hw else ""))
+            self._note_connect(lk, r)
             threading.Thread(target=self.after_connect, args=(lk,), daemon=True).start()
         except Exception as e:
             self.log(f"wifi display {port} failed: {e}")
@@ -690,6 +707,16 @@ class Daemon:
                 if "ts" in msg:
                     msg["ts"] = cyd_push.local_epoch()
                 self.send_to(lk, msg, "restored after restart")
+        elif not night_set:
+            # back after a drop or a reboot: pictures live only in the board's RAM, so show the
+            # role's content again instead of whatever the board kept
+            with self.state_lock:
+                msg = self.last_content.get(b.id)
+            if msg:
+                msg = dict(msg)
+                if "ts" in msg:
+                    msg["ts"] = cyd_push.local_epoch()
+                self.send_to(lk, msg, "reconnected")
         with self.state_lock:
             if (self.setup_running and not self.manual_exit and lk.board.mode != "keypad"
                     and cyd_push.keypad_allowed(lk.board, self.st)):
@@ -699,7 +726,105 @@ class Daemon:
         with self.links_lock:
             if self.links.get(lk.port) is lk:
                 self.links.pop(lk.port, None)
+        if lk.detached:
+            self.log(f"detached test session {lk.port} closed by the board")
+            return
         self.log(f"display {lk.board.label() if lk.board else lk.port} disconnected; waiting for it to come back")
+        if lk.board is not None:
+            self.link_stats.dropped(lk.board.id, lk.port, lk.lost_reason or "connection lost")
+
+    def _note_connect(self, lk: BoardLink, reply: dict | None) -> None:
+        if lk.board is None:
+            return
+        e, rebooted = self.link_stats.connected(lk.board.id, lk.port, reply)
+        self.log(link_health.describe_connect(lk.board.id, e, rebooted))
+
+    def drop_link(self, lk: BoardLink, reason: str) -> None:
+        """Close one session on purpose (dead heartbeat, test). on_lost logs and counts it."""
+        lk.lost_reason = reason
+        with self.links_lock:
+            if self.links.get(lk.port) is lk:
+                self.links.pop(lk.port, None)
+        lk.close()
+        self.on_lost(lk)
+
+    def poll_heartbeats(self) -> None:
+        """fw >= 1.6.0 Wi-Fi boards: {"cmd":"hb"} every HEARTBEAT_S. It keeps the board's 90 s
+        silence timer happy, and a board that stops answering is dropped so it dials again."""
+        now = time.monotonic()
+        with self.links_lock:
+            links = list(self.links.values())
+        for lk in links:
+            b = lk.board
+            if b is None or not lk.connected or not lk.is_wifi or b.hb <= 0 or lk.hb_busy or now < lk.hb_next:
+                continue
+            lk.hb_busy = True
+            lk.hb_next = now + HEARTBEAT_S
+
+            def beat(lk=lk):
+                try:
+                    if not lk.connected or lk.detached:
+                        return
+                    r = lk.request({"cmd": "hb"}, timeout=HEARTBEAT_TIMEOUT_S)
+                    who = lk.board.id if lk.board else lk.port
+                    if r.get("ok"):
+                        lk.hb_miss = 0
+                        self.link_stats.heartbeat(who, True, r)
+                        self.log(f"hb {who} ok: up {r.get('up')} s, rssi {r.get('rssi')}", debug=True)
+                        return
+                    if not lk.connected or lk.detached:
+                        return
+                    lk.hb_miss += 1
+                    self.link_stats.heartbeat(who, False)
+                    self.log(f"wifi {who}: heartbeat not acked ({lk.hb_miss}/{HEARTBEAT_MISSES}): {r.get('err')}")
+                    if lk.hb_miss >= HEARTBEAT_MISSES:
+                        self.drop_link(lk, "no heartbeat ack")
+                    else:
+                        lk.hb_next = time.monotonic() + 5.0
+                finally:
+                    lk.hb_busy = False
+
+            lk.submit(beat)
+
+    def test_drop(self, req: dict) -> dict:
+        """Simulated failures on one Wi-Fi display (never a USB one) to check that it comes back."""
+        target, mode = req.get("target"), req.get("mode", "close")
+        hits = displays.select(self.boards(), target) if target else []
+        if len(hits) != 1:
+            return {"ok": False, "err": f"target must match exactly one connected display (got {len(hits)})"}
+        lk = self.link_for(hits[0].id)
+        if lk is None or not lk.is_wifi:
+            return {"ok": False, "err": "test drops are for Wi-Fi displays only"}
+        bid = lk.board.id
+        if mode in ("board", "hang") and lk.board.hb <= 0:
+            return {"ok": False, "err": f"{bid} firmware {lk.board.fw} has no selftest (needs 1.6.0)"}
+        self.log(f"TEST: {mode} drop on {bid} ({lk.port})")
+        if mode == "close":
+            self.drop_link(lk, "test: daemon closed the session")
+        elif mode == "silent":
+            lk.detached = True
+            with self.links_lock:
+                if self.links.get(lk.port) is lk:
+                    self.links.pop(lk.port, None)
+            self.stop_gallery(lk)
+            self.link_stats.dropped(bid, lk.port, "test: daemon went silent")
+            guard = threading.Timer(SILENT_DROP_GUARD_S, lk.close)
+            guard.daemon = True
+            guard.start()
+        elif mode == "board":
+            r = lk.request({"cmd": "selftest", "op": "drop"}, timeout=3)
+            if not r.get("ok"):
+                return {"ok": False, "err": f"board refused: {r.get('err')}"}
+        elif mode == "hang":
+            if req.get("confirm") != "hang":
+                return {"ok": False, "err": "hang needs confirm"}
+            lk.lost_reason = "test: board hung (watchdog)"
+            r = lk.request({"cmd": "selftest", "op": "hang", "confirm": "hang"}, timeout=3)
+            if not r.get("ok"):
+                return {"ok": False, "err": f"board refused: {r.get('err')}"}
+        else:
+            return {"ok": False, "err": "mode must be close | silent | board | hang"}
+        return {"ok": True, "board": bid, "mode": mode, "port": lk.port, "at": ts()}
 
     def on_identity(self, lk: BoardLink, ack: dict):
         old = lk.board
@@ -1069,7 +1194,8 @@ class Daemon:
                 "profile": self.st.profile, "key_backend": self.injector.backend,
                 "virtual_gamepad": self.st.virtual_gamepad,
                 "wifi_port": self.wifi_hub.tcp_port if self.wifi_hub else None,
-                "night": ({"state": self.night.state, "force": self.night.force} if self.night else None)}
+                "night": ({"state": self.night.state, "force": self.night.force} if self.night else None),
+                "links": self.link_stats.snapshot()}
 
     def run_sends(self, sends: list, timeout: float, wait: bool = True) -> dict:
         """sends: [{"board": id, "messages": [...]}]. Every board is served by its own worker thread,
@@ -1127,6 +1253,11 @@ class Daemon:
         op = req.get("op")
         if op == "status":
             return self.status()
+        if op == "links":
+            return {"ok": True, "links": self.link_stats.snapshot(), "heartbeat_s": HEARTBEAT_S,
+                    "connected": [{"id": b.id, "port": b.port, "fw": b.fw, "hb": b.hb} for b in self.boards()]}
+        if op == "drop":
+            return self.test_drop(req)
         if op == "night":
             if self.night is None:
                 return {"ok": False, "err": "night mode is not running in this daemon"}
@@ -1172,6 +1303,7 @@ class Daemon:
 
     def shutdown(self):
         self.stop.set()
+        self.link_stats.save(force=True)
         if self.night is not None:
             self.night.stop.set()
             self.night.kick.set()
@@ -1312,6 +1444,7 @@ def main(argv=None) -> int:
         while True:
             d.poll_touch_keypads()
             d.poll_galleries()
+            d.poll_heartbeats()
             try:
                 d.night.tick()
             except Exception as e:

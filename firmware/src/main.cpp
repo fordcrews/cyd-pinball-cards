@@ -30,6 +30,12 @@
 //                         fitted the picture to this screen (host/images.py); hello reports w, h,
 //                         img_max (largest JPEG accepted) and strip (title strip height).
 //   {"cmd":"image","op":"show"[,"crc":C]}   redraw the picture still held in RAM  |  {"cmd":"image","op":"abort"}
+//   {"cmd":"hb"}          (fw 1.6.0) cabinet heartbeat on a Wi-Fi session; ack carries the link counters.
+//                         Arms the 90 s silence drop for that session (see wifi_link.h).
+//   {"cmd":"selftest","op":"drop"}   close the Wi-Fi session (the board dials again)
+//   {"cmd":"selftest","op":"hang","confirm":"hang"}   stop feeding the loop watchdog: reboots in ~30 s
+// fw 1.6.0: ping/hello/ready also report "hb" (silence timeout s), "up", "reset", "sessions",
+// "silence_drops", "wifi_lost", "rejoins", "rssi". The main loop runs under a 30 s task watchdog.
 // Events (device -> host, unsolicited):
 //   {"evt":"key","key":"alt+f4"[,"mods":["ctrl","shift","alt","win"]]}   keypad button released
 //   {"evt":"keypad","state":"on"|"off","source":"touch"}   keypad opened (long-press) / EXIT tapped
@@ -37,13 +43,14 @@
 //   {"evt":"touch","x":..,"y":..}   a tap that is not a keypad key (host shows the keypad on this board)
 //   {"evt":"touch","raw_x":..,"raw_y":..,"x":..,"y":..}   only while cal debug is on
 // Replies: {"ack":"<cmd>","ok":true[, ...]} or {"ack":"<cmd>","ok":false,"err":"..."}
-// Boot line: {"ready":true,"device":"cyd-pinball-cards","fw":"1.5.0","board":"cyd","id":"cyd-a1b2c3","name":"","role":"",
+// Boot line: {"ready":true,"device":"cyd-pinball-cards","fw":"1.6.0","board":"cyd","id":"cyd-a1b2c3","name":"","role":"",
 //             "w":320,"h":240,"img_max":49152,"strip":24,...}
 //
 // "ts" is the host's LOCAL wall-clock time as seconds since 1970-01-01 00:00 (i.e. local time
 // encoded as if it were UTC). The ESP32 has no RTC, so the clock only runs after a host sent it,
 // and it is advanced locally with millis().
 
+#include <esp_task_wdt.h>
 #include <Arduino.h>
 #include "board.h"
 #include "wifi_link.h"
@@ -97,7 +104,10 @@
 #define IDENTIFY_MS 5000
 #endif
 
-#define FW_VERSION "1.5.0"
+#define FW_VERSION "1.6.0"
+#ifndef LOOP_WDT_S
+#define LOOP_WDT_S 30         // task watchdog on the main loop: a hang reboots the board
+#endif
 #define MAX_CARDS 8
 #define MAX_IDLE_SCREENS 12
 #define MAX_LINE 6144         // longest accepted JSON line (bytes)
@@ -2071,7 +2081,28 @@ void handleLine(const String &line) {
     r["device"] = "cyd-pinball-cards";
     r["mode"] = modeName();
     addIdentity(r);
+    linkStatus(r);
     emitLine(r);
+  } else if (!strcmp(cmd, "hb")) {
+    linkHeartbeat();
+    JsonDocument r;
+    r["ack"] = "hb";
+    r["ok"] = true;
+    linkStatus(r);
+    emitLine(r);
+  } else if (!strcmp(cmd, "selftest")) {
+    const char *op = doc["op"] | "";
+    if (!strcmp(op, "drop")) {
+      reply("selftest", true);
+      linkDropForTest();
+    } else if (!strcmp(op, "hang") && !strcmp(doc["confirm"] | "", "hang")) {
+      reply("selftest", true);
+      unsigned long t0 = millis();
+      while (millis() - t0 < (LOOP_WDT_S + 30) * 1000UL) delay(50);   // watchdog fires first
+      ESP.restart();   // watchdog did not fire: restart anyway
+    } else {
+      reply("selftest", false, "op must be drop | hang (with confirm)");
+    }
   } else if (!strcmp(cmd, "identify")) {
     if (ui == UI_CAL) { reply("identify", false, "calibrating"); return; }
     int secs = doc["secs"] | (IDENTIFY_MS / 1000);
@@ -2318,10 +2349,13 @@ void sendReadyLine() {
   r["device"] = "cyd-pinball-cards";
   r["fw"] = FW_VERSION;
   addIdentity(r);
+  linkStatus(r);
   emitLine(r);
 }
 
 void setup() {
+  esp_task_wdt_init(LOOP_WDT_S, true);   // panic + reboot when the loop stops feeding it
+  esp_task_wdt_add(NULL);
   // Big RX ring buffer (set before begin): a full 6 KB line can arrive while a screen is drawn
   boardBeginSerial(RX_BUFFER);
   linkBegin();
@@ -2372,6 +2406,7 @@ void setup() {
   // Display, backlight and touch controller (board.h): CYD = PWM backlight, TFT_eSPI, XPT2046;
   // Waveshare 7" = CH422G resets + backlight switch, LovyanGFX RGB panel, GT911
   boardInitDisplay(st.rotation, st.brightness);
+  esp_task_wdt_reset();
 
   if (!wasIdle && last.length()) {
     JsonDocument doc;
@@ -2387,6 +2422,7 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();
   linkPoll();
   pollSerial();
   pollTouch();

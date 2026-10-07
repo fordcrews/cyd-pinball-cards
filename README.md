@@ -959,6 +959,29 @@ so a request/ack round trip is about 25 ms.
 Pictures are in (see "Pictures (firmware 1.5.0)" above). LaunchBox is the first front end that
 sends them; the same `"image"` card key works from any front end that knows its artwork paths.
 
+### Staying connected (firmware 1.6.0)
+
+Wi-Fi displays recover on their own; nobody should have to unplug one.
+
+* **TCP keepalive** on the board's session: if the cabinet PC disappears without a clean close
+  (power cut, a Wi-Fi blip that ate the close), the board notices in about 25 s and dials again.
+* **Heartbeat**: cyd_daemon sends `{"cmd":"hb"}` every 30 s to Wi-Fi boards that report `"hb"`
+  (fw 1.6.0). The board drops a session that has been silent for 90 s and dials again; the daemon
+  closes a session whose board missed two heartbeats. Boards with older firmware and USB boards get
+  no heartbeats and behave as before; a 1.6.0 board under an older daemon never arms the 90 s timer.
+* **Wi-Fi rejoin**: access point gone for 30 s -> the board joins again (every 30 s); still gone
+  after 10 minutes -> the board restarts (not while a USB host drives it).
+* **Watchdog**: the main loop runs under a 30 s task watchdog; a hang reboots the board, and it
+  comes back with its last content.
+* After any reconnect the daemon sends the board its current content again (pictures only live in
+  the board's RAM).
+
+Check it: `python host/cyd_links.py` lists connects, drops (with the reason), reboots (with the
+reset reason the board reports, e.g. `task_wdt`) and heartbeats per board; the counts are kept in
+`.cyd_cache/link_stats.json`. The daemon log has one `link <id> ...: connect #N` line per connect.
+Test a recovery on one Wi-Fi board: `python host/cyd_links.py drop cyd-1e37f4 --mode close|silent|board`
+or `python host/cyd_links.py hang cyd-1e37f4 --yes` (watchdog reboot). USB boards are refused.
+
 ## Night and idle screens
 
 `cyd_daemon` puts every display to sleep at night and shows a clock, the weather and news
