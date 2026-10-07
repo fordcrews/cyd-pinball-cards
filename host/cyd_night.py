@@ -46,7 +46,7 @@ def preview(out: Path, offline: bool) -> int:
                                           {"date": "2026-10-08", "hi": 71, "lo": 52, "icon": "clear"},
                                           {"date": "2026-10-09", "hi": 64, "lo": 50, "icon": "rain", "rain": 60},
                                           {"date": "2026-10-10", "hi": 60, "lo": 45, "icon": "storm"}]}
-        news = {"source": "Sample News", "at": time.time(), "headlines": [
+        news = {"source": "Sample Tech", "label": s.news_title, "at": time.time(), "headlines": [
             "City council approves a new plan for downtown parking after a long debate",
             "Local team wins in overtime",
             "Forecasters expect a mild, dry week ahead across the region",

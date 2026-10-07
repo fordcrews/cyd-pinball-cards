@@ -28,7 +28,7 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_NEWS_FEED = "https://feeds.npr.org/1001/rss.xml"
+DEFAULT_NEWS_FEED = "https://www.theverge.com/rss/tech/index.xml"   # tech only (The Verge, Tech section)
 
 DEFAULTS = {
     "enabled": True,
@@ -41,10 +41,13 @@ DEFAULTS = {
     "news_seconds": 20,              # each headline page
     "clock_24h": False,
     "weather_location": "",          # "Memphis, TN", "Chicago", "35.15,-90.05"; "" = IP lookup once
+    "weather_lat": None,             # optional exact coordinates (then weather_location is only the label)
+    "weather_lon": None,
     "weather_units": "F",            # F (and mph) or C (and km/h)
     "weather_refresh_minutes": 15,
     "news_feed": DEFAULT_NEWS_FEED,  # any RSS / Atom feed
-    "news_source": "NPR News",       # label on the headline slide ("" = the feed's own title)
+    "news_title": "TECH NEWS",       # heading of the headline slide
+    "news_source": "The Verge",      # source shown on the headline slide ("" = the feed's own title)
     "news_count": 5,
     "news_refresh_minutes": 20,
 }
@@ -83,10 +86,13 @@ class NightSettings:
     clock_24h: bool = False
     weather_location: str = ""
     weather_location_name: str = ""
+    weather_lat: float | None = None
+    weather_lon: float | None = None
     weather_units: str = "F"
     weather_refresh_minutes: float = 15
     news_feed: str = DEFAULT_NEWS_FEED
-    news_source: str = "NPR News"
+    news_title: str = "TECH NEWS"
+    news_source: str = "The Verge"
     news_count: int = 5
     news_refresh_minutes: float = 20
     warnings: list = field(default_factory=list)
@@ -131,10 +137,20 @@ class NightSettings:
         s.clock_24h = bool(raw["clock_24h"])
         s.weather_location = str(raw.get("weather_location") or "").strip()
         s.weather_location_name = str(raw.get("weather_location_name") or "").strip()
+        lat, lon = raw.get("weather_lat"), raw.get("weather_lon")
+        if lat not in (None, "") or lon not in (None, ""):
+            try:
+                lat, lon = float(lat), float(lon)
+                if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                    raise ValueError
+                s.weather_lat, s.weather_lon = lat, lon
+            except (TypeError, ValueError):
+                s.warnings.append(f"night.weather_lat/weather_lon {lat!r}, {lon!r} are not coordinates; ignored")
         s.weather_units = "C" if str(raw.get("weather_units") or "F").upper().startswith("C") else "F"
         s.weather_refresh_minutes = num("weather_refresh_minutes", 5, 24 * 60)
         s.news_feed = str(raw.get("news_feed") or "").strip()
         s.news_source = str(raw.get("news_source") or "").strip()
+        s.news_title = str(raw.get("news_title") or "").strip() or "HEADLINES"
         s.news_count = num("news_count", 1, 20, int)
         s.news_refresh_minutes = num("news_refresh_minutes", 5, 24 * 60)
         return s

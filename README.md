@@ -971,11 +971,12 @@ info slides are pictures drawn on the PC for each screen size (firmware 1.5.0 `i
   (default 5) after the last activity, then they sleep again.
 * **Idle** (default 60 minutes with no LaunchBox pick/launch and no touch): every display rotates
   a big clock with the date, the current weather (Open-Meteo, no key) and the top 5 news
-  headlines (an RSS feed, default NPR News), 15 s per slide, 20 s per headline page. Each display
+  tech headlines (an RSS feed, default The Verge's Tech section; no general news), 15 s per slide, 20 s per headline page. Each display
   starts on a different slide.
 * Any pick, launch or touch puts every display back on its role at once. A tap on a sleeping or
   info screen only wakes the screens; the next tap opens the keypad as usual.
-* Weather location: `weather_location` ("Memphis, TN", "Chicago", or "35.15,-90.05"). Empty: one
+* Weather location: `weather_location` ("Memphis, TN", "Chicago", or "35.15,-90.05"); add
+  `weather_lat` / `weather_lon` to pin exact coordinates (the name is then only the label). Empty: one
   IP lookup (ipinfo.io, else ip-api.com), saved in `.cyd_cache/location.json` (city, region and
   coordinates only). Delete that file to look it up again. Offline: the slides with no data are
   left out and the clock keeps going.
@@ -991,8 +992,9 @@ Settings (`config.json`, every key optional; restart the daemon after a change):
   "idle_minutes": 60, "quiet_wake_minutes": 5,
   "brightness": 220,
   "slide_seconds": 15, "news_seconds": 20, "clock_24h": false,
-  "weather_location": "", "weather_units": "F", "weather_refresh_minutes": 15,
-  "news_feed": "https://feeds.npr.org/1001/rss.xml", "news_source": "NPR News",
+  "weather_location": "", "weather_lat": null, "weather_lon": null,
+  "weather_units": "F", "weather_refresh_minutes": 15,
+  "news_feed": "https://www.theverge.com/rss/tech/index.xml", "news_title": "TECH NEWS", "news_source": "The Verge",
   "news_count": 5, "news_refresh_minutes": 20
 }
 ```

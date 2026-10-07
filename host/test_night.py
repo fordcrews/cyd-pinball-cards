@@ -86,7 +86,8 @@ class Settings(unittest.TestCase):
         s = settings()
         self.assertEqual((s.quiet_start, s.quiet_end), (23 * 60, 7 * 60))
         self.assertEqual((s.idle_minutes, s.quiet_wake_minutes, s.weather_units), (60, 5, "F"))
-        self.assertTrue(s.news_feed.startswith("https://"))
+        self.assertEqual(s.news_feed, "https://www.theverge.com/rss/tech/index.xml")   # tech only, no general news
+        self.assertEqual((s.news_title, s.news_source), ("TECH NEWS", "The Verge"))
         self.assertEqual(s.as_dict()["quiet_start"], "23:00")
         self.assertEqual(s.warnings, [])
 
@@ -191,6 +192,17 @@ class Feeds(unittest.TestCase):
         g = self.feeds(weather_location="41.88, -87.63", weather_location_name="Chicago")
         self.assertEqual(g.resolve_location()["lat"], 41.88)
         self.assertEqual(g.place(), "Chicago")
+        # exact coordinates + a label: no geocoder, no IP lookup
+        self.net.calls.clear()
+        h = self.feeds(weather_location="Crystal Springs, MS", weather_lat=31.9874, weather_lon=-90.357)
+        h.refresh()
+        self.assertEqual(h.place(), "Crystal Springs, MS")
+        self.assertIn("latitude=31.9874", [u for u in self.net.calls if "forecast" in u][0])
+        self.assertFalse(any("geocoding" in u or "ipinfo" in u for u in self.net.calls))
+        self.assertEqual(h.snapshot()[1]["label"], "TECH NEWS")
+        bad = settings(weather_lat="north", weather_lon=1)
+        self.assertIsNone(bad.weather_lat)
+        self.assertEqual(len(bad.warnings), 1)
 
     def test_refresh_intervals(self):
         f = self.feeds()

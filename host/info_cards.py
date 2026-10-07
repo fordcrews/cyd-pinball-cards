@@ -359,11 +359,12 @@ def news_pages(headlines: list[str], w: int, h: int) -> list[list[str]]:
 
 
 def render_news(w: int, h: int, headlines: list[str], source: str = "News", page: int = 1, pages: int = 1,
-                at: float | None = None, h24: bool = False, size: int | None = None) -> Image.Image:
+                at: float | None = None, h24: bool = False, size: int | None = None,
+                label: str = "HEADLINES") -> Image.Image:
     img, d = _canvas(w, h)
     s = _scale(w, h)
     right = source + (f"  {page}/{pages}" if pages > 1 else "")
-    _header(d, w, s, "HEADLINES", right)
+    _header(d, w, s, label or "HEADLINES", right)
     if size is None:
         size = news_layout(headlines, w, h)[0]
     f, pad, lh, gap, bullet = _news_metrics(w, h, size)
@@ -405,7 +406,7 @@ def render(slide: str, w: int, h: int, *, now: datetime | None = None, weather: 
         if not 0 <= i < len(pages):
             return None
         return render_news(w, h, pages[i], news.get("source") or "News", i + 1, len(pages), news.get("at"), h24,
-                           size=size)
+                           size=size, label=news.get("label") or "HEADLINES")
     return None
 
 

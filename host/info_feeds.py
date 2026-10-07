@@ -7,7 +7,8 @@ info_feeds.py - weather and news for the idle info screens (no API keys).
     Open-Meteo geocoder) or "35.15,-90.05" (lat,lon). Empty: one IP geolocation lookup
     (ipinfo.io, else ip-api.com), saved in the cache folder so it is not asked again. Only the
     city, region and coordinates are kept (no IP address). Delete location.json to look again.
-  * News: any RSS 2.0 or Atom feed (default NPR News top stories); the first N headlines.
+    "weather_lat"/"weather_lon" pin exact coordinates (weather_location is then just the label).
+  * News: any RSS 2.0 or Atom feed (default The Verge, Tech section); the first N headlines.
 
 Everything is fetched with urllib (no extra packages) on a background thread. A failed fetch
 keeps the last good data and tries again a couple of minutes later, so the screens never wait
@@ -242,6 +243,13 @@ class InfoFeeds:
         if self.location:
             return self.location
         cfg = str(getattr(self.s, "weather_location", "") or "").strip()
+        lat, lon = getattr(self.s, "weather_lat", None), getattr(self.s, "weather_lon", None)
+        if lat is not None and lon is not None:
+            label = getattr(self.s, "weather_location_name", "") or ("" if parse_latlon(cfg) else cfg)
+            city, _, region = label.partition(",")
+            self.location = {"lat": float(lat), "lon": float(lon), "city": city.strip(), "region": region.strip(),
+                             "source": "config"}
+            return self.location
         ll = parse_latlon(cfg)
         if ll:
             self.location = {"lat": ll[0], "lon": ll[1], "city": getattr(self.s, "weather_location_name", "") or "",
@@ -334,6 +342,7 @@ class InfoFeeds:
             self._note_fail("news", f"{type(e).__name__}: {e}")
             return False
         n["source"] = self.s.news_source or n.get("title") or "News"
+        n["label"] = getattr(self.s, "news_title", "") or "HEADLINES"
         with self.lock:
             self.news, self.news_at = n, self.now()
         self._news_retry = 0.0

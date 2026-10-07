@@ -35,7 +35,7 @@
   ],
   "exclude_ports": [],
   "night": {
-    "_comment": "Screens sleep in quiet hours (backlight off) and show clock / weather / news after idle_minutes without a LaunchBox pick, launch or touch. Times are local 24 h (\"23:00\"); \"\" turns the sleep off, idle_minutes 0 the info slides. weather_location: \"City, ST\", \"lat,lon\" or \"\" (one IP lookup, cached in .cyd_cache/location.json). news_feed: any RSS/Atom URL. Test: python host/cyd_night.py info|sleep|wake|auto.",
+    "_comment": "Screens sleep in quiet hours (backlight off) and show clock / weather / news after idle_minutes without a LaunchBox pick, launch or touch. Times are local 24 h (\"23:00\"); \"\" turns the sleep off, idle_minutes 0 the info slides. weather_location: \"City, ST\", \"lat,lon\" or \"\"; weather_lat/weather_lon pin exact coordinates (one IP lookup, cached in .cyd_cache/location.json). news_feed: any RSS/Atom URL (default The Verge tech headlines; news_title is the slide heading). Test: python host/cyd_night.py info|sleep|wake|auto.",
     "enabled": true,
     "quiet_start": "23:00",
     "quiet_end": "07:00",
@@ -46,10 +46,13 @@
     "news_seconds": 20,
     "clock_24h": false,
     "weather_location": "",
+    "weather_lat": null,
+    "weather_lon": null,
     "weather_units": "F",
     "weather_refresh_minutes": 15,
-    "news_feed": "https://feeds.npr.org/1001/rss.xml",
-    "news_source": "NPR News",
+    "news_feed": "https://www.theverge.com/rss/tech/index.xml",
+    "news_title": "TECH NEWS",
+    "news_source": "The Verge",
     "news_count": 5,
     "news_refresh_minutes": 20
   }
