@@ -81,7 +81,7 @@ class Dialer(threading.Thread):
             pass
 
 
-class Heartbeat(BusCase):
+class DaemonCase(BusCase):
     def start(self):
         args = cyd_daemon.build_parser().parse_args(["--dry-run", "--no-watch", "--no-wifi"])
         self.log = CapLog()
@@ -105,6 +105,8 @@ class Heartbeat(BusCase):
         self.addCleanup(b.close)
         return b
 
+
+class Heartbeat(DaemonCase):
     @mock.patch.object(cyd_daemon, "HEARTBEAT_S", 0.3)
     def test_new_firmware_gets_heartbeats_old_does_not(self):
         d, port = self.start()
@@ -167,7 +169,7 @@ class Heartbeat(BusCase):
         self.assertTrue(wait_until(lambda: b1.closed, 3))
         b2 = self.dial(port, "cyd-gal")
         self.assertTrue(wait_until(lambda: any(m.get("title") == "F1 Pole Position 64" for m in b2.cmds("table")), 3))
-        self.assertTrue(self.log.has("(reconnected)"))
+        self.assertTrue(self.log.has("reconnected"))
         st = d.link_stats.snapshot()["cyd-gal"]
         self.assertEqual((st["connects"], st["drops"]), (2, 1))
         self.assertEqual(st["last_drop_reason"], "test: daemon closed the session")
@@ -201,6 +203,62 @@ class Heartbeat(BusCase):
         r = d.handle_request({"op": "drop", "target": "cyd-old", "mode": "hang"})
         self.assertFalse(r["ok"])
         self.assertEqual(len(d.boards()), 2)
+
+
+def game(title):
+    return {"cmd": "table", "title": title, "ts": 1000, "cards": [
+        {"type": "instructions", "roles": ["howtoplay"], "title": "HOW TO PLAY", "text": f"{title} rules"},
+        {"type": "pictureboxart", "roles": ["pictureboxart"], "title": "BOX ART", "text": title}]}
+
+
+class CatchUp(DaemonCase):
+    def tables(self, b):
+        return [m.get("title") for m in b.cmds("table")]
+
+    def test_board_away_during_a_pick_gets_the_current_game_on_reconnect(self):
+        d, port = self.start()
+        how = self.dial(port, "cyd-how", role="howtoplay")
+        self.assertTrue(wait_until(lambda: [x.id for x in d.boards()] == ["cyd-how"], 3))
+        self.assertTrue(d.handle_request({"op": "send", "messages": [game("F1 Pole Position 64")], "timeout": 2})["ok"])
+        self.assertTrue(wait_until(lambda: "F1 Pole Position 64" in self.tables(how), 2))
+        d.handle_request({"op": "drop", "target": "cyd-how", "mode": "close"})
+        self.assertTrue(wait_until(lambda: how.closed, 3))
+        # picks while the how-to-play display is away (another display takes them)
+        self.plug("FAKE1", id="cyd-box", role="pictureboxart", fw="1.6.0")
+        d.scan_once(wait=True)
+        for t in ("Gex 64: Enter the Gecko", "Hydro Thunder"):
+            self.assertTrue(d.handle_request({"op": "send", "messages": [game(t)], "timeout": 2})["ok"])
+        back = self.dial(port, "cyd-how", role="howtoplay")
+        self.assertTrue(wait_until(lambda: self.tables(back), 3))
+        self.assertEqual(self.tables(back), ["Hydro Thunder"])
+        sent = back.cmds("table")[-1]
+        self.assertEqual([c["title"] for c in sent["cards"]], ["HOW TO PLAY"])   # specialized for its role
+        self.assertNotEqual(sent["ts"], 1000)                                     # fresh clock
+        self.assertTrue(self.log.has("reconnected: current content"))
+
+    def test_current_game_survives_a_daemon_restart(self):
+        d, port = self.start()
+        self.assertTrue(d.handle_request({"op": "send", "messages": [game("Hydro Thunder")], "timeout": 2}).get("ok") is False)
+        # no display was connected, but the pick is still the current game
+        self.assertTrue((self.dir / "cache" / "current_content.json").exists())
+        d.shutdown()
+        d2, port2 = self.start()
+        how = self.dial(port2, "cyd-how", role="howtoplay")
+        self.assertTrue(wait_until(lambda: self.tables(how), 3))
+        self.assertEqual(self.tables(how), ["Hydro Thunder"])
+
+    def test_per_board_sends_and_untargeted_boards(self):
+        d, port = self.start()
+        d.note_current({"sends": [{"board": "cyd-a", "messages": [{"cmd": "table", "title": "Only A", "cards": []}]}]})
+        a = displays.make_board("wifi:1:1", {"id": "cyd-a", "role": "left"})
+        other = displays.make_board("wifi:1:2", {"id": "cyd-b", "role": "left"})
+        self.assertEqual([m["title"] for m in d.catch_up_msgs(a)], ["Only A"])
+        self.assertIsNone(d.catch_up_msgs(other))              # falls back to its own last content
+        d.note_current({"messages": [game("Joust")], "target": "cyd-a"})
+        self.assertIsNone(d.catch_up_msgs(other))
+        self.assertEqual(d.catch_up_msgs(a)[0]["title"], "Joust")
+        d.note_current({"messages": [{"cmd": "brightness", "value": 9}]})   # not content: no change
+        self.assertEqual(d.catch_up_msgs(a)[0]["title"], "Joust")
 
 
 class Stats(unittest.TestCase):

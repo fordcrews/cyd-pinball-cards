@@ -445,11 +445,22 @@ class Daemon:
         self.content_file: Path | None = None  # last_content survives a restart (main() sets it)
         self._content_lock = threading.Lock()
         self.link_stats = link_health.LinkStats()
+        # the latest content push (LaunchBox pick, game exit, cyd_push): a display that was away
+        # when it went out is caught up with it when it (re)connects
+        self.current: dict | None = None
+        self.current_file: Path | None = None
 
     def enable_persistence(self, path: Path) -> None:
         """Load and keep each board's last content in path (JSON), so a restart restores it."""
         self.content_file = Path(path)
         self.link_stats = link_health.LinkStats(self.content_file.with_name("link_stats.json"))
+        self.current_file = self.content_file.with_name("current_content.json")
+        try:
+            cur = json.loads(self.current_file.read_text(encoding="utf-8"))
+            if isinstance(cur, dict) and (isinstance(cur.get("messages"), list) or isinstance(cur.get("per_board"), dict)):
+                self.current = cur
+        except (OSError, ValueError):
+            pass
         try:
             data = json.loads(self.content_file.read_text(encoding="utf-8"))
             if isinstance(data, dict):
@@ -686,6 +697,60 @@ class Daemon:
     def _wifi_accept(self, conn, addr) -> None:
         threading.Thread(target=self.adopt_wifi, args=(conn, addr), name="wifi-board", daemon=True).start()
 
+    def note_current(self, req: dict) -> None:
+        """Remember the newest content push. Generic messages (LaunchBox: the same table for every
+        display, specialized per role here) are kept as they came; per-board sends (cyd_push) per id."""
+        content = ("table", "idle")
+        cur = None
+        if req.get("sends") is None:
+            msgs = [m for m in (req.get("messages") or []) if isinstance(m, dict) and m.get("cmd") in content]
+            if msgs:
+                cur = {"messages": msgs, "target": req.get("target"), "time": time.time()}
+        else:
+            per = {}
+            for e in req.get("sends") or []:
+                msgs = [m for m in (e.get("messages") or []) if isinstance(m, dict) and m.get("cmd") in content]
+                if msgs and e.get("board"):
+                    per[str(e["board"])] = msgs
+            if per:
+                cur = {"per_board": per, "time": time.time()}
+        if cur is None:
+            return
+        with self.state_lock:
+            self.current = cur
+        if self.current_file is not None:
+            try:
+                self.current_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.current_file.with_name(self.current_file.name + ".tmp")
+                tmp.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+                tmp.replace(self.current_file)
+            except (OSError, TypeError, ValueError) as e:
+                self.log(f"could not save current content: {e}", debug=True)
+
+    def catch_up_msgs(self, b: displays.Board) -> list[dict] | None:
+        """What this display should show for the newest content push, or None when that push says
+        nothing about it (then its own last content is used)."""
+        with self.state_lock:
+            cur = self.current
+        if not cur:
+            return None
+        if "per_board" in cur:
+            msgs = cur["per_board"].get(b.id)
+        else:
+            target = cur.get("target")
+            if target and not displays.matches(b, target):
+                return None
+            msgs = [x for x in (cyd_push.specialize_message(dict(m), b) for m in cur.get("messages") or []) if x]
+        if not msgs:
+            return None
+        out = []
+        for m in msgs:
+            m = dict(m)
+            if "ts" in m:
+                m["ts"] = cyd_push.local_epoch()
+            out.append(m)
+        return out
+
     def after_connect(self, lk: BoardLink):
         b = lk.board
         want = b.cfg.get("rotation") if b and b.cfg else None
@@ -695,7 +760,13 @@ class Daemon:
         first_time = b.id not in self.seen_ids
         self.seen_ids.add(b.id)
         night_set = bool(self.night and self.night.on_connect(lk))   # asleep / info slides: they own it
-        if first_time and not night_set:   # a display plugged in mid-game catches up with what its role shows now
+        catch_up = None if night_set else self.catch_up_msgs(b)
+        if catch_up:
+            # the current game (or idle screen), even if this display missed that push
+            why = "current content" if first_time else "reconnected: current content"
+            for m in catch_up:
+                self.send_to(lk, m, why, timeout=max(self.args.timeout, RESTORE_TIMEOUT_S))
+        elif first_time and not night_set:   # a display plugged in mid-game catches up with what its role shows now
             last = self.last_by_role.get(b.role) or (self.last_by_role.get("all") if b.generic else None)
             if last:
                 msg, sent = dict(last[0]), last[1]
@@ -1272,6 +1343,7 @@ class Daemon:
                 msgs = req.get("messages")
                 if not isinstance(msgs, list) or not all(isinstance(m, dict) and m.get("cmd") for m in msgs):
                     return {"ok": False, "err": "messages must be a list of {\"cmd\":...} objects"}
+                self.note_current(req)       # the current game, even for displays that are away now
                 targets = displays.select(self.boards(), req.get("target"))
                 if not targets:
                     return {"ok": False, "err": "no display connected" if not self.boards()
@@ -1298,6 +1370,8 @@ class Daemon:
                     isinstance(e, dict) and isinstance(e.get("messages"), list)
                     and all(isinstance(m, dict) and m.get("cmd") for m in e["messages"]) for e in sends):
                 return {"ok": False, "err": "sends must be a list of {\"board\":id,\"messages\":[{\"cmd\":...}]}"}
+            if req.get("sends") is not None:
+                self.note_current(req)
             if self.night is not None:      # a pick / launch / exit: wake, back to the roles
                 self.night.on_content([str(e.get("board")) for e in sends])
             return self.run_sends(sends, timeout, wait)
