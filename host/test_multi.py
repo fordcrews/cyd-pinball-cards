@@ -421,7 +421,7 @@ class DirectFanout(BusCase):
         rows = {r["port"]: r for r in json.loads(out)}
         self.assertEqual((rows["FAKE1"]["hw"], rows["FAKE2"]["hw"]), ("cyd", "ws-s3-7"))
         rc, out, _ = self.push("--list-displays", "--no-daemon")
-        self.assertIn("1.4.0 (ws-s3-7)", out)
+        self.assertIn("1.6.0 (ws-s3-7)", out)
 
     def test_list_identify_assign(self):
         self.five()
@@ -632,6 +632,63 @@ class DaemonMulti(BusCase):
             {"cmd": "config", "role": "center"}]}]})
         self.assertTrue(r["ok"])
         self.assertEqual({b.id: b.role for b in d.boards()}["cyd-aaa004"], "center")
+
+
+    def test_touch_opens_keypad_then_returns_to_role(self):
+        """A tap shows the keypad on that board only, then its own cards again after the timer.
+        Another touch while the keypad is up restarts the timer. A keyboard role stays put."""
+        self.plug("FAKE1", id="cyd-panel", role="control_panel", name="control_panel")
+        self.plug("FAKE2", id="cyd-how", role="howtoplay", name="howtoplay")
+        self.plug("FAKE3", id="cyd-pic", role="picture", name="picture")
+        self.plug("FAKE4", id="cyd-keys", role="keyboard", name="keyboard")
+        d = self.start_daemon()
+        msg = {"cmd": "table", "title": "Sim", "cards": [
+            {"type": "controls", "title": "CONTROL PANEL", "text": "p"},
+            {"type": "instructions", "title": "HOW TO PLAY", "text": "h"},
+            {"type": "picture", "title": "PICTURE", "text": "i"},
+            {"type": "keypad", "title": "KEYS", "text": "k"},
+        ]}
+        r = d.handle_request({"op": "send", "messages": [msg]})
+        self.assertTrue(r["ok"], r)
+        panel, how, pic, keys = (self.boards[p] for p in ("FAKE1", "FAKE2", "FAKE3", "FAKE4"))
+        self.assertEqual(panel.cmds("table")[-1]["cards"][0]["title"], "CONTROL PANEL")
+        self.assertEqual(how.cmds("table")[-1]["cards"][0]["title"], "HOW TO PLAY")
+        self.assertEqual(keys.mode, "keypad")
+        key_pushes = len(keys.cmds("keypad"))
+
+        panel.tap()
+        self.assertTrue(wait_until(lambda: panel.mode == "keypad" and "cyd-panel" in d.touch_until))
+        self.assertEqual(len(panel.cmds("keypad")), 1)
+        self.assertFalse(how.cmds("keypad"))
+        self.assertFalse(pic.cmds("keypad"))
+        self.assertNotIn("cyd-how", d.touch_until)
+        first = d.touch_until["cyd-panel"]
+
+        panel.tap()  # still on the keypad: reset the timer, do not send the layout again
+        self.assertTrue(wait_until(lambda: d.touch_until.get("cyd-panel", 0) > first))
+        self.assertEqual(len(panel.cmds("keypad")), 1)
+        self.assertEqual(how.mode, "table")
+        extended = d.touch_until["cyd-panel"]
+        panel.key("f5")
+        self.assertTrue(wait_until(lambda: d.touch_until.get("cyd-panel", 0) > extended))
+        self.assertEqual(len(panel.cmds("keypad")), 1)
+
+        d.touch_until["cyd-panel"] = time.monotonic() - 1
+        d.poll_touch_keypads()
+        self.assertTrue(wait_until(lambda: panel.mode == "table"))
+        self.assertEqual(panel.cmds("table")[-1]["cards"][0]["title"], "CONTROL PANEL")
+        self.assertEqual(how.mode, "table")
+        self.assertEqual(pic.mode, "table")
+        self.assertNotIn("cyd-panel", d.touch_until)
+        self.assertEqual(len(keys.cmds("keypad")), key_pushes)
+
+        keys.exit_button()
+        self.assertTrue(wait_until(lambda: keys.mode != "keypad"))
+        keys.tap()
+        self.assertTrue(wait_until(lambda: keys.mode == "keypad"))
+        self.assertNotIn("cyd-keys", d.touch_until)
+        d.poll_touch_keypads()
+        self.assertEqual(keys.mode, "keypad")
 
 
 # ---------------------------------------------------------------- PTYs + subprocesses (Linux/macOS)

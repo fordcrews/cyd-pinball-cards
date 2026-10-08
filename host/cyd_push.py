@@ -78,6 +78,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import serialport  # noqa: E402  (pyserial, or a termios fallback on Linux)
 import displays    # noqa: E402  (multi-display: identity, targeting, direct fan-out)
 from displays import Board  # noqa: E402
+import images      # noqa: E402  (pictures: fit, JPEG, chunked transfer; fw 1.5.0)
+import textfit     # noqa: E402  (long text cards split into pages that fit each display)
 
 # Known USB-serial bridges used on CYD boards: CH340, CH9102, CP2102
 KNOWN_VID_PID = displays.KNOWN_VID_PID
@@ -545,7 +547,114 @@ def table_for_board(data: dict, board: Board | None) -> dict:
         cards = list(sec)
     cards = [c for c in cards if not isinstance(c, dict) or not c.get("roles")
              or displays.role_listed(board, c.get("roles"))]
+    if board is not None and displays.is_content_role(board.role):
+        # control_panel, howtoplay, picture, pictureboxart, videoofplay, gallery, keyboard:
+        # only the matching cards, never the shared playlist.
+        cards = [c for c in cards if displays.card_matches_content_role(c, board.role)]
     return {**data, "title": title, "cards": cards}
+
+
+def message_for_table(data: dict, board: Board | None, with_clock: bool = True) -> dict | None:
+    """One board's table command. A keyboard role gets {"cmd":"keypad"} when a keypad card
+    is in the content, and nothing when there is not. Other content roles get only their cards.
+    A content role with nothing to show gets None (do not fall back to every card)."""
+    part = table_for_board(data, board)
+    cards = [c for c in (part.get("cards") or []) if isinstance(c, dict)]
+    if board is not None and displays._fold(board.role) == "keyboard":
+        kept = [c for c in cards if displays.card_matches_content_role(c, "keyboard")]
+        if not kept:
+            return None
+        cfg = {}
+        for c in kept:
+            if isinstance(c.get("layout"), dict):
+                cfg = c["layout"]
+                break
+            if isinstance(c.get("pages"), list):
+                cfg = {"pages": c["pages"]}
+                break
+        return build_keypad_msg(cfg) if cfg else {"cmd": "keypad"}
+    msg = build_table_msg(part, with_clock=with_clock)
+    if board is not None and displays.is_content_role(board.role) and not msg.get("cards"):
+        return None
+    return msg
+
+
+# Content roles that show a picture when a card carries an "image" path (howtoplay stays text).
+IMAGE_ROLES = frozenset({"control_panel", "picture", "pictureboxart", "videoofplay", "gallery"})
+GALLERY_INTERVAL_S = 9.0   # seconds each gallery picture stays up (counted after it is drawn)
+
+
+def gallery_items(cards: list) -> list[dict]:
+    """[{"path","title"}] from cards' "images" lists (strings or {"path","title"}), then "image"."""
+    out, seen = [], set()
+    for c in cards:
+        if not isinstance(c, dict):
+            continue
+        raw = list(c.get("images") or [])
+        if isinstance(c.get("image"), str):
+            raw.append(c["image"])
+        for it in raw:
+            path, title = (it, "") if isinstance(it, str) else \
+                (str((it or {}).get("path") or ""), str((it or {}).get("title") or ""))
+            path = path.strip()
+            if path and path not in seen:
+                seen.add(path)
+                out.append({"path": path, "title": title})
+    return out
+
+
+def specialize_message(msg: dict, board: Board | None) -> dict | None:
+    """Fan-out of one already-built idle/table: content-role boards do not all get the same
+    payload. Other commands, and boards without a content role, are unchanged. A keyboard
+    role is sent the keypad only when a keypad card is in the message."""
+    if not isinstance(msg, dict) or board is None or not displays.is_content_role(board.role):
+        return msg
+    role = displays._fold(board.role)
+    cmd = msg.get("cmd")
+    if cmd == "table":
+        cards = [c for c in (msg.get("cards") or []) if isinstance(c, dict)]
+        kept = [c for c in cards if displays.card_matches_content_role(c, role)]
+        if role == "keyboard":
+            if not kept:
+                return None
+            return message_for_table({"title": msg.get("title", ""), "cards": kept}, board, with_clock=False) or {"cmd": "keypad"}
+        if not kept:
+            return None
+        out = dict(msg)
+        out["cards"] = [{k: v for k, v in c.items() if k not in ("roles", "image", "images", "interval")}
+                        for c in kept]
+        # "fit": true (a long LaunchBox description): as many pages as this display needs
+        out["cards"] = textfit.expand_cards(out["cards"], board)
+        if role == "gallery":
+            # Several pictures in turn: the daemon shows one, waits, shows the next (repeats until
+            # the next content push). Missing files are skipped there; the cards are the fallback.
+            items = gallery_items(kept)
+            if not items:
+                return out
+            title = msg.get("title", "")
+            for it in items:
+                it["title"] = it["title"] or title
+            interval = next((c.get("interval") for c in kept if isinstance(c.get("interval"), (int, float))),
+                            GALLERY_INTERVAL_S)
+            return {"cmd": "gallery", "title": title, "items": items, "interval": float(interval),
+                    "fallback": out}
+        # A card with an "image" path on a picture role becomes a picture (fw 1.5.0); the cards
+        # stay as the text fallback for a missing file, an old board or a failed transfer.
+        pic = next((c["image"] for c in kept if isinstance(c.get("image"), str) and c["image"].strip()), None)
+        if pic and role in IMAGE_ROLES:
+            return {"cmd": "image", "path": pic, "title": msg.get("title", ""), "fallback": out}
+        return out
+    if cmd == "idle":
+        screens = [s for s in (msg.get("screens") or []) if isinstance(s, dict)]
+        kept = [s for s in screens if displays.screen_matches_content_role(s, role)]
+        if role == "keyboard" and kept:
+            return {"cmd": "keypad"}
+        if not kept:
+            return None
+        out = dict(msg)
+        out["screens"] = [{k: v for k, v in s.items() if k != "roles"} for s in kept]
+        return out
+    return msg
 
 
 def idle_cfg_for_board(cfg: dict, board: Board | None, cards_dir: Path, base: Path | None = None) -> dict:
@@ -569,6 +678,9 @@ def idle_cfg_for_board(cfg: dict, board: Board | None, cards_dir: Path, base: Pa
             out["screens"] = [sc for sc in out.get("screens", [])
                               if not isinstance(sc, dict) or not sc.get("roles")
                               or displays.role_listed(board, sc.get("roles"))]
+        if displays.is_content_role(board.role):
+            out["screens"] = [sc for sc in out.get("screens", [])
+                              if displays.screen_matches_content_role(sc, board.role)]
     out.pop("displays", None)
     return out
 
@@ -852,31 +964,47 @@ def daemon_request(obj: dict, timeout: float = 5.0, port: int | None = None) -> 
 def send(port: str, messages: list[dict], timeout: float, quiet: bool) -> bool:
     ok_all = True
     ser = open_serial(port)
+
+    def request(msg: dict, t: float, echo: bool = True) -> dict:
+        line = json.dumps(msg, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ser.write(line.encode("utf-8"))
+        ser.flush()
+        deadline = time.time() + t
+        while time.time() < deadline:
+            raw = ser.readline().decode("utf-8", "replace").strip()
+            if not raw:
+                continue
+            try:
+                resp = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(resp, dict) and "ack" in resp:
+                if msg.get("cmd") == "image" and not images.ack_matches(msg, resp):
+                    continue              # stale answer to a retried picture chunk
+                if echo:
+                    log(f"{port}: {raw}", quiet)
+                return resp
+        return {"ack": msg.get("cmd"), "ok": False, "err": f"no ack within {t}s"}
+
     try:
         time.sleep(0.1)
         ser.reset_input_buffer()
+        board = None
         for msg in messages:
-            line = json.dumps(msg, ensure_ascii=False, separators=(",", ":")) + "\n"
-            ser.write(line.encode("utf-8"))
-            ser.flush()
-            deadline = time.time() + timeout
-            acked = False
-            while time.time() < deadline:
-                raw = ser.readline().decode("utf-8", "replace").strip()
-                if not raw:
-                    continue
-                try:
-                    resp = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if "ack" in resp:
-                    acked = True
-                    log(f"{port}: {raw}", quiet)
-                    ok_all &= bool(resp.get("ok"))
-                    break
-            if not acked:
+            if msg.get("cmd") == "gallery":   # no daemon to rotate it: the first picture only
+                msg = images.gallery_first(msg)
+            if images.is_image_msg(msg):   # picture: fit/encode/chunk here (no daemon to do it)
+                if board is None:
+                    hello = request({"cmd": "hello"}, timeout, echo=False)
+                    board = displays.make_board(port, hello if hello.get("ok") else {})
+                res = images.deliver(lambda m, t: request(m, t, echo=False), msg, board, timeout)
+                log(f"{port}: {images.describe(res)}", quiet)
+                ok_all &= bool(res.get("ok"))
+                continue
+            resp = request(msg, timeout)
+            if "no ack" in str(resp.get("err", "")):
                 log(f"{port}: no ack for cmd={msg.get('cmd')} within {timeout}s", quiet)
-                ok_all = False
+            ok_all &= bool(resp.get("ok"))
     finally:
         ser.close()
     return ok_all
@@ -1073,11 +1201,11 @@ def main(argv=None) -> int:
         data, src, info = find_rom_card(rom, cards_dir, args.system, args.game_name, args.rom_name, default)
         log(f"rom '{info['rom']}' system={info['system'] or '?'} -> {rel_name(src, cards_dir)} ({info['match']})",
             args.quiet)
-        plan.append(lambda b, d=data: build_table_msg(table_for_board(d, b), with_clock=not no_clock))
+        plan.append(lambda b, d=data: message_for_table(d, b, with_clock=not no_clock))
     elif args.table:
         data, src = find_table(args.table, cards_dir, st.default_card)
         log(f"table '{args.table}' -> {src.name if src else '(generated title card)'}", args.quiet)
-        plan.append(lambda b, d=data: build_table_msg(table_for_board(d, b), with_clock=not no_clock))
+        plan.append(lambda b, d=data: message_for_table(d, b, with_clock=not no_clock))
     if not args.assign:
         if args.cal is not None:
             try:

@@ -14,6 +14,7 @@ in parallel, each with the cards for its role (main README, "Multiple displays")
 | Folder | Frontend | OS | Game start / end hook | Boot / daemon |
 |---|---|---|---|---|
 | [`popper/`](popper/POPPER_SETUP.md) | PinUP Popper | Windows | VPX emulator Launch / Close Script | Startup folder or Task Scheduler (main README) |
+| [`launchbox/`](launchbox/README.md) | LaunchBox / Big Box | Windows | Plugin (selection + launch/exit) calling `cyd_launchbox.py` | run `cyd_daemon.py` separately |
 | [`batocera/`](batocera/SETUP.md) | Batocera | Linux (Buildroot) | `/userdata/system/scripts/cyd_game.sh` (`gameStart` / `gameStop`) | service `/userdata/system/services/cyd` (v43+), `custom.sh` (v42 and older) |
 | [`retrobat/`](retrobat/SETUP.md) | RetroBat | Windows | `emulationstation\.emulationstation\scripts\game-start\` / `game-end\` | `scripts\start\` |
 | [`retropie/`](retropie/SETUP.md) | RetroPie | Raspberry Pi OS / Linux | `/opt/retropie/configs/all/runcommand-onstart.sh` / `runcommand-onend.sh` | `/opt/retropie/configs/all/autostart.sh` |

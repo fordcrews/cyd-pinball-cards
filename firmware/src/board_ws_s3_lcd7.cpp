@@ -127,6 +127,8 @@ void HostLink::flush() {
 
 void boardBeginSerial(size_t rxBuf) { hostLink.begin(115200, rxBuf); }
 
+bool boardUsbHostOpen() { return (bool)Serial; }  // HWCDC: true while a host has the native USB port open
+
 // ---------- display / backlight / touch ----------
 void boardSetBacklight(uint8_t v) {
   uint8_t n = v ? (exio | EXIO_BL) : (exio & ~EXIO_BL);
@@ -174,5 +176,9 @@ bool boardReadTouch(TouchSample &t) {
   t.y = tp.y;
   t.z = 1000;  // capacitive: no pressure; treat every sample as a firm press
   return true;
+}
+
+bool boardDrawJpeg(const uint8_t *data, size_t len, int x, int y) {
+  return lcd.drawJpg(data, (uint32_t)len, x, y);  // frame buffer is in PSRAM; JPEG from RAM
 }
 #endif

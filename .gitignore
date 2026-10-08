@@ -19,3 +19,16 @@ Desktop.ini
 
 # Per-cabinet host config (copy config.example.json)
 config.json
+
+# Wi-Fi credentials (copy firmware/wifi.example.json). Never commit SSIDs or passwords.
+firmware/wifi.json
+firmware/src/wifi_secrets.h
+
+# portable .NET SDK used to build the LaunchBox plugin
+.tools/
+frontends/launchbox/plugin/bin/
+frontends/launchbox/plugin/obj/
+
+# daemon cache: weather location, last content per display, night state
+.cyd_cache/
+night-preview/

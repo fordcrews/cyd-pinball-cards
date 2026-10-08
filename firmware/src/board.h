@@ -6,6 +6,8 @@
 //   ws-s3-7   Waveshare ESP32-S3-Touch-LCD-7: 7" 800x480 RGB parallel (LovyanGFX Bus_RGB),
 //             GT911 capacitive touch, CH422G IO expander (backlight on/off, resets),
 //             native USB CDC + CH343 UART port                                      (env: waveshare_s3_lcd7)
+//   cyd35     ESP32-3248S035R (and LCDwiki E32R35T): 3.5" 480x320 ST7796 (TFT_eSPI, SPI), XPT2046
+//             resistive touch on the display's SPI bus (TOUCH_CS 33), backlight GPIO27, CH340 (env: cyd35)
 //
 // The drawing object is called `tft` on both boards (TFT_eSPI and LovyanGFX share the API used here).
 // Layout constants in main.cpp go through S(): 1x on the CYD, 2x on the 800x480 panel.
@@ -37,7 +39,11 @@
 #else
   #include <SPI.h>
   #include <TFT_eSPI.h>
-  #define BOARD_KIND "cyd"
+  #ifdef BOARD_KIND_STR
+    #define BOARD_KIND BOARD_KIND_STR   // "cyd35"
+  #else
+    #define BOARD_KIND "cyd"
+  #endif
   #define UI_SCALE 1
   #define TOUCH_CAPACITIVE 0
   #define BACKLIGHT_DIMMABLE 1
@@ -60,3 +66,7 @@ void boardInitDisplay(uint8_t rotation, uint8_t brightness); // panel, backlight
 void boardSetBacklight(uint8_t v);       // 0-255 (on/off only when BACKLIGHT_DIMMABLE == 0)
 void boardSetRotation(uint8_t rotation); // protocol rotation: 0/2 portrait, 1/3 landscape (both boards)
 bool boardReadTouch(TouchSample &t);     // true while touched; raw values only (CYD maps them in main.cpp)
+bool boardUsbHostOpen();             // true only when a native USB CDC host has the port open (false on UART-bridge CYDs)
+// Decode a baseline JPEG from RAM and draw it with its top-left corner at x,y (clipped to the
+// screen). CYD: TJpg_Decoder (MCU blocks pushed to TFT_eSPI); 7": LovyanGFX drawJpg.
+bool boardDrawJpeg(const uint8_t *data, size_t len, int x, int y);

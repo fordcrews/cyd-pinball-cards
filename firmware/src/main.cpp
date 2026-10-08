@@ -4,6 +4,7 @@
 // serial ports) is in board.h / board_cyd.cpp / board_ws_s3_lcd7.cpp; this file is shared.
 //
 // Serial protocol (115200 baud, newline-delimited JSON, one object per line):
+// Wi-Fi uses the same lines on one TCP session (see wifi_link.cpp). USB wins while the host is on USB.
 //   {"cmd":"table","title":"Medieval Madness","ts":<local epoch s, optional>,"cards":[{"type":"instructions","title":"Rules","text":"..."}, ...]}
 //   {"cmd":"idle"}        bare idle: attract playlist using the saved (or built-in default) idle config
 //   {"cmd":"idle","ts":<local epoch s>,"cabinet":"Crews Pinball","screens":[...],"selected":"Table"}
@@ -22,22 +23,40 @@
 //   {"cmd":"cal","reset":true}  |  {"cmd":"cal","debug":true|false}      touch calibration values
 //   {"cmd":"calibrate"}   on-device 4-point touch calibration (tap the crosshairs)
 //                         (capacitive GT911 board: cal/calibrate are no-ops that report "touch":"capacitive")
+//   {"cmd":"image","op":"begin","size":N,"w":W,"h":H,"crc":CRC32[,"chunks":K][,"title":"Joust"]}
+//   {"cmd":"image","op":"chunk","seq":0,"data":"<base64>"}   ... one ack each ({"ack":"image","ok":true,"seq":0})
+//   {"cmd":"image","op":"end"}     check size + CRC-32, decode the baseline JPEG, draw it centred
+//                         (title strip along the bottom when "title" was given). The host has already
+//                         fitted the picture to this screen (host/images.py); hello reports w, h,
+//                         img_max (largest JPEG accepted) and strip (title strip height).
+//   {"cmd":"image","op":"show"[,"crc":C]}   redraw the picture still held in RAM  |  {"cmd":"image","op":"abort"}
+//   {"cmd":"hb"}          (fw 1.6.0) cabinet heartbeat on a Wi-Fi session; ack carries the link counters.
+//                         Arms the 90 s silence drop for that session (see wifi_link.h).
+//   {"cmd":"selftest","op":"drop"}   close the Wi-Fi session (the board dials again)
+//   {"cmd":"selftest","op":"hang","confirm":"hang"}   stop feeding the loop watchdog: reboots in ~30 s
+// fw 1.6.0: ping/hello/ready also report "hb" (silence timeout s), "up", "reset", "sessions",
+// "silence_drops", "wifi_lost", "rejoins", "rssi". The main loop runs under a 30 s task watchdog.
 // Events (device -> host, unsolicited):
 //   {"evt":"key","key":"alt+f4"[,"mods":["ctrl","shift","alt","win"]]}   keypad button released
 //   {"evt":"keypad","state":"on"|"off","source":"touch"}   keypad opened (long-press) / EXIT tapped
 //   {"evt":"cal","ok":true,"x_min":..,...}   calibration finished (or "ok":false,"err":...)
+//   {"evt":"touch","x":..,"y":..}   a tap that is not a keypad key (host shows the keypad on this board)
 //   {"evt":"touch","raw_x":..,"raw_y":..,"x":..,"y":..}   only while cal debug is on
 // Replies: {"ack":"<cmd>","ok":true[, ...]} or {"ack":"<cmd>","ok":false,"err":"..."}
-// Boot line: {"ready":true,"device":"cyd-pinball-cards","fw":"1.4.0","board":"cyd","id":"cyd-a1b2c3","name":"","role":""}
+// Boot line: {"ready":true,"device":"cyd-pinball-cards","fw":"1.6.0","board":"cyd","id":"cyd-a1b2c3","name":"","role":"",
+//             "w":320,"h":240,"img_max":49152,"strip":24,...}
 //
 // "ts" is the host's LOCAL wall-clock time as seconds since 1970-01-01 00:00 (i.e. local time
 // encoded as if it were UTC). The ESP32 has no RTC, so the clock only runs after a host sent it,
 // and it is advanced locally with millis().
 
+#include <esp_task_wdt.h>
 #include <Arduino.h>
 #include "board.h"
+#include "wifi_link.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include "mbedtls/base64.h"
 
 #ifndef CYD_ROTATION
 #define CYD_ROTATION 1
@@ -67,6 +86,15 @@
 #ifndef TOUCH_Y_MAX
 #define TOUCH_Y_MAX 3800
 #endif
+// Native landscape size of the panel (resistive touch + calibration work in this space):
+// 320x240 on the 2.8" CYD, 480x320 on the 3.5" ESP32-3248S035 (env cyd35).
+#if defined(TFT_WIDTH) && defined(TFT_HEIGHT)
+#define NATIVE_LW (TFT_WIDTH > TFT_HEIGHT ? TFT_WIDTH : TFT_HEIGHT)
+#define NATIVE_LH (TFT_WIDTH > TFT_HEIGHT ? TFT_HEIGHT : TFT_WIDTH)
+#else
+#define NATIVE_LW 320
+#define NATIVE_LH 240
+#endif
 // Hold a finger on the idle/card screen this long to open the keypad (0 = disabled)
 #ifndef LONGPRESS_KEYPAD_MS
 #define LONGPRESS_KEYPAD_MS 2000
@@ -76,7 +104,10 @@
 #define IDENTIFY_MS 5000
 #endif
 
-#define FW_VERSION "1.4.0"
+#define FW_VERSION "1.6.0"
+#ifndef LOOP_WDT_S
+#define LOOP_WDT_S 30         // task watchdog on the main loop: a hang reboots the board
+#endif
 #define MAX_CARDS 8
 #define MAX_IDLE_SCREENS 12
 #define MAX_LINE 6144         // longest accepted JSON line (bytes)
@@ -1000,8 +1031,95 @@ void idleTick(unsigned long now) {
   }
 }
 
+// ---------- Pictures (fw 1.5.0) ----------
+// The host fits the picture to this screen and sends a small baseline JPEG as base64 chunks, one
+// ack each (host/images.py). The JPEG stays in RAM so an overlay (keypad, identify) or a rotation
+// can redraw it; a table or idle push frees it. No PSRAM on the CYD: the buffer is capped and a
+// heap reserve is kept for Wi-Fi, JSON and the decoder.
+#define IMG_STRIP_H S(24)
+#if defined(BOARD_HAS_PSRAM)
+#define IMG_MAX_BYTES (256 * 1024)
+#define IMG_HEAP_RESERVE 0
+#else
+#define IMG_MAX_BYTES (48 * 1024)
+#define IMG_HEAP_RESERVE (28 * 1024)
+#endif
+
+struct Picture {
+  uint8_t *buf = nullptr;
+  size_t size = 0, got = 0;
+  int seq = 0;
+  uint32_t crc = 0;
+  int w = 0, h = 0;
+  String title;
+  bool complete = false;  // buf holds a whole, CRC-checked JPEG
+  bool showing = false;   // the picture is the current content (instead of cards / idle)
+  unsigned long drawMs = 0;
+} pic;
+
+void pictureFree() {
+  if (pic.buf) free(pic.buf);
+  pic = Picture();
+}
+
+size_t pictureMax() {
+#if defined(BOARD_HAS_PSRAM)
+  return IMG_MAX_BYTES;
+#else
+  size_t blk = ESP.getMaxAllocHeap();
+  size_t m = blk > IMG_HEAP_RESERVE ? blk - IMG_HEAP_RESERVE : 0;
+  return m < IMG_MAX_BYTES ? m : IMG_MAX_BYTES;
+#endif
+}
+
+uint8_t *pictureAlloc(size_t n) {
+#if defined(BOARD_HAS_PSRAM)
+  uint8_t *p = (uint8_t *)heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (p) return p;
+#endif
+  return (uint8_t *)malloc(n);
+}
+
+uint32_t crc32Of(const uint8_t *p, size_t n) {  // same as zlib.crc32
+  uint32_t c = 0xFFFFFFFFu;
+  while (n--) {
+    c ^= *p++;
+    for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+  }
+  return ~c;
+}
+
+bool drawPicture() {
+  int W = tft.width(), H = tft.height();
+  bool strip = pic.title.length() > 0;
+  int areaH = strip ? H - IMG_STRIP_H : H;
+  tft.fillScreen(COL_BG);
+  int x = (W - pic.w) / 2, y = (areaH - pic.h) / 2;
+  if (x < 0) x = 0;
+  if (y < 0) y = 0;
+  unsigned long t0 = millis();
+  bool ok = pic.buf && pic.complete && boardDrawJpeg(pic.buf, pic.size, x, y);
+  pic.drawMs = millis() - t0;
+  if (strip) {
+    tft.fillRect(0, H - IMG_STRIP_H, W, IMG_STRIP_H, COL_DARK);
+    tft.drawFastHLine(0, H - IMG_STRIP_H, W, COL_ACCENT);
+    useFont(F_SB9);
+    tft.setTextColor(COL_TEXT, COL_DARK);
+    tft.setTextDatum(MC_DATUM);
+    String t = pic.title;
+    while (t.length() > 1 && tft.textWidth(t) > W - S(12)) t.remove(t.length() - 1);
+    tft.drawString(t, W / 2, H - IMG_STRIP_H / 2 + 1);
+    tft.setTextDatum(TL_DATUM);
+  }
+  return ok;
+}
+
 // ---------- Cards ----------
 void drawCard() {
+  if (pic.showing && pic.complete) {
+    drawPicture();
+    return;
+  }
   if (st.idle || st.cardCount == 0) {
     idleStart();
     return;
@@ -1167,24 +1285,25 @@ void saveCal() {
 }
 
 // Touch is always read in the controller's native orientation (XPT2046 lib rotation 1 = landscape,
-// which matches the CYD panel). Raw -> 320x240 landscape via the calibration, then rotated to the
-// current display rotation using the same transforms the XPT2046 library applies.
+// which matches the CYD panel). Raw -> native landscape (NATIVE_LW x NATIVE_LH) via the calibration,
+// then rotated to the current display rotation using the same transforms the XPT2046 library applies.
 void touchToScreen(int rx, int ry, int &sx, int &sy) {
-  int lx = (int32_t)(rx - tcal.xMin) * 320 / (tcal.xMax - tcal.xMin);
-  int ly = (int32_t)(ry - tcal.yMin) * 240 / (tcal.yMax - tcal.yMin);
-  lx = constrain(lx, 0, 319);
-  ly = constrain(ly, 0, 239);
+  const int LW = NATIVE_LW, LH = NATIVE_LH;
+  int lx = (int32_t)(rx - tcal.xMin) * LW / (tcal.xMax - tcal.xMin);
+  int ly = (int32_t)(ry - tcal.yMin) * LH / (tcal.yMax - tcal.yMin);
+  lx = constrain(lx, 0, LW - 1);
+  ly = constrain(ly, 0, LH - 1);
   switch (st.rotation & 3) {
     case 1: sx = lx; sy = ly; break;
-    case 3: sx = 319 - lx; sy = 239 - ly; break;
-    case 0: sx = 239 - ly; sy = lx; break;
-    default: sx = ly; sy = 319 - lx; break;
+    case 3: sx = LW - 1 - lx; sy = LH - 1 - ly; break;
+    case 0: sx = LH - 1 - ly; sy = lx; break;
+    default: sx = ly; sy = LW - 1 - lx; break;
   }
 }
 
 void emitLine(JsonDocument &d) {
-  serializeJson(d, HOST);
-  HOST.println();
+  serializeJson(d, linkOut());
+  linkOut().println();
 }
 
 // ---------- Keypad (touch mini-keyboard) ----------
@@ -1553,7 +1672,7 @@ void kpTick(unsigned long now) {
 }
 
 // ---------- On-device touch calibration ----------
-static const int16_t CAL_PTS[4][2] = {{20, 20}, {299, 20}, {299, 219}, {20, 219}};
+static const int16_t CAL_PTS[4][2] = {{20, 20}, {NATIVE_LW - 21, 20}, {NATIVE_LW - 21, NATIVE_LH - 21}, {20, NATIVE_LH - 21}};
 struct CalRun {
   uint8_t step = 0;
   int32_t rx[4], ry[4];
@@ -1565,12 +1684,12 @@ void calDrawTarget() {
   tft.setTextColor(COL_TEXT);
   tft.setTextDatum(MC_DATUM);
   useFont(F_SB12);
-  tft.drawString("TOUCH CALIBRATION", 160, 90);
+  tft.drawString("TOUCH CALIBRATION", NATIVE_LW / 2, NATIVE_LH / 2 - 30);
   useFont(F_S9);
   tft.setTextColor(COL_ACCENT);
-  tft.drawString("Tap the centre of the cross (" + String(cal.step + 1) + "/4)", 160, 125);
+  tft.drawString("Tap the centre of the cross (" + String(cal.step + 1) + "/4)", NATIVE_LW / 2, NATIVE_LH / 2 + 5);
   tft.setTextColor(COL_DIM);
-  tft.drawString("use a stylus or fingernail", 160, 150);
+  tft.drawString("use a stylus or fingernail", NATIVE_LW / 2, NATIVE_LH / 2 + 30);
   tft.setTextDatum(TL_DATUM);
   int x = CAL_PTS[cal.step][0], y = CAL_PTS[cal.step][1];
   tft.drawFastHLine(x - 14, y, 29, COL_RED);
@@ -1598,7 +1717,7 @@ void calEnd(bool ok, const char *err) {
   tft.setTextDatum(MC_DATUM);
   useFont(F_SB12);
   tft.setTextColor(ok ? COL_GREEN : COL_RED);
-  tft.drawString(ok ? "CALIBRATED" : "CALIBRATION FAILED", 160, 110);
+  tft.drawString(ok ? "CALIBRATED" : "CALIBRATION FAILED", NATIVE_LW / 2, NATIVE_LH / 2 - 10);
   tft.setTextDatum(TL_DATUM);
   delay(1200);
   boardSetRotation(st.rotation);
@@ -1620,9 +1739,9 @@ void calSample(int32_t rx, int32_t ry) {
   float kx = (xr - xl) / (CAL_PTS[1][0] - CAL_PTS[0][0]), ky = (yb - yt) / (CAL_PTS[2][1] - CAL_PTS[1][1]);
   TouchCal c;
   c.xMin = (int16_t)lroundf(xl - CAL_PTS[0][0] * kx);
-  c.xMax = (int16_t)lroundf(c.xMin + 320 * kx);
+  c.xMax = (int16_t)lroundf(c.xMin + NATIVE_LW * kx);
   c.yMin = (int16_t)lroundf(yt - CAL_PTS[0][1] * ky);
-  c.yMax = (int16_t)lroundf(c.yMin + 240 * ky);
+  c.yMax = (int16_t)lroundf(c.yMin + NATIVE_LH * ky);
   if (!calValid(c)) { calEnd(false, "implausible readings (axes swapped or missed a target?)"); return; }
   tcal = c;
   saveCal();
@@ -1740,12 +1859,16 @@ bool applyIdentity(JsonDocument &doc, bool allowId, String &err) {
 }
 
 void addIdentity(JsonDocument &r) {
-  r["board"] = BOARD_KIND;  // fw 1.4.0: "cyd" | "ws-s3-7"
+  r["board"] = BOARD_KIND;  // fw 1.4.0: "cyd" | "ws-s3-7"; "cyd35" = 3.5" ESP32-3248S035
   r["id"] = boardId();
   r["name"] = ident.name;
   r["role"] = ident.role;
   r["rotation"] = st.rotation;
   r["keypad"] = ident.keypad;
+  r["w"] = tft.width();      // fw 1.5.0: screen size in this rotation, for host-side picture fitting
+  r["h"] = tft.height();
+  r["img_max"] = (uint32_t)pictureMax();
+  r["strip"] = IMG_STRIP_H;
 }
 
 // ---------- Serial ----------
@@ -1755,8 +1878,8 @@ void reply(const char *cmd, bool ok, const char *err = nullptr, const char *extr
   r["ok"] = ok;
   if (err) r["err"] = err;
   if (extraKey) r[extraKey] = extraVal;
-  serializeJson(r, HOST);
-  HOST.println();
+  serializeJson(r, linkOut());
+  linkOut().println();
 }
 
 // Leave keypad / calibration screens (a table or idle push always wins).
@@ -1777,7 +1900,86 @@ const char *modeName() {
   if (ui == UI_KEYPAD) return "keypad";
   if (ui == UI_CAL) return "calibrate";
   if (ui == UI_IDENT) return "identify";
+  if (pic.showing) return "image";
   return st.idle ? "idle" : "table";
+}
+
+void handleImage(JsonDocument &doc) {
+  const char *op = doc["op"] | "";
+  JsonDocument r;
+  r["ack"] = "image";
+  r["op"] = op;
+  bool ok = false;
+  const char *err = nullptr;
+  if (!strcmp(op, "begin")) {
+    size_t size = doc["size"] | 0;
+    pictureFree();  // one buffer: the old picture goes first (it matters on the no-PSRAM CYD)
+    size_t mx = pictureMax();
+    r["max"] = mx;
+    if (!size) err = "size missing";
+    else if (size > mx) err = "too big";
+    else if (!(pic.buf = pictureAlloc(size))) err = "out of memory";
+    else {
+      pic.size = size;
+      pic.crc = doc["crc"] | 0;
+      pic.w = doc["w"] | 0;
+      pic.h = doc["h"] | 0;
+      pic.title = cleanText(doc["title"] | "", 80, false);
+      ok = true;
+    }
+  } else if (!strcmp(op, "chunk")) {
+    int seq = doc["seq"] | -1;
+    const char *data = doc["data"] | "";
+    r["seq"] = seq;
+    if (!pic.buf || pic.complete) err = "no transfer";
+    else if (seq >= 0 && seq == pic.seq - 1) ok = true;  // repeat of the last chunk (lost ack): already stored
+    else if (seq != pic.seq) { err = "out of order"; r["want"] = pic.seq; }
+    else {
+      size_t olen = 0;
+      int rc = mbedtls_base64_decode(pic.buf + pic.got, pic.size - pic.got, &olen,
+                                     (const unsigned char *)data, strlen(data));
+      if (rc) err = "bad base64 or more data than size";
+      else {
+        pic.got += olen;
+        pic.seq++;
+        ok = true;
+      }
+    }
+    r["got"] = (uint32_t)pic.got;
+  } else if (!strcmp(op, "end")) {
+    if (!pic.buf || pic.got != pic.size) { err = "incomplete"; r["got"] = (uint32_t)pic.got; }
+    else if (pic.crc && crc32Of(pic.buf, pic.size) != pic.crc) err = "crc mismatch";
+    else {
+      pic.complete = true;
+      leaveOverlay();  // like a table push, a new picture wins over keypad / identify
+      pic.showing = true;
+      if (drawPicture()) {
+        ok = true;
+        r["ms"] = (uint32_t)pic.drawMs;
+        r["bytes"] = (uint32_t)pic.size;
+      } else {
+        err = "jpeg decode failed";
+        pictureFree();
+        drawCard();  // back to what was there before
+      }
+    }
+  } else if (!strcmp(op, "show")) {
+    uint32_t crc = doc["crc"] | 0;
+    if (pic.complete && pic.buf && (!crc || crc == pic.crc)) {
+      leaveOverlay();
+      pic.showing = true;
+      ok = drawPicture();
+      if (!ok) err = "jpeg decode failed";
+    } else err = "no such picture";
+  } else if (!strcmp(op, "abort")) {
+    if (!pic.complete) pictureFree();
+    ok = true;
+  } else {
+    err = "unknown op";
+  }
+  r["ok"] = ok;
+  if (err) r["err"] = err;
+  emitLine(r);
 }
 
 void replyCal(const char *ack) {
@@ -1800,6 +2002,7 @@ void handleLine(const String &line) {
   if (!strcmp(cmd, "table")) {
     if (doc["ts"].is<uint32_t>()) setClock(doc["ts"].as<uint32_t>());
     leaveOverlay();
+    pictureFree();
     loadTableFromDoc(doc);
     lastTitle = st.tableTitle;
     lastTs = clockValid ? clockNow() : 0;
@@ -1826,6 +2029,7 @@ void handleLine(const String &line) {
       prefs.end();
     }
     leaveOverlay();
+    pictureFree();
     st.idle = true;
     saveIdle(true);
     drawCard();
@@ -1834,8 +2038,8 @@ void handleLine(const String &line) {
     r["ok"] = true;
     r["screens"] = icfg.count;
     r["clock"] = clockValid;
-    serializeJson(r, HOST);
-    HOST.println();
+    serializeJson(r, linkOut());
+    linkOut().println();
   } else if (!strcmp(cmd, "brightness")) {
     int v = doc["value"] | -1;
     if (v < 0 || v > 255) { reply("brightness", false, "value must be 0-255"); return; }
@@ -1877,7 +2081,28 @@ void handleLine(const String &line) {
     r["device"] = "cyd-pinball-cards";
     r["mode"] = modeName();
     addIdentity(r);
+    linkStatus(r);
     emitLine(r);
+  } else if (!strcmp(cmd, "hb")) {
+    linkHeartbeat();
+    JsonDocument r;
+    r["ack"] = "hb";
+    r["ok"] = true;
+    linkStatus(r);
+    emitLine(r);
+  } else if (!strcmp(cmd, "selftest")) {
+    const char *op = doc["op"] | "";
+    if (!strcmp(op, "drop")) {
+      reply("selftest", true);
+      linkDropForTest();
+    } else if (!strcmp(op, "hang") && !strcmp(doc["confirm"] | "", "hang")) {
+      reply("selftest", true);
+      unsigned long t0 = millis();
+      while (millis() - t0 < (LOOP_WDT_S + 30) * 1000UL) delay(50);   // watchdog fires first
+      ESP.restart();   // watchdog did not fire: restart anyway
+    } else {
+      reply("selftest", false, "op must be drop | hang (with confirm)");
+    }
   } else if (!strcmp(cmd, "identify")) {
     if (ui == UI_CAL) { reply("identify", false, "calibrating"); return; }
     int secs = doc["secs"] | (IDENTIFY_MS / 1000);
@@ -1953,6 +2178,8 @@ void handleLine(const String &line) {
       saveCal();
     }
     replyCal("cal");
+  } else if (!strcmp(cmd, "image")) {
+    handleImage(doc);
   } else if (!strcmp(cmd, "calibrate")) {
 #if TOUCH_CAPACITIVE
     JsonDocument r;
@@ -1975,8 +2202,18 @@ void handleLine(const String &line) {
 }
 
 void pollSerial() {
-  while (HOST.available()) {
-    char ch = (char)HOST.read();
+  if (linkSessionChanged()) {
+    rxLine = "";
+    rxOverflow = false;
+  }
+  while (linkAvailable()) {
+    int got = linkRead();
+    if (got < 0) break;
+    if (linkSessionChanged()) {
+      rxLine = "";
+      rxOverflow = false;
+    }
+    char ch = (char)got;
     if (ch == '\r') continue;
     if (ch == '\n') {
       if (rxOverflow) {
@@ -1995,8 +2232,9 @@ void pollSerial() {
 
 // ---------- Touch ----------
 // A small gesture layer: press / hold / release with screen coordinates.
-//   idle + cards: tap (on release) = next card/screen; hold LONGPRESS_KEYPAD_MS = open keypad
-//   keypad: press highlights a key, release on it sends it; horizontal swipe = page change
+//   idle + cards: tap (on release) reports evt touch (host shows the keypad); hold = open keypad
+//   keypad: any touch reports evt touch (host keeps the keypad up); press highlights a key,
+//           release on it sends it; horizontal swipe = page change
 //   calibrate: the averaged raw position of each press is one calibration sample
 struct TouchState {
   bool down = false, consumed = false;
@@ -2006,6 +2244,14 @@ struct TouchState {
 } tch;
 unsigned long lastTapMs = 0;
 
+void emitTouch(int x, int y) {
+  JsonDocument e;
+  e["evt"] = "touch";
+  e["x"] = x;
+  e["y"] = y;
+  emitLine(e);
+}
+
 void onTouchDown() {
   if (ui == UI_IDENT) {  // a tap closes the identify label; the rest of this touch is ignored
     tch.consumed = true;
@@ -2013,6 +2259,7 @@ void onTouchDown() {
     return;
   }
   if (ui == UI_KEYPAD) {
+    emitTouch(tch.x0, tch.y0);  // key, miss, or swipe: host resets the return timer
     kpPressed = kpHit(tch.x0, tch.y0);
     if (kpPressed >= 0) kpDrawKey(kpPressed, true);
   }
@@ -2057,8 +2304,7 @@ void onTouchUp(unsigned long now) {
   }
   if (!tch.consumed && now - lastTapMs > 150) {
     lastTapMs = now;
-    nextCard();
-    lastRotate = now;  // restart auto-rotate timer after manual tap
+    emitTouch(tch.x, tch.y);  // not a keypad key; the host pushes the keypad to this board
   }
 }
 
@@ -2097,9 +2343,23 @@ void pollTouch() {
 }
 
 // ---------- Setup / loop ----------
+void sendReadyLine() {
+  JsonDocument r;
+  r["ready"] = true;
+  r["device"] = "cyd-pinball-cards";
+  r["fw"] = FW_VERSION;
+  addIdentity(r);
+  linkStatus(r);
+  emitLine(r);
+}
+
 void setup() {
+  esp_task_wdt_init(LOOP_WDT_S, true);   // panic + reboot when the loop stops feeding it
+  esp_task_wdt_add(NULL);
   // Big RX ring buffer (set before begin): a full 6 KB line can arrive while a screen is drawn
   boardBeginSerial(RX_BUFFER);
+  linkBegin();
+  linkOnWifiSession(sendReadyLine);
   rxLine.reserve(1024);
   randomSeed(esp_random());
 
@@ -2146,6 +2406,7 @@ void setup() {
   // Display, backlight and touch controller (board.h): CYD = PWM backlight, TFT_eSPI, XPT2046;
   // Waveshare 7" = CH422G resets + backlight switch, LovyanGFX RGB panel, GT911
   boardInitDisplay(st.rotation, st.brightness);
+  esp_task_wdt_reset();
 
   if (!wasIdle && last.length()) {
     JsonDocument doc;
@@ -2157,15 +2418,12 @@ void setup() {
   tableStartMs = millis();
   drawCard();
   lastRotate = millis();
-  JsonDocument r;
-  r["ready"] = true;
-  r["device"] = "cyd-pinball-cards";
-  r["fw"] = FW_VERSION;
-  addIdentity(r);
-  emitLine(r);
+  sendReadyLine();
 }
 
 void loop() {
+  esp_task_wdt_reset();
+  linkPoll();
   pollSerial();
   pollTouch();
   unsigned long now = millis();
@@ -2175,6 +2433,8 @@ void loop() {
     calTick(now);
   } else if (ui == UI_IDENT) {
     if ((long)(now - identUntil) >= 0) endIdentify();
+  } else if (pic.showing) {
+    // a still picture: nothing to animate or rotate
   } else if (!st.idle) {
     if (st.cardCount > 1 && CARD_ROTATE_MS > 0 && now - lastRotate >= CARD_ROTATE_MS) {
       lastRotate = now;

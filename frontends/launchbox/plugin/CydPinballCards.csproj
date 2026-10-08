@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>CydPinballCards</AssemblyName>
+    <RootNamespace>CydPinballCards</RootNamespace>
+    <OutputType>Library</OutputType>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <!-- Your LaunchBox folder. install.ps1 / build.ps1 pass it; or: dotnet build -p:LaunchBoxDir=D:\LaunchBox -->
+    <LaunchBoxDir Condition="'$(LaunchBoxDir)' == ''">$(USERPROFILE)\LaunchBox</LaunchBoxDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Unbroken.LaunchBox.Plugins">
+      <HintPath>$(LaunchBoxDir)\Core\Unbroken.LaunchBox.Plugins.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

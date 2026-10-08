@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to firmware/wifi.json (gitignored). ssid and pass are the display Wi-Fi. Leave host empty to follow the cabinet UDP beacon on port 47311; set host and port to skip the beacon.",
+  "ssid": "",
+  "pass": "",
+  "host": "",
+  "port": 47311
+}

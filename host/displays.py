@@ -8,6 +8,11 @@ tested with 5 simulated boards; there is no hard limit in the code).
   the id "port:<port name>" (e.g. port:COM5, port:ttyUSB0) and the role "all".
 * config.json "displays" maps board ids (or "port:COM5" for old firmware) to name / role /
   rotation / keypad / idle_config, so the identity can also live on the host. Host config wins.
+* Content roles (config.json displays[id].role): control_panel, howtoplay, picture,
+  pictureboxart, videoofplay, gallery, keyboard. Those boards get only the matching card or idle
+  screen. gallery rotates box art, gameplay screenshot and a video still (the daemon does it).
+  keyboard gets the keypad only when a keypad card is in the content. Other roles
+  (left, right, top, ...) are unchanged.
 * Targeting (--target): "all" (default), or a comma list of roles, names, ids or ports.
 * Direct fan-out (no daemon): every port is opened in its own thread, pinged for its identity,
   sent its own messages, and closed again, so all boards update in parallel.
@@ -34,10 +39,66 @@ KNOWN_VID_PID = {
     (0x1A86, 0x55D3): "CH343",
 }
 # Board types reported by firmware >= 1.4.0 in ping/hello/ready ("board"); older firmware = CYD
-BOARD_TYPES = {"cyd": "ESP32-2432S028R (CYD) 320x240", "ws-s3-7": "Waveshare ESP32-S3-Touch-LCD-7 800x480"}
+BOARD_TYPES = {"cyd": "ESP32-2432S028R (CYD) 320x240", "cyd35": "ESP32-3248S035R (3.5\" CYD) 480x320",
+               "ws-s3-7": "Waveshare ESP32-S3-Touch-LCD-7 800x480"}
 BAUD = 115200
 GENERIC_ROLES = {"", "all", "*", "any"}   # a board with one of these roles gets the generic content
 TESTED_MAX_DISPLAYS = 5
+# Assignable content roles for config.json "displays"[board id].role (name is free text).
+# A board with one of these shows only the matching card or idle screen, not the whole playlist.
+# keyboard gets the keypad only when that content includes a keypad card.
+# Any other role (left, right, top, ...) is unchanged.
+CONTENT_ROLES = (
+    "control_panel",   # control-panel photo, or a controls card
+    "howtoplay",       # how to play
+    "picture",         # a still picture
+    "pictureboxart",   # box art
+    "videoofplay",     # a video of play
+    "gallery",         # box art, gameplay screenshot, video still in turn (about 9 s each)
+    "keyboard",        # touch keypad, when a keypad card is in the content
+)
+CONTENT_ROLE_TYPES = {
+    "control_panel": frozenset({"controls", "buttons", "control", "control_panel", "cpanel"}),
+    "howtoplay": frozenset({"instructions", "howto", "howtoplay", "how_to_play", "rules"}),
+    "picture": frozenset({"picture", "image", "photo"}),
+    "pictureboxart": frozenset({"pictureboxart", "boxart", "box_art", "flyer"}),
+    "videoofplay": frozenset({"video", "videoofplay", "video_of_play"}),
+    "gallery": frozenset({"gallery", "slideshow"}),
+    "keyboard": frozenset({"keyboard", "keypad"}),
+}
+
+
+def is_content_role(role) -> bool:
+    return _fold(role) in CONTENT_ROLE_TYPES
+
+
+def _listed_for_role(roles, role: str) -> bool:
+    toks = _tokens(roles)
+    if not toks:
+        return False
+    if any(t in ("all", "*", "any") for t in toks):
+        return True
+    return role in toks
+
+
+def _matches_content_role(item, role) -> bool:
+    """An explicit roles list wins. Otherwise the card/screen type picks the content role."""
+    if not isinstance(item, dict) or not is_content_role(role):
+        return False
+    role = _fold(role)
+    if item.get("roles"):
+        return _listed_for_role(item.get("roles"), role)
+    return _fold(item.get("type")) in CONTENT_ROLE_TYPES[role]
+
+
+def card_matches_content_role(card, role) -> bool:
+    """Raw or built card belongs on a board whose role is one of CONTENT_ROLES."""
+    return _matches_content_role(card, role)
+
+
+def screen_matches_content_role(screen, role) -> bool:
+    """Idle screen belongs on a content-role board."""
+    return _matches_content_role(screen, role)
 
 
 def port_name(port: str) -> str:
@@ -67,6 +128,11 @@ class Board:
     board_name: str = ""          # as stored on the board
     board_role: str = ""
     hw: str = ""                  # board type from firmware >= 1.4.0: "cyd" | "ws-s3-7" ("" = older fw)
+    w: int = 0                    # screen size in the current rotation (firmware >= 1.5.0; 0 = unknown)
+    h: int = 0
+    img_max: int = 0              # largest JPEG the board accepts (firmware >= 1.5.0; 0 = no images)
+    strip: int = -1               # height of the image title strip in pixels (-1 = unknown)
+    hb: int = 0                   # fw >= 1.6.0: takes {"cmd":"hb"}; drops a Wi-Fi session silent this many s
     configured: bool = False      # a config.json "displays" entry applies
     cfg: dict = field(default_factory=dict)
 
@@ -100,6 +166,9 @@ def identity_from_reply(reply: dict | None, port: str) -> dict:
     out["id"] = bid or legacy_id(port)
     rot = reply.get("rotation")
     out["rotation"] = int(rot) if isinstance(rot, int) else None
+    for k, default in (("w", 0), ("h", 0), ("img_max", 0), ("strip", -1), ("hb", 0)):
+        v = reply.get(k)
+        out[k] = int(v) if isinstance(v, int) and not isinstance(v, bool) else default
     return out
 
 
@@ -124,6 +193,7 @@ def make_board(port: str, reply: dict | None, displays: dict | None = None) -> B
     return Board(port=port, id=ident["id"], name=name, role=role, fw=ident["fw"], mode=ident["mode"],
                  keypad=keypad, rotation=ident["rotation"], legacy=ident["legacy"],
                  board_name=ident["board_name"], board_role=ident["board_role"], hw=ident["hw"],
+                 w=ident["w"], h=ident["h"], img_max=ident["img_max"], strip=ident["strip"], hb=ident["hb"],
                  configured=bool(cfg), cfg=cfg)
 
 
