@@ -7,7 +7,9 @@ return to the idle playlist.
 
 ## What you need
 
-* LaunchBox install (this machine: `C:\Users\fcrews\LaunchBox`, v14.0.1)
+* LaunchBox 14 (developed on 14.0.1). The installer looks in `%USERPROFILE%\LaunchBox`,
+  `C:\LaunchBox`, `D:\LaunchBox`, `E:\LaunchBox` and `%LAUNCHBOX_HOME%`; pass `-LaunchBox <folder>` otherwise
+* Python 3 with `pip install -r host\requirements.txt` (Pillow is needed for pictures)
 * `cyd_daemon.py` running (listens on `127.0.0.1:47291` and Wi-Fi `47311`)
 * Boards assigned roles in `config.json` (`gallery`, `control_panel`, `howtoplay`, `picture`,
   `pictureboxart`, `videoofplay`, `keyboard`)
@@ -32,11 +34,12 @@ hand from this kit; paste snippets in the LaunchBox UI if you use that path.
 
 ## Install (reversible)
 
-From the repo (wifi-displays branch), with the portable SDK under `.tools\dotnet` or
-any .NET 10 SDK:
+From the repo, with any .NET 10 SDK on PATH ([download](https://dotnet.microsoft.com/download/dotnet/10.0);
+the SDK, not just the runtime) or a portable one unpacked under `.tools\dotnet`:
 
 ```bat
-frontends\launchbox\install.ps1
+powershell -ExecutionPolicy Bypass -File frontends\launchbox\install.ps1
+powershell -ExecutionPolicy Bypass -File frontends\launchbox\install.ps1 -LaunchBox D:\LaunchBox
 ```
 
 What it does:
@@ -119,7 +122,7 @@ If the plugin cannot load, call the CLI from an emulator’s **Running AutoHotke
 (adjust paths):
 
 ```ahk
-Run, pythonw "C:\Users\fcrews\projects\cyd-pinball-cards\frontends\launchbox\cyd_launchbox.py" --title "%1" --platform "Arcade" --resolve-media --launch -q,, Hide
+Run, pythonw "C:\path\to\cyd-pinball-cards\frontends\launchbox\cyd_launchbox.py" --title "%1" --platform "Arcade" --resolve-media --launch -q,, Hide
 ```
 
 LaunchBox variable names differ by version; prefer the plugin. Selection will not update

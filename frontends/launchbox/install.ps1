@@ -1,13 +1,20 @@
 # Build and install the CydPinballCards LaunchBox plugin (reversible).
 # Does not edit LaunchBox XML, does not delete files, does not close LaunchBox.
+#   powershell -ExecutionPolicy Bypass -File frontends\launchbox\install.ps1 [-LaunchBox D:\LaunchBox]
+param([string]$LaunchBox = "")
 $ErrorActionPreference = "Stop"
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Repo = Resolve-Path (Join-Path $Here "..\..")
 $PluginSrc = Join-Path $Here "plugin"
-$Lb = "C:\Users\fcrews\LaunchBox"
-if (-not (Test-Path (Join-Path $Lb "Core\Unbroken.LaunchBox.Plugins.dll"))) {
-  throw "LaunchBox Plugins DLL not found under $Lb\Core"
+$Lb = $null
+foreach ($c in @($LaunchBox, $env:LAUNCHBOX_HOME, (Join-Path $env:USERPROFILE "LaunchBox"),
+                 "C:\LaunchBox", "D:\LaunchBox", "E:\LaunchBox")) {
+  if ($c -and (Test-Path (Join-Path $c "Core\Unbroken.LaunchBox.Plugins.dll"))) { $Lb = $c; break }
 }
+if (-not $Lb) {
+  throw "LaunchBox not found. Pass -LaunchBox <folder that contains Core\Unbroken.LaunchBox.Plugins.dll>"
+}
+Write-Host "LaunchBox: $Lb"
 $Dotnet = $null
 foreach ($c in @(
   (Join-Path $Repo ".tools\dotnet\dotnet.exe"),
@@ -21,7 +28,7 @@ foreach ($c in @(
 if (-not $Dotnet) { throw "No .NET SDK / portable dotnet found. See README.md" }
 
 Write-Host "Building with $Dotnet"
-& $Dotnet build (Join-Path $PluginSrc "CydPinballCards.csproj") -c Release
+& $Dotnet build (Join-Path $PluginSrc "CydPinballCards.csproj") -c Release "-p:LaunchBoxDir=$Lb"
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
 $dll = Join-Path $PluginSrc "bin\Release\CydPinballCards.dll"

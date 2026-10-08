@@ -1,35 +1,130 @@
-# CYD Cabinet Cards – a companion display for pinball and arcade cabinets
+# CYD Cabinet Cards: house-wide ESP32 displays for pinball and arcade cabinets
 
 *(repository name: `cyd-pinball-cards`)*
 
-Custom firmware and host scripts that turn an **ESP32 Cheap Yellow Display** (ESP32-2432S028R,
-2.8" 320×240 ILI9341, XPT2046 resistive touch) into a small card screen next to the player on a
-**virtual pinball** or **arcade** cabinet. The same firmware also builds for the bigger
-**Waveshare ESP32-S3-Touch-LCD-7** (7" 800×480, capacitive touch), see
-[Waveshare ESP32-S3-Touch-LCD-7](#waveshare-esp32-s3-touch-lcd-7) (not yet tested on hardware):
+Cheap ESP32 touch screens next to your cabinet, or anywhere in the house, that show what the
+frontend is doing: the game's box art, gameplay screenshots, control-panel layout, how to play,
+rules and pricing while a game is picked or running, an attract playlist while nothing runs,
+and a clock with weather and tech news at night. They can also turn into a touch keypad for the keys a cabinet
+lacks. Firmware (PlatformIO) plus host tools (Python 3, Windows and Linux) that plug into
+**LaunchBox / Big Box, PinUP Popper, R-Cade, Batocera, RetroBat, RetroPie and ES-DE**.
+
+![Night info slides on the 7-inch display](docs/night-slides-7in.png)
+
+*Info slides as the host renders them for the 7" (800×480): clock, weather, tech headlines.
+Output of `python host/cyd_night.py preview --offline` with sample data, the same images that are
+sent to the boards.*
+
+## Highlights
+
+* **Three boards, one firmware:** the 2.8" "Cheap Yellow Display" (ESP32-2432S028R),
+  the 3.5" ESP32-3248S035R and the 7" Waveshare ESP32-S3-Touch-LCD-7. All three run firmware 1.6.0 on real hardware.
+* **USB or Wi-Fi.** Plug a board into the cabinet PC, or put it on the house Wi-Fi. It finds
+  the cabinet by a UDP beacon and connects to the daemon on TCP port 47311.
+* **One to five displays, each with a job.** Seven content roles: `gallery` (box art, gameplay
+  and a video still in turn), `pictureboxart`, `picture`, `videoofplay`, `control_panel`,
+  `howtoplay` (genre, players, controls, notes, paged to fit), and `keyboard`. Roles like `left` /
+  `right` / `top` select per-role text cards.
+* **Real pictures:** LaunchBox media is fitted to each screen and sent as small JPEGs in
+  acknowledged chunks (under 1 s per picture over Wi-Fi on the 2.8").
+* **Touch keypad on demand:** Esc, Enter, arrows, F-keys, coin/start, MAME and RetroArch hotkeys,
+  Alt+F4. Keys are injected with `SendInput` on Windows and a virtual `/dev/uinput` keyboard (or
+  gamepad, for R-Cade) on Linux.
+* **Night and idle mode:** backlights off in quiet hours (default 23:00 to 07:00). After an hour
+  without play, the displays rotate a big clock, the weather (Open-Meteo, no API key) and RSS tech headlines.
+  Any pick, launch or touch brings them back.
+* **Self-healing links (1.6.0):** TCP keepalive, a daemon heartbeat with a 90 s silence redial,
+  Wi-Fi rejoin, and a 30 s task watchdog. A reconnecting board is caught up to the *current* game.
+  Measured on the bench: back in about 3 s after a dropped session, about 75–90 s after a silent
+  one, and about 31–34 s after a forced hang (watchdog reboot).
+* **Testable without hardware:** a board simulator (`host/fake_cyd.py`) and 200+ unit and end-to-end tests.
+
+## Supported boards
+
+| Board | Screen | Touch | PlatformIO env | Prebuilt image (USB only) |
+|---|---|---|---|---|
+| **ESP32-2432S028R** "Cheap Yellow Display" | 2.8" 320×240 ILI9341 | resistive (XPT2046) | `cyd` | `firmware/bin/merged.bin` |
+| **ESP32-3248S035R** (3.5" CYD) | 3.5" 480×320 ST7796 | resistive (XPT2046) | `cyd35` | `firmware/bin/cyd35/merged.bin` |
+| **Waveshare ESP32-S3-Touch-LCD-7** | 7" 800×480 IPS RGB | capacitive (GT911) | `waveshare_s3_lcd7` | `firmware/bin/waveshare_s3_lcd7/merged.bin` |
+
+The prebuilt images contain **no Wi-Fi credentials**, so they talk to the cabinet over USB only.
+For Wi-Fi, put your network in `firmware/wifi.json` and build with PlatformIO (see
+[Wireless displays](#wireless-displays-wifi-idle)). The SSID and password are compiled into
+the firmware. `wifi.json` is gitignored.
+
+## How it works
+
+```
+ frontend hook / LaunchBox plugin           cabinet PC                          displays
+ ─────────────────────────────────          ─────────────────────────           ─────────────────
+ game picked / launched / exited  ──────►  host/cyd_daemon.py  ── USB serial ──► CYD 2.8" / 3.5"
+ (cyd_launchbox.py, cyd_push.py)            127.0.0.1:47291       ── Wi-Fi TCP 47311 ─► Waveshare 7"
+                                            builds role cards,    ◄── touch keys ── (keypad)
+                                            pictures, night mode
+```
+
+The daemon keeps every display connected (USB hot-plug and Wi-Fi). It turns the frontend's game
+into per-role content (text cards or pictures) and presses keypad keys on the PC. It also runs the
+quiet-hours and idle schedule. The protocol is newline-delimited JSON at 115200 baud (USB) or over TCP
+(Wi-Fi), documented in [Serial protocol](#serial-protocol).
+
+## Quick start
+
+1. **Flash a board.** For USB, use the prebuilt image:
+   `pip install esptool`, then
+   `esptool.py --chip esp32 --port COM5 write_flash 0x0 firmware/bin/merged.bin`. For the 7" use
+   `--chip esp32s3` and `firmware/bin/waveshare_s3_lcd7/merged.bin`, for the 3.5" use
+   `firmware/bin/cyd35/merged.bin`. A browser flasher ([esptool-js](https://espressif.github.io/esptool-js/))
+   also works, with merged.bin at offset `0x0`. For Wi-Fi, build it yourself:
+   [Flashing the firmware](#flashing-the-firmware).
+2. **Host tools:** install Python 3, then `pip install -r host/requirements.txt`. Copy
+   `config.example.json` to `config.json` and pick a `profile` (`pinball`, `arcade` or `rcade`).
+3. **Start the daemon:** `python host/cyd_daemon.py`. Then `python host/cyd_push.py --list-displays`
+   shows each board's id. `python host/cyd_push.py --identify` puts a big label on each screen.
+4. **Give each board a role**, for example `"displays": {"cyd-a1b2c3": {"name": "Box art", "role": "pictureboxart"}}`
+   in `config.json`, or `python host/cyd_push.py --assign cyd-a1b2c3 --role right`.
+5. **Try it without a frontend:** `python host/cyd_sim.py` sends a sample idle playlist and card.
+   `python host/cyd_push.py --rom sf2 --system mame` pushes a game.
+6. **Hook up your frontend:** for LaunchBox, run `frontends\launchbox\install.ps1` and restart
+   LaunchBox ([frontends/launchbox](frontends/launchbox/README.md)). For the others, see the table
+   below.
+
+## Contents
+
+* [Supported frontends](#supported-frontends) · [Parts list](#parts-list) · [Flashing the firmware](#flashing-the-firmware)
+* Boards: [3.5" CYD](#esp32-3248s035r-35-cyd) · [Waveshare 7"](#waveshare-esp32-s3-touch-lcd-7)
+* [Serial protocol](#serial-protocol) · [Pictures](#pictures-firmware-150) · [Idle / attract screens](#idle--attract-screens)
+* [Touch keypad](#touch-keypad) · [Host tools](#host-tools-windows-and-linux) · [Adding cards](#adding-cards-for-a-table)
+* [Multiple displays](#multiple-displays-1-to-5-boards) · [Testing without hardware](#testing-without-hardware)
+* [Wireless displays](#wireless-displays-wifi-idle) · [Staying connected](#staying-connected-firmware-160) · [Night and idle screens](#night-and-idle-screens)
+* [CHANGELOG](CHANGELOG.md) · [License](#license)
+
+## Background
+
+The project started as a text-card screen next to the player on a **virtual pinball** cabinet
+(PinUP Popper) and grew from there:
 
 * **While a game runs** it shows cards for it: the table or game title, rules or instructions,
-  controls / button layout, a moves list, pricing or credits. The frontend pushes them over USB
-  serial when the game launches (PinUP Popper, Batocera, RetroBat, RetroPie, ES-DE, or anything
-  that can run a command).
+  controls / button layout, a moves list, pricing or credits. The frontend pushes them when the
+  game launches (PinUP Popper, LaunchBox, Batocera, RetroBat, RetroPie, ES-DE, R-Cade, or
+  anything that can run a command).
 * **While nothing runs** it plays an idle/attract playlist: cabinet marquee, "pick a table/game"
   prompt, clock, house rules, pricing, a burn-in-safe animation, last played game. There is a
   pinball profile and an arcade profile.
-* **One to five displays** on one cabinet (right, left, topper...): every display updates when the
+* **One to five displays** on one cabinet (right, left, topper...) or around the room: every display updates when the
   game changes, and each can show its own cards (instructions on the right, pricing on the left,
   controls on top). Each board remembers its own identity. See [Multiple displays](#multiple-displays-1-to-5-boards).
-* **On demand** it becomes a **touch keypad** (Esc, Enter, arrows, F-keys, coin/start, MAME and
-  RetroArch hotkeys, Alt+F4...) for the keys a cabinet doesn't have. Keys are injected with
-  `SendInput` on Windows and a virtual `/dev/uinput` keyboard on Linux.
+* **On demand** it becomes a **touch keypad** for the keys a cabinet doesn't have.
 
 The idea comes from Pixelcade Sidekick, but everything here is written from scratch and needs no
-Pixelcade software or license. The host scripts run on **Windows and Linux** with Python 3 and no
-required packages on Linux (pyserial, python-evdev and psutil are used when present).
+Pixelcade software or license. The host scripts run on **Windows and Linux** with Python 3. On
+Linux no extra packages are required (pyserial, Pillow, python-evdev and psutil are used when present). Pillow is needed for pictures.
 
 ## Supported frontends
 
 | Frontend | OS | Game start → cards | Game end → idle | Keypad daemon at boot | Setup |
 |---|---|---|---|---|---|
+| LaunchBox / Big Box 14 | Windows | plugin: game **select** and launch (pictures per role) | plugin: game exit | plugin starts the daemon | [frontends/launchbox](frontends/launchbox/README.md) |
 | PinUP Popper (VPX) | Windows | VPX Launch Script | VPX Close Script | Startup folder / Task Scheduler | [frontends/popper](frontends/popper/POPPER_SETUP.md) |
 | Batocera | Linux | `/userdata/system/scripts/` (`gameStart`) | same script (`gameStop`) | service in `/userdata/system/services/` (v43+), `custom.sh` (≤ v42) | [frontends/batocera](frontends/batocera/SETUP.md) |
 | RetroBat | Windows | ES `scripts\game-start\` | ES `scripts\game-end\` | ES `scripts\start\` | [frontends/retrobat](frontends/retrobat/SETUP.md) |
@@ -37,45 +132,40 @@ required packages on Linux (pyserial, python-evdev and psutil are used when pres
 | ES-DE | Linux, Windows | `~/ES-DE/scripts/game-start/` | `scripts/game-end/` | `scripts/startup/` or systemd | [frontends/es-de](frontends/es-de/SETUP.md) |
 | R-Cade (GRS Build-A-Cade FU, Viper boards) | Linux (Rockchip ARM) | `/rcade/share/userscripts/game-start/` | `userscripts/game-end/` | `userscripts/system-ready/` (keypad = virtual controller + keyboard) | [frontends/rcade](frontends/rcade/SETUP.md) |
 | Other EmulationStation forks | Linux, Windows | `scripts/game-start/` | `scripts/game-end/` | – | [frontends/emulationstation](frontends/emulationstation/SETUP.md) |
-| Anything else (LaunchBox, Attract-Mode, Pegasus...) | Windows, Linux | run `cyd_push.py --rom ...` | run `cyd_push.py --idle` | Startup folder / systemd user unit | [generic](frontends/emulationstation/SETUP.md#generic-linux-and-windows-frontends) |
+| Anything else (Attract-Mode, Pegasus...) | Windows, Linux | run `cyd_push.py --rom ...` | run `cyd_push.py --idle` | Startup folder / systemd user unit | [generic](frontends/emulationstation/SETUP.md#generic-linux-and-windows-frontends) |
 
 Hook paths and arguments, with their sources, and what is still **TO-VERIFY** on real hardware:
 [frontends/README.md](frontends/README.md).
 
 ```
 cyd-pinball-cards/
-├── firmware/          PlatformIO project: env cyd (TFT_eSPI + XPT2046_Touchscreen) and env waveshare_s3_lcd7 (LovyanGFX)
-│   ├── platformio.ini   pins, rotation, rotate timer, brightness in build_flags (one [env] per board)
-│   ├── src/main.cpp     shared: cards, idle playlist, keypad, identity, serial protocol
-│   ├── src/board.h      board abstraction; board_cyd.cpp / board_ws_s3_lcd7.cpp implement it
-│   └── bin/             prebuilt CYD images; bin/waveshare_s3_lcd7/ = Waveshare 7" images + merged.bin
-├── host/              host tools (Windows + Linux, Python 3)
-│   ├── cyd_push.py      push table/game cards, idle, keypad (hands off to the daemon when it runs)
-│   ├── cyd_daemon.py    keeps the serial ports open (all displays, hot-plug), turns keypad presses into key presses, optional process watch
-│   ├── displays.py      multi-display: board identity, --target matching, parallel direct fan-out
-│   ├── keymap.py        key names -> Windows VK + Linux KEY_* codes; SendInput / evdev / uinput injectors
-│   ├── serialport.py    pyserial when installed, else a termios + sysfs fallback (Linux)
-│   ├── test_keymap.py   unit tests: key codes (both backends), injectors, keypad layouts, process watch
-│   ├── test_arcade.py   unit + end-to-end tests: ROM parsing per frontend, card matching, profiles, fake display
-│   ├── test_multi.py    multi-display tests: routing, targeting, fan-out timing, hot-plug, keypad on one board, fw 1.2.0 boards
-│   ├── fake_cyd.py      device simulator: one or many boards on PTYs (Linux/macOS) or an in-memory bus (any OS)
+├── firmware/            PlatformIO project, one [env] per board: cyd, cyd35 (TFT_eSPI), waveshare_s3_lcd7 (LovyanGFX)
+│   ├── platformio.ini     pins, rotation, rotate timer, brightness in build_flags
+│   ├── src/main.cpp       shared: cards, idle playlist, keypad, identity, pictures, protocol, watchdog
+│   ├── src/wifi_link.*    USB/Wi-Fi session, beacon, keepalive, heartbeat, rejoin
+│   ├── src/board*.{h,cpp} board abstraction (board_cyd.cpp, board_ws_s3_lcd7.cpp)
+│   ├── wifi.example.json  copy to wifi.json (gitignored) for Wi-Fi builds; gen_wifi_secrets.py runs before each build
+│   └── bin/               prebuilt USB-only images (no Wi-Fi credentials): 2.8" here, cyd35/, waveshare_s3_lcd7/
+├── host/                host tools (Windows + Linux, Python 3)
+│   ├── cyd_daemon.py      keeps every display connected (USB hot-plug + Wi-Fi), routes content, keypad keys, night mode
+│   ├── cyd_push.py        push table/game cards, idle, keypad; list / identify / assign displays
+│   ├── cyd_links.py       link health per board; test drops and watchdog hangs on Wi-Fi boards
+│   ├── cyd_night.py       night/idle mode: status, info / sleep / wake now, slide previews
+│   ├── cyd_sim.py         send a sample idle playlist and card through the daemon (no frontend needed)
+│   ├── fake_cyd.py        device simulator: boards on PTYs (Linux/macOS) or an in-memory bus (any OS)
+│   ├── link_soak.py       Wi-Fi recovery soak for one board (drop, silence, close, hang)
+│   ├── usb_watchdog_test.py  watchdog test for one board on USB
+│   ├── displays.py, wifi_displays.py, link_health.py   multi-display routing, Wi-Fi listener + beacon, link stats
+│   ├── images.py, textfit.py, info_cards.py, info_feeds.py, night.py   pictures, text fitting, clock/weather/news slides
+│   ├── keymap.py, serialport.py   key injection (SendInput / evdev / uinput), serial fallback for Linux
+│   ├── test_*.py          unit + end-to-end tests
 │   └── requirements.txt
-├── cards/             one JSON per table or game
-│   ├── template.json
-│   ├── _default.json          pinball: used when no table matches ({{TITLE}} is filled in)
-│   ├── _default_arcade.json   arcade: used when no game matches ({{TITLE}}, {{SYSTEM}}, {{CONTROLS}})
-│   ├── _systems.json          system ids -> display names, kinds, default controls text, aliases
-│   ├── _idle.json             pinball idle/attract playlist ("Crews Pinball")
-│   ├── _idle_arcade.json      arcade idle/attract playlist ("Crews Arcade")
-│   ├── _keypad.json           pinball touch keypad + process names that open it
-│   ├── _keypad_arcade.json    arcade touch keypad (coin/start, MAME, RetroArch, NAV pages)
-│   ├── _keypad_rcade.json     R-Cade keypad (controller hotkey combos on the virtual gamepad, pad setup, keyboard, MAME)
-│   ├── medieval_madness.json, attack_from_mars.json, the_addams_family.json   (pinball)
-│   ├── sf2.json, mslug.json, pacman.json                                      (arcade)
-│   └── <system>/<rom>.json    optional per-system cards (e.g. cards/snes/sf2.json)
-├── config.example.json  per-cabinet settings (copy to config.json)
-├── frontends/         hook scripts + SETUP.md per frontend (popper, batocera, retrobat, retropie, es-de, emulationstation, rcade, linux)
-├── docs/              idle_preview.py / keypad_preview.py / multi_display_preview.py / waveshare7_preview.py (Pillow mock-up renderers) + preview PNGs
+├── cards/               one JSON per table or game, plus _default*, _idle*, _keypad*, _systems.json, template.json
+├── frontends/           hooks + setup per frontend: launchbox (plugin), popper, batocera, retrobat, retropie, es-de,
+│                        emulationstation, rcade, linux (systemd unit)
+├── docs/                preview images and the Pillow scripts that draw the mock-ups
+├── config.example.json  per-cabinet settings (copy to config.json, gitignored)
+├── CHANGELOG.md
 └── README.md
 ```
 
@@ -104,20 +194,32 @@ cyd-pinball-cards/
    pio device monitor           # optional: see the {"ready":true,...} line (115200 baud)
    ```
    If the upload won't start, hold **BOOT**, tap **RST**, then release BOOT.
+4. Use `-e cyd35` for the 3.5" board and `-e waveshare_s3_lcd7` for the 7". For Wi-Fi, first copy
+   `firmware/wifi.example.json` to `firmware/wifi.json` and fill in `ssid` and `pass` (see
+   [Wireless displays](#wireless-displays-wifi-idle)). Without that file, the build is USB only.
 
-### Option B: esptool (flash a prebuilt binary without the toolchain)
-Prebuilt CYD images (firmware 1.4.0) are in `firmware/bin/` (the Waveshare 7" images are in
-`firmware/bin/waveshare_s3_lcd7/`, see [Waveshare ESP32-S3-Touch-LCD-7](#waveshare-esp32-s3-touch-lcd-7)). After your own `pio run`, they are in
-`firmware/.pio/build/cyd/`. Flash them with:
+### Option B: esptool (flash a prebuilt image without the toolchain)
+Prebuilt **firmware 1.6.0** images are in `firmware/bin/`. They were built **without Wi-Fi
+credentials**, so the board talks to the cabinet over **USB only**. For Wi-Fi use Option A with a
+`firmware/wifi.json` (see [Wireless displays](#wireless-displays-wifi-idle)).
+
+| Board | Folder | Single file (offset `0x0`) |
+|---|---|---|
+| 2.8" CYD (ESP32-2432S028R) | `firmware/bin/` | `merged.bin` (`--chip esp32`) |
+| 3.5" CYD (ESP32-3248S035R) | `firmware/bin/cyd35/` | `merged.bin` (`--chip esp32`) |
+| Waveshare 7" (ESP32-S3-Touch-LCD-7) | `firmware/bin/waveshare_s3_lcd7/` | `merged.bin` (`--chip esp32s3`) |
+
 ```
 pip install esptool
-esptool.py --chip esp32 --port COM5 --baud 921600 write_flash -z ^
-  0x1000  bootloader.bin ^
-  0x8000  partitions.bin ^
-  0xe000  %USERPROFILE%\.platformio\packages\framework-arduinoespressif32\tools\partitions\boot_app0.bin ^
-  0x10000 firmware.bin
+esptool.py --chip esp32 --port COM5 --baud 460800 write_flash 0x0 firmware/bin/merged.bin
 ```
-(`^` continues the line in cmd.exe. In PowerShell, use a backtick.)
+Each folder also has the separate parts: `bootloader.bin` (`0x1000` on the ESP32, `0x0` on the
+ESP32-S3), `partitions.bin` @ `0x8000`, `boot_app0.bin` @ `0xe000`, `firmware.bin` @ `0x10000`.
+**Updating a board that is already set up?** Write only the app, and the board keeps its saved
+name, role, rotation, brightness and touch calibration:
+`esptool.py --chip esp32 --port COM5 --baud 460800 write_flash 0x10000 firmware/bin/firmware.bin`.
+If 921600 baud fails verification on a CH340 board, use 460800. A browser flasher
+([esptool-js](https://espressif.github.io/esptool-js/), Chrome/Edge) works with `merged.bin` at `0x0`.
 
 ### Configuration (in `platformio.ini` build_flags)
 | Flag | Default | Meaning |
@@ -154,7 +256,8 @@ Env `cyd35` builds the same firmware for the 3.5" "Cheap Yellow Display": ESP32-
 no PSRAM), CH340 USB, ST7796 480x320 panel on HSPI (MISO 12, MOSI 13, SCLK 14, CS 15, DC 2),
 backlight GPIO 27, XPT2046 resistive touch on the same SPI bus (CS 33). The board reports itself
 as `"board":"cyd35"`, 480x320, and takes pictures like the 2.8" CYD (JPEG up to 48 KB, kept to
-about 34 KB). No prebuilt image: a local build bakes in your `firmware/wifi.json`, so build it yourself.
+about 34 KB). Tested on hardware with firmware 1.6.0 over USB and Wi-Fi. The prebuilt image in
+`firmware/bin/cyd35/` is USB only. For Wi-Fi, build it yourself with your `firmware/wifi.json`.
 
     cd firmware
     pio run -e cyd35 -t upload --upload-port COMx
@@ -170,9 +273,9 @@ a second PlatformIO environment, `waveshare_s3_lcd7`. Cards, idle playlist, keyp
 the serial protocol are shared with the CYD; only the board layer differs
 (`firmware/src/board.h`, `board_cyd.cpp`, `board_ws_s3_lcd7.cpp`).
 
-> **Status: compiles, not yet tested on real hardware.** Pins, timings and the IO-expander
-> sequence are taken from Waveshare's wiki and demo code (sources below). Please report back
-> the results of the hardware checks at the end of this section.
+> **Status: runs on real hardware** (firmware 1.4.0 to 1.6.0). Tested: picture, capacitive touch,
+> backlight on/off, native USB and Wi-Fi, gallery pictures. Pins, timings and the IO-expander sequence come from
+> Waveshare's wiki and demo code (sources below).
 
 ![Waveshare 7-inch mock-up](docs/waveshare-7-preview.png)
 
@@ -235,7 +338,7 @@ and [CH422G driver](https://github.com/esp-arduino-libs/ESP32_IO_Expander/blob/m
    `boot_app0.bin` @ `0xe000`, `firmware.bin` @ `0x10000`). A browser flasher such as
    [ESP Web Tools / esptool-js](https://espressif.github.io/esptool-js/) also works with `merged.bin` at offset `0x0` (Chrome/Edge).
 5. The host tools need no changes: auto-detect includes both Waveshare VID:PIDs, and
-   `--list-displays` shows the board type (`1.4.0 (ws-s3-7)`). Everything else (`--target`, roles,
+   `--list-displays` shows the board type (`1.6.0 (ws-s3-7)`). Everything else (`--target`, roles,
    keypad, identify) works as with the CYD.
 
 **Power:** the 7" panel and its backlight draw about 450 mA at 5 V (Waveshare spec) and more at
@@ -247,10 +350,12 @@ the PH2.0 connector.)
 **Mounting:** the touch version is about 193 × 111 mm (without touch 165 × 98 mm). It fits a
 topper, the backbox side or the coin-door area rather than the lockdown bar. Capacitive touch
 works through the original cover glass; do **not** add an extra glass or acrylic layer on top (it
-stops touch unless it is very thin). Keep the PCB antenna end free of metal (Wi-Fi is not used,
-so this is only relevant if you add it), and leave the USB and BOOT/RESET side reachable.
+stops touch unless it is very thin). Keep the PCB antenna end free of metal (it matters for
+Wi-Fi), and leave the USB and BOOT/RESET side reachable.
 
-**Hardware checks still to do**
+**Hardware notes**
+* While a program on the PC has the native **USB** port open, USB is the session and Wi-Fi stays
+  quiet. Run a Wi-Fi-only 7" from a charger.
 * Panel shows a correct, stable image (colours not swapped, no horizontal drift). If the image
   drifts or flickers, try `cfg.freq_write = 14000000` or `12000000` in `board_ws_s3_lcd7.cpp`;
   a short glitch while NVS is written (settings saved) is a known ESP32-S3 RGB/PSRAM effect.
@@ -276,9 +381,11 @@ documents grow on the heap as needed (no fixed document size); a full idle confi
 | brightness | `{"cmd":"brightness","value":128}` (0–255) | `{"ack":"brightness","ok":true,"value":128}` (Waveshare 7": on/off only, adds `"dimmable":false,"backlight":"on"`) |
 | rotation | `{"cmd":"rotation","value":3}` (0–3) | `{"ack":"rotation","ok":true,"value":3}` |
 | next | `{"cmd":"next"}` | `{"ack":"next","ok":true,"card":1}` |
-| ping / hello | `{"cmd":"ping"}` or `{"cmd":"hello"}` | `{"ack":"ping","ok":true,"fw":"1.4.0","device":"cyd-pinball-cards","mode":"idle","board":"cyd","id":"cyd-a1b2c3","name":"Right palm","role":"right","rotation":1,"keypad":true}` (`mode`: idle, table, keypad, calibrate, identify). `board` (1.4.0+): `cyd` or `ws-s3-7`. Firmware 1.2.0 answers `ping` without the identity keys. |
+| ping / hello | `{"cmd":"ping"}` or `{"cmd":"hello"}` | `{"ack":"ping","ok":true,"fw":"1.6.0","device":"cyd-pinball-cards","mode":"idle","board":"cyd","id":"cyd-a1b2c3","name":"Right palm","role":"right","rotation":1,"keypad":true}` (`mode`: idle, table, keypad, calibrate, identify). `board` (1.4.0+): `cyd` or `ws-s3-7`. Firmware 1.2.0 answers `ping` without the identity keys. |
+| hb (1.6.0) | `{"cmd":"hb"}` (the daemon sends it every 30 s to Wi-Fi boards) | `{"ack":"hb","ok":true,"up":1234,"reset":"power_on","sessions":2,"silence_drops":0,"wifi_lost":0,"rejoins":0,"rssi":-60,"hb":90}`. The first hb arms the 90 s silence timer. ping/hello replies carry the same link fields. |
+| selftest (1.6.0) | `{"cmd":"selftest","op":"drop"}` or `{"cmd":"selftest","op":"hang","confirm":"hang"}` | `{"ack":"selftest","ok":true}`. `drop` closes the Wi-Fi session (the board redials). `hang` stops the main loop so the 30 s watchdog reboots the board. For recovery tests only. |
 | identify | `{"cmd":"identify","secs":5}` (1–60, default 5) | `{"ack":"identify","ok":true,"secs":5,"id":...,"name":...,"role":...}`. The board shows a big label with its role, name, id and fw in a role colour, then returns to what it showed. A tap closes it early. |
-| config | `{"cmd":"config","name":"Right palm","role":"right","rotation":1,"keypad":true}` (every key optional; `{"cmd":"config"}` alone just reads) | `{"ack":"config","ok":true,"fw":"1.4.0","board":"cyd","id":"cyd-a1b2c3","name":"Right palm","role":"right","rotation":1,"keypad":true}` |
+| config | `{"cmd":"config","name":"Right palm","role":"right","rotation":1,"keypad":true}` (every key optional; `{"cmd":"config"}` alone just reads) | `{"ack":"config","ok":true,"fw":"1.6.0","board":"cyd","id":"cyd-a1b2c3","name":"Right palm","role":"right","rotation":1,"keypad":true}` |
 | set_id | `{"cmd":"set_id","id":"cyd-right"}`, `{"cmd":"set_id","reset":true}` (back to the MAC id); also takes the `config` keys | same as config |
 | keypad | `{"cmd":"keypad"}` (saved/default layout) or `{"cmd":"keypad","layout":{"pages":[...]},"page":0}` | `{"ack":"keypad","ok":true,"pages":3,"page":0}` |
 | keypad exit | `{"cmd":"keypad","exit":true}` (back to the previous screen) | `{"ack":"keypad","ok":true}` |
@@ -302,7 +409,7 @@ Existing host scripts ignore lines without `ack`, so the new events don't distur
 
 * Errors come back as `{"ack":"<cmd>","ok":false,"err":"..."}`, for example on bad JSON, an unknown
   cmd or an out-of-range value.
-* On boot the device prints `{"ready":true,"device":"cyd-pinball-cards","fw":"1.4.0","board":"cyd","id":"cyd-a1b2c3","name":"","role":"","rotation":1,"keypad":true}`.
+* On boot the device prints `{"ready":true,"device":"cyd-pinball-cards","fw":"1.6.0","board":"cyd","id":"cyd-a1b2c3","name":"","role":"","rotation":1,"keypad":true}`.
 * **Board identity (1.3.0):** `id` defaults to `cyd-` + the last 3 bytes of the ESP32's factory MAC
   (e.g. `cyd-a1b2c3`), so it is unique per board and survives reflashing. `name` (up to 32 ASCII
   characters), `role` (up to 16, stored in lower case: `right`, `left`, `top`, `bottom`, `center`
@@ -769,7 +876,7 @@ send to every display they find.
 pricing, right = instructions, top = controls. Regenerate with `python docs/multi_display_preview.py`.*
 
 ### Set up
-1. Flash firmware **1.3.0 or newer** (1.4.0 in `firmware/bin/`) on every board. Plug them in, ideally through a powered hub.
+1. Flash firmware **1.3.0 or newer** (1.6.0 in `firmware/bin/`) on every board. Plug them in, ideally through a powered hub.
 2. `python cyd_push.py --list-displays` shows each board with its id (from the ESP32 MAC, e.g.
    `cyd-a1b2c3`), name, role, port and firmware.
 3. `python cyd_push.py --identify` – each display shows a big label (role, name, id) for 5 s, so
@@ -898,14 +1005,15 @@ card). Map them by that id in config.json `displays` to give them a role. `ident
   have serial numbers; most CH340 boards don't) or a udev rule by USB path, e.g.
   `SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", KERNELS=="1-1.2", SYMLINK+="cyd-right"`
   in `/etc/udev/rules.d/99-cyd.rules`. On Ubuntu remove `brltty` if CH340 ports vanish.
-* **Hardware checks still to do** (the multi-display code is tested with simulated boards only):
-  5 real boards on one hub (power, enumeration), `identify` / `config` on real firmware 1.3.0,
-  unplug/re-plug on Windows (COM port disappearing while open) and Linux.
+* **Tested on hardware** with three boards at once (2.8", 3.5" and 7"; USB and Wi-Fi; identify,
+  roles, unplug/re-plug on Windows). Five boards are tested with simulated boards only, and Linux
+  hot-plug with PTYs.
 
 ### Testing without hardware
 ```
 cd host
-python -m unittest test_keymap.py test_arcade.py test_multi.py test_wifi.py
+python -m unittest discover -p "test_*.py"               # all host tests (some are Linux/macOS only)
+cd ../frontends/launchbox && python -m pytest test_launchbox.py -q && cd ../../host
 python fake_cyd.py --boards 3 --roles right,left,top     # Linux/macOS: three simulated boards on PTYs
 ```
 `test_multi.py` runs five simulated boards on an in-memory bus (any OS, no COM port is opened)
@@ -934,12 +1042,14 @@ The cabinet broadcasts a UDP beacon on port **47311**:
 A board uses the address that sent the beacon. To skip the beacon, set `host` and `port` in the
 board's Wi-Fi file.
 
-**Joining.** Copy `firmware/wifi.example.json` to `firmware/wifi.json` and fill in `ssid` and `pass`.
+**Joining.** Wi-Fi settings are compiled into the firmware. The prebuilt images in
+`firmware/bin/` have none, so they are USB only. Copy `firmware/wifi.example.json` to `firmware/wifi.json`
+and fill in `ssid` and `pass`.
 `firmware/wifi.json` is gitignored, and so is the generated `firmware/src/wifi_secrets.h`.
 PlatformIO runs `firmware/gen_wifi_secrets.py` before each build and compiles those values into the
 firmware. The password is not written to git. Leave `host` empty to follow the beacon. Flash as
-usual (`pio run -e waveshare_s3_lcd7 -t upload`, or `-e cyd`); this slice does not change the
-serial protocol. Both board environments share `firmware/src/wifi_link.cpp`.
+usual (`pio run -e waveshare_s3_lcd7 -t upload`, or `-e cyd` / `-e cyd35`). Do not share a binary
+built this way: it contains your Wi-Fi password. Both board environments share `firmware/src/wifi_link.cpp`.
 
 **One session.** USB wins. On the Waveshare board, an open native USB port is the session and Wi-Fi
 stays quiet. On a CYD (USB-UART) the board treats USB as the session for 15 seconds after the host
@@ -973,14 +1083,32 @@ Wi-Fi displays recover on their own; nobody should have to unplug one.
   after 10 minutes -> the board restarts (not while a USB host drives it).
 * **Watchdog**: the main loop runs under a 30 s task watchdog; a hang reboots the board, and it
   comes back with its last content.
-* After any reconnect the daemon sends the board its current content again (pictures only live in
-  the board's RAM).
+* After any reconnect the daemon sends the board the **current** content for its role: the latest
+  game picked in the frontend, even if the board was away when it was picked. Pictures only live in
+  the board's RAM. The current content is kept in `.cyd_cache/current_content.json`, so it
+  survives a daemon restart.
 
 Check it: `python host/cyd_links.py` lists connects, drops (with the reason), reboots (with the
 reset reason the board reports, e.g. `task_wdt`) and heartbeats per board; the counts are kept in
 `.cyd_cache/link_stats.json`. The daemon log has one `link <id> ...: connect #N` line per connect.
-Test a recovery on one Wi-Fi board: `python host/cyd_links.py drop cyd-1e37f4 --mode close|silent|board`
-or `python host/cyd_links.py hang cyd-1e37f4 --yes` (watchdog reboot). USB boards are refused.
+Test a recovery on one Wi-Fi board: `python host/cyd_links.py drop cyd-a1b2c3 --mode close|silent|board`
+or `python host/cyd_links.py hang cyd-a1b2c3 --yes` (watchdog reboot). USB boards are refused.
+`python host/link_soak.py cyd-a1b2c3` runs the whole set (board drop x3, silence x3, daemon close x2,
+hang x1) and prints each recovery time. `python host/usb_watchdog_test.py COM5 --runs 3` checks the
+watchdog on a board over USB (stop the daemon first if it has that port open).
+
+Bench results (2.8", 3.5" and 7" on firmware 1.6.0, every run passed, with the current content
+restored after each reconnect):
+
+| Test | Recovery time |
+|---|---|
+| Board drops its session, or the daemon closes it | 3–10 s |
+| Silent session (silence redial) | 73–87 s |
+| Forced hang (watchdog reboot, reset reason `task_wdt`) | 31–34 s |
+
+**A CYD plugged into the cabinet PC can still use Wi-Fi** as long as nothing on the PC talks to its
+serial port: add the port to `exclude_ports` in `config.json`. Once a USB host sends it a command,
+the board treats USB as its session and dials Wi-Fi at most every 2 minutes until it reboots.
 
 ## Night and idle screens
 
@@ -1005,6 +1133,11 @@ info slides are pictures drawn on the PC for each screen size (firmware 1.5.0 `i
   left out and the clock keeps going.
 * Each display's last content is kept in `.cyd_cache/last_content.json`, so a restarted daemon
   puts the current game back on the screens when they reconnect.
+
+![Night info slides on the 2.8 and 3.5 inch displays](docs/night-slides-cyd.png)
+
+*Clock (2.8"), weather (3.5"), headlines (2.8"): `python host/cyd_night.py preview --offline`
+output with sample data.*
 
 Settings (`config.json`, every key optional; restart the daemon after a change):
 

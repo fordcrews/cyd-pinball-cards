@@ -557,11 +557,16 @@ def load_event_file(path: Path) -> dict:
 
 
 def default_launchbox_home() -> Path | None:
+    env = os.environ.get("LAUNCHBOX_HOME", "").strip()
     for p in (
-        Path(r"C:\Users\fcrews\LaunchBox"),
+        Path(env) if env else None,
         Path.home() / "LaunchBox",
+        Path(r"C:\LaunchBox"),
         Path(r"D:\LaunchBox"),
+        Path(r"E:\LaunchBox"),
     ):
+        if p is None:
+            continue
         if (p / "Data" / "Platforms.xml").is_file() or (p / "LaunchBox.exe").is_file():
             return p
     return None

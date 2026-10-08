@@ -9,13 +9,15 @@ Each board is sent only the card for its content role (config.json "displays").
 Roles: control_panel, howtoplay, picture, pictureboxart, videoofplay, gallery, keyboard.
 keyboard gets the keypad only when a keypad card is in the sample.
 
-A run writes assignments for the two known boards when they are not already in
-config.json (the 7 inch stays assigned even if it is offline):
+Each board uses the role from config.json "displays" (or the one saved on the board).
+--write-assignments also writes name and role for the two bench boards below into
+config.json when they are not already there (handy on the author's bench; skip it elsewhere):
 
   cyd-1e37f4  name gallery        role gallery
   cyd-2bee08  name howtoplay      role howtoplay
 
   python cyd_sim.py
+  python cyd_sim.py --write-assignments
   python cyd_sim.py --idle-only
   python cyd_sim.py --card-only
   python cyd_sim.py --delay 8
@@ -165,7 +167,7 @@ def _has_assignment(entry) -> bool:
     return isinstance(entry, dict) and str(entry.get("role") or "").strip()
 
 
-def ensure_assignments(path: Path | None = None) -> dict:
+def ensure_assignments(path: Path | None = None, write: bool = True) -> dict:
     """Write name and role for the known boards. An id that already has a role is left alone.
     Both known boards are written even if one is offline. Returns the displays map.
     config.json is git-ignored and holds no Wi-Fi secrets."""
@@ -181,6 +183,8 @@ def ensure_assignments(path: Path | None = None) -> dict:
     assigned = cfg.get("displays")
     if not isinstance(assigned, dict):
         assigned = {}
+    if not write:
+        return assigned
     changed = False
     for bid, want in LIVE_ASSIGNMENTS.items():
         cur = assigned.get(bid)
@@ -242,7 +246,9 @@ def main(argv=None) -> int:
     ap.add_argument("--wait", type=float, default=45.0, help="seconds to wait for a display to connect (default 45)")
     ap.add_argument("--timeout", type=float, default=5.0, help="seconds to wait for each ack")
     ap.add_argument("--dry-run", action="store_true", help="print the JSON lines and do not contact the daemon")
-    ap.add_argument("--config", type=Path, default=None, help="config.json to write assignments into")
+    ap.add_argument("--config", type=Path, default=None, help="config.json to read (and, with --write-assignments, write)")
+    ap.add_argument("--write-assignments", action="store_true",
+                    help="write name/role for the two bench boards into config.json when missing")
     args = ap.parse_args(argv)
 
     mode = "idle" if args.idle_only else "card" if args.card_only else "both"
@@ -253,12 +259,13 @@ def main(argv=None) -> int:
                 print(cyd_push.json.dumps(m, ensure_ascii=False))
         return 0
 
-    assigned = ensure_assignments(args.config)
+    assigned = ensure_assignments(args.config, write=args.write_assignments)
     boards = wait_for_boards(0 if args.wait < 0 else args.wait)
     connected = {canonical_id(b.get("id")) for b in boards}
-    for bid, ent in LIVE_ASSIGNMENTS.items():
-        state = "connected" if bid in connected else "offline"
-        print("assignment %s name %s role %s (%s)" % (bid, ent["name"], ent["role"], state))
+    if args.write_assignments:
+        for bid, ent in LIVE_ASSIGNMENTS.items():
+            state = "connected" if bid in connected else "offline"
+            print("assignment %s name %s role %s (%s)" % (bid, ent["name"], ent["role"], state))
     if not boards:
         print("no display is connected to the daemon yet", file=sys.stderr)
         return 2

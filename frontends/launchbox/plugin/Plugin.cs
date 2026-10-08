@@ -309,7 +309,7 @@ public sealed class Plugin : ISystemEventsPlugin, IGameLaunchingPlugin
             Environment.GetEnvironmentVariable("CYD_HOME"),
             Path.GetFullPath(Path.Combine(dllDir, "..", "..", "..", "..", "..")),
             Path.GetFullPath(Path.Combine(dllDir, "..", "..", "..", "..")),
-            @"C:\Users\fcrews\projects\cyd-pinball-cards"
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "projects", "cyd-pinball-cards")
         };
         foreach (var c in cand)
         {
