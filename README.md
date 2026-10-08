@@ -1171,7 +1171,7 @@ python host/cyd_night.py preview --offline --out night-preview   # PNGs for each
 ```
 
 ## License
-This kit is yours to use and change. It uses TFT_eSPI (FreeBSD/MIT-style), XPT2046_Touchscreen (MIT),
+MIT License, Copyright (c) 2026 Ford Crews; see [LICENSE](LICENSE). It uses TFT_eSPI (FreeBSD/MIT-style), XPT2046_Touchscreen (MIT),
 ArduinoJson (MIT), TJpg_Decoder (FreeBSD-style, CYD pictures), LovyanGFX (FreeBSD, 7"), Pillow (MIT-CMU,
 host-side picture fitting), and optionally pyserial (BSD), psutil (BSD) and python-evdev (BSD). It
 contains no Pixelcade code or assets, and no game artwork (pictures are read from your own front end's
