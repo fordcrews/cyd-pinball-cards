@@ -91,6 +91,7 @@ GALLERY_USB_MAX_BYTES = 40 * 1024   # gallery pictures over USB: about 5 s each 
 HEARTBEAT_S = 30.0          # {"cmd":"hb"} to every Wi-Fi board with fw >= 1.6.0 this often
 HEARTBEAT_TIMEOUT_S = 8.0   # wait this long for its ack
 HEARTBEAT_MISSES = 2        # this many unanswered in a row: close the session (the board dials again)
+RESTORE_TIMEOUT_S = 12.0    # content sent right after a (re)connect: a board that just booted draws slowly
 SILENT_DROP_GUARD_S = 150.0  # test "silent" drop: close the abandoned socket after this long anyway
 GALLERY_STOP_CMDS = ("table", "idle", "image", "keypad", "calibrate")   # these end a gallery rotation
 
@@ -706,7 +707,7 @@ class Daemon:
                 msg = dict(self.last_content[b.id])
                 if "ts" in msg:
                     msg["ts"] = cyd_push.local_epoch()
-                self.send_to(lk, msg, "restored after restart")
+                self.send_to(lk, msg, "restored after restart", timeout=max(self.args.timeout, RESTORE_TIMEOUT_S))
         elif not night_set:
             # back after a drop or a reboot: pictures live only in the board's RAM, so show the
             # role's content again instead of whatever the board kept
@@ -716,7 +717,7 @@ class Daemon:
                 msg = dict(msg)
                 if "ts" in msg:
                     msg["ts"] = cyd_push.local_epoch()
-                self.send_to(lk, msg, "reconnected")
+                self.send_to(lk, msg, "reconnected", timeout=max(self.args.timeout, RESTORE_TIMEOUT_S))
         with self.state_lock:
             if (self.setup_running and not self.manual_exit and lk.board.mode != "keypad"
                     and cyd_push.keypad_allowed(lk.board, self.st)):
@@ -765,7 +766,8 @@ class Daemon:
                 try:
                     if not lk.connected or lk.detached:
                         return
-                    r = lk.request({"cmd": "hb"}, timeout=HEARTBEAT_TIMEOUT_S)
+                    r = lk.request({"cmd": "hb"}, timeout=HEARTBEAT_TIMEOUT_S,
+                                   accept=lambda a: a.get("ack") == "hb")   # not a late ack of something else
                     who = lk.board.id if lk.board else lk.port
                     if r.get("ok"):
                         lk.hb_miss = 0

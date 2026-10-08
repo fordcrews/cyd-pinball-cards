@@ -119,6 +119,17 @@ class Heartbeat(BusCase):
         self.assertEqual(st["board"]["rssi"], -60)
         self.assertTrue(self.log.has("link cyd-new wifi: connect #1"))
 
+    @mock.patch.object(cyd_daemon, "HEARTBEAT_S", 0.2)
+    def test_late_ack_of_another_command_is_not_a_heartbeat(self):
+        d, port = self.start()
+        b = self.dial(port, "cyd-late")
+        self.assertTrue(wait_until(lambda: [x.id for x in d.boards()] == ["cyd-late"], 3))
+        lk = d.link_for("cyd-late")
+        b.answer_hb = False
+        lk.acks.put({"ack": "table", "ok": True})          # a table ack that arrived too late
+        r = lk.request({"cmd": "hb"}, timeout=0.5, accept=lambda a: a.get("ack") == "hb")
+        self.assertFalse(r.get("ok"))
+
     def test_usb_board_gets_no_heartbeat(self):
         self.plug("FAKE1", id="cyd-usb", fw="1.6.0", role="pictureboxart")
         with mock.patch.object(cyd_daemon, "HEARTBEAT_S", 0.2):
