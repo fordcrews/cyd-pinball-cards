@@ -40,7 +40,7 @@ class FakeBoard:
     thread; `delay` (seconds, or a dict cmd -> seconds) simulates the time a real board spends
     drawing, so timing / parallel fan-out can be tested."""
 
-    def __init__(self, fw: str = "1.6.0", id: str | None = None, name: str = "", role: str = "",
+    def __init__(self, fw: str = "1.6.1", id: str | None = None, name: str = "", role: str = "",
                  rotation: int = 1, keypad: bool = True, delay=0.0, log=None, mac: str | None = None,
                  board: str = "cyd"):
         self.fw = fw

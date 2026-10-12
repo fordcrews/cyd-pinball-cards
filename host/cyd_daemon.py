@@ -108,23 +108,42 @@ def ts() -> str:
 
 
 class Logger:
+    """Console + optional --log file. The file is rotated to <name>.1 at max_bytes. A failed open or
+    write (Windows: the file briefly locked by a reader, antivirus, a full disk) is retried on the next
+    line instead of silently ending all file logging."""
+
     def __init__(self, verbose: bool = False, logfile: Path | None = None, max_bytes: int = LOG_MAX_BYTES):
         self.verbose = verbose
         self.path = Path(logfile) if logfile else None
         self.max_bytes = max_bytes
         self.lock = threading.Lock()
         self.fh = None
+        self.failed = 0          # lines that could not be written to the file
         if self.path:
             self._rotate_if_big()
+            self._open()
+
+    def _open(self) -> bool:
+        try:
             self.fh = open(self.path, "a", encoding="utf-8")
+            return True
+        except OSError:
+            self.fh = None
+            return False
+
+    def _close(self) -> None:
+        if self.fh:
+            try:
+                self.fh.close()
+            except OSError:
+                pass
+            self.fh = None
 
     def _rotate_if_big(self) -> None:
         # Keep one old copy (<log>.1); a chatty board can no longer grow the log without bound.
         try:
             if self.path.is_file() and self.path.stat().st_size >= self.max_bytes:
-                if self.fh:
-                    self.fh.close()
-                    self.fh = None
+                self._close()
                 self.path.replace(self.path.with_name(self.path.name + ".1"))
         except OSError:
             pass
@@ -138,19 +157,26 @@ class Logger:
                 print(line, flush=True)
             except (OSError, ValueError):  # pythonw / no console
                 pass
-            if self.fh:
-                self.fh.write(line + "\n")
-                self.fh.flush()
+            if not self.path:
+                return
+            for _attempt in (1, 2):
+                if self.fh is None and not self._open():
+                    break
                 try:
+                    if self.failed:
+                        self.fh.write(f"{ts()} (log: {self.failed} line(s) could not be written)\n")
+                        self.failed = 0
+                    self.fh.write(line + "\n")
+                    self.fh.flush()
                     big = self.fh.tell() >= self.max_bytes
                 except (OSError, ValueError):
-                    big = False
+                    self._close()          # reopen on the next attempt / line
+                    continue
                 if big:
                     self._rotate_if_big()
-                    try:
-                        self.fh = open(self.path, "a", encoding="utf-8")
-                    except OSError:
-                        self.fh = None
+                    self._close()
+                return
+            self.failed += 1
 
 
 # ---------------------------------------------------------------- process watcher

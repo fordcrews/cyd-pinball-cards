@@ -3,6 +3,20 @@
 Firmware versions are what a board reports in `ping` / `hello` / `ready` (`"fw"`). Host tools
 work with every firmware version listed here. Newer host features turn themselves off for older boards.
 
+## v1.6.1 (2026-10-12)
+
+* Firmware 1.6.1: night sleep now really turns off the backlight on the 2.8" and 3.5" CYDs. TFT_eSPI's
+  `init()` sets the backlight pin to a plain output after the PWM channel was attached, so on 1.6.0 and
+  earlier `brightness 0` was acked but the screen stayed lit. The PWM is now attached after `tft.init()`.
+  The 7" (on/off backlight through the IO expander) was not affected. Prebuilt images in `firmware/bin/` updated.
+* Night sleep is confirmed per display. A `brightness 0` that is not acked is retried after 20 s,
+  and every display is told `brightness 0` again every 10 minutes while asleep. A failed wake is retried too.
+  Before this, one lost command at 23:00 could leave a screen lit all night.
+* Daemon log: if opening or writing the log file fails, the daemon tries again on the next line and
+  notes how many lines were lost.
+* `host/cyd_supervise.py` + `host/windows/install-autostart.ps1`: start the daemon (and with it night
+  mode) at every logon and restart it if it exits. It leaves a daemon started by the LaunchBox plugin alone.
+
 ## v1.6.0 (2026-10-08)
 
 ### Firmware 1.6.0: self-healing link

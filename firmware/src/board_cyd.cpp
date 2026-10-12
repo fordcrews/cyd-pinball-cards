@@ -31,11 +31,14 @@ void boardBeginSerial(size_t rxBuf) {
 void boardSetBacklight(uint8_t v) { ledcWrite(BL_CHANNEL, v); }
 
 void boardInitDisplay(uint8_t rotation, uint8_t brightness) {
-  // Backlight PWM (Arduino-ESP32 core 2.x API), same order as firmware <= 1.3.0
+  tft.init();
+  // Backlight PWM (Arduino-ESP32 core 2.x API) only AFTER tft.init(): TFT_eSPI's init() does
+  // pinMode(TFT_BL, OUTPUT) + digitalWrite(TFT_BL, HIGH), which takes the pin away from an LEDC
+  // channel attached before it. Firmware <= 1.6.0 attached first, so "brightness" (and the night
+  // sleep's brightness 0) was acked but the backlight stayed fully on (fw 1.6.1 fix).
   ledcSetup(BL_CHANNEL, 5000, 8);
   ledcAttachPin(TFT_BL, BL_CHANNEL);
   boardSetBacklight(brightness);
-  tft.init();
   tft.setRotation(rotation);
   tft.fillScreen(TFT_BLACK);
 #if !defined(CYD_TOUCH_SHARED_SPI)

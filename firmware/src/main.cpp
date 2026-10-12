@@ -104,7 +104,7 @@
 #define IDENTIFY_MS 5000
 #endif
 
-#define FW_VERSION "1.6.0"
+#define FW_VERSION "1.6.1"
 #ifndef LOOP_WDT_S
 #define LOOP_WDT_S 30         // task watchdog on the main loop: a hang reboots the board
 #endif

@@ -202,6 +202,11 @@ class Schedule:
         return "active"
 
 
+SLEEP_RETRY_S = 20        # brightness 0 not acked (link hiccup, board busy): try again this soon
+SLEEP_REASSERT_S = 600    # asleep: send brightness 0 again this often (a board that lost it goes dark again)
+WAKE_RETRY_S = 20         # wake brightness not acked: try again
+
+
 class _Rot:
     __slots__ = ("pos", "next_at", "busy")
 
@@ -232,6 +237,9 @@ class NightController:
         self.force_until = 0.0
         self.rot: dict[str, _Rot] = {}
         self.slept: set[str] = self._load_slept()
+        self.dark: dict[str, float] = {}       # board id -> when its brightness 0 was last acked (this sleep)
+        self.bl_busy: set[str] = set()         # a brightness request is in flight for these boards
+        self.bl_retry: dict[str, float] = {}   # board id -> earliest retry after a failed brightness request
         self.kick = threading.Event()
         self.stop = threading.Event()
         for w in settings.warnings:
@@ -279,6 +287,7 @@ class NightController:
                        "active": ("quiet hours over" if self.state == "sleep" and not quiet
                                   else f"last activity {self.sched.idle_s() / 60:.0f} min ago")}[want]
                 self._go(want, why)
+            self._keep_backlights()
         if self.state == "info":
             self._poll_rotations()
 
@@ -291,6 +300,8 @@ class NightController:
         keep: boards whose keypad was just opened by a long-press (backlight only)."""
         old, self.state = self.state, want
         self.rot.clear()
+        self.dark.clear()
+        self.bl_retry.clear()
         self.log(f"screens: {old} -> {want} ({why})")
         links = self._links()
         if want == "sleep":
@@ -315,17 +326,59 @@ class NightController:
         return int(v) if isinstance(v, int) and 1 <= v <= 255 else self.s.brightness
 
     def _brightness(self, lk, value: int, why: str) -> None:
+        bid = lk.board.id if lk.board else lk.port
+        with self.lock:
+            self.bl_busy.add(bid)
+
         def job():
-            r = lk.request({"cmd": "brightness", "value": int(value)}, timeout=self.d.args.timeout)
-            who = lk.board.id if lk.board else lk.port
-            self.log(f"-> {who} brightness {value} ({why}): {'ok' if r.get('ok') else 'FAILED ' + str(r.get('err'))}")
+            ok = False
+            try:
+                r = lk.request({"cmd": "brightness", "value": int(value)}, timeout=self.d.args.timeout)
+                ok = bool(r.get("ok"))
+                self.log(f"-> {bid} brightness {value} ({why}): {'ok' if ok else 'FAILED ' + str(r.get('err'))}")
+            finally:
+                with self.lock:
+                    self.bl_busy.discard(bid)
+                    if value == 0 and self.state == "sleep":
+                        if ok:
+                            self.dark[bid] = self.now()
+                            self.bl_retry.pop(bid, None)
+                        else:
+                            self.dark.pop(bid, None)
+                            self.bl_retry[bid] = self.now() + SLEEP_RETRY_S
+                    elif value > 0 and not ok:
+                        # the wake did not reach the board: keep it on the list so it is tried again
+                        self.slept.add(bid)
+                        self._save_slept()
+                        self.bl_retry[bid] = self.now() + WAKE_RETRY_S
         lk.submit(job)
+
+    def _keep_backlights(self) -> None:
+        """Called from tick(). Asleep: every display must have acked brightness 0; resend when it
+        failed, and every SLEEP_REASSERT_S anyway. Awake: retry a wake that failed."""
+        t = self.now()
+        for lk in self._links():
+            bid = lk.board.id
+            if bid in self.bl_busy or t < self.bl_retry.get(bid, 0.0):
+                continue
+            if self.state == "sleep":
+                last = self.dark.get(bid)
+                if last is None and bid in self.bl_retry:
+                    self.bl_retry.pop(bid, None)
+                    self._brightness(lk, 0, "sleep: retry")
+                elif last is not None and t - last >= SLEEP_REASSERT_S:
+                    self.dark.pop(bid, None)
+                    self._brightness(lk, 0, "sleep: keep dark")
+            elif bid in self.slept and bid in self.bl_retry:
+                self.bl_retry.pop(bid, None)
+                self._wake_backlight(lk)
 
     def _sleep_board(self, lk) -> None:
         b = lk.board
         self.d.stop_gallery(lk)
         with self.d.state_lock:
             self.d.touch_until.pop(b.id, None)
+        self.dark.pop(b.id, None)
         self._brightness(lk, 0, "sleep")
         self.slept.add(b.id)
         self._save_slept()
@@ -466,7 +519,7 @@ class NightController:
         return {"ok": True, "state": self.state, "enabled": self.s.enabled, "quiet_now": self.sched.quiet(),
                 "idle_min": round(idle / 60, 1), "last_activity": self.sched.last_why,
                 "force": self.force, "force_left_s": max(0, int(self.force_until - self.now())) if self.force else 0,
-                "slept": sorted(self.slept), "settings": self.s.as_dict(),
+                "slept": sorted(self.slept), "dark_acked": sorted(self.dark), "settings": self.s.as_dict(),
                 "weather_place": self.feeds.place() or None,
                 "weather": {k: wx.get(k) for k in ("temp", "unit", "text")} if wx else None,
                 "news_source": (news or {}).get("source") or self.s.news_source,

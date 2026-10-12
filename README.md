@@ -18,7 +18,7 @@ sent to the boards.*
 ## Highlights
 
 * **Three boards, one firmware:** the 2.8" "Cheap Yellow Display" (ESP32-2432S028R),
-  the 3.5" ESP32-3248S035R and the 7" Waveshare ESP32-S3-Touch-LCD-7. All three run firmware 1.6.0 on real hardware.
+  the 3.5" ESP32-3248S035R and the 7" Waveshare ESP32-S3-Touch-LCD-7. All three run firmware 1.6.x on real hardware.
 * **USB or Wi-Fi.** Plug a board into the cabinet PC, or put it on the house Wi-Fi. It finds
   the cabinet by a UDP beacon and connects to the daemon on TCP port 47311.
 * **One to five displays, each with a job.** Seven content roles: `gallery` (box art, gameplay
@@ -152,6 +152,7 @@ cyd-pinball-cards/
 │   ├── cyd_links.py       link health per board; test drops and watchdog hangs on Wi-Fi boards
 │   ├── cyd_night.py       night/idle mode: status, info / sleep / wake now, slide previews
 │   ├── cyd_sim.py         send a sample idle playlist and card through the daemon (no frontend needed)
+│   ├── cyd_supervise.py   keep the daemon running (Startup folder via windows/install-autostart.ps1)
 │   ├── fake_cyd.py        device simulator: boards on PTYs (Linux/macOS) or an in-memory bus (any OS)
 │   ├── link_soak.py       Wi-Fi recovery soak for one board (drop, silence, close, hang)
 │   ├── usb_watchdog_test.py  watchdog test for one board on USB
@@ -199,7 +200,7 @@ cyd-pinball-cards/
    [Wireless displays](#wireless-displays-wifi-idle)). Without that file, the build is USB only.
 
 ### Option B: esptool (flash a prebuilt image without the toolchain)
-Prebuilt **firmware 1.6.0** images are in `firmware/bin/`. They were built **without Wi-Fi
+Prebuilt **firmware 1.6.1** images are in `firmware/bin/`. They were built **without Wi-Fi
 credentials**, so the board talks to the cabinet over **USB only**. For Wi-Fi use Option A with a
 `firmware/wifi.json` (see [Wireless displays](#wireless-displays-wifi-idle)).
 
@@ -1133,6 +1134,24 @@ info slides are pictures drawn on the PC for each screen size (firmware 1.5.0 `i
   left out and the clock keeps going.
 * Each display's last content is kept in `.cyd_cache/last_content.json`, so a restarted daemon
   puts the current game back on the screens when they reconnect.
+* Every sleep is confirmed. A display that does not ack `brightness 0` (a Wi-Fi hiccup at 23:00, a
+  board that is busy) is sent it again 20 s later. While asleep, every display is sent
+  `brightness 0` again every 10 minutes, so one that missed it or rejoined still goes dark. A wake
+  that is not acked is also retried. The daemon log has one `brightness 0 (sleep...)` line per try.
+  `python host/cyd_night.py` shows the state. The daemon's `night` status lists `dark_acked` boards.
+
+**Start it with Windows.** Night mode lives inside `cyd_daemon`, so the daemon has to be running
+at night. The LaunchBox plugin starts it only while LaunchBox is open. To start it at every logon
+and restart it if it ever exits, run this once:
+
+```
+powershell -ExecutionPolicy Bypass -File host\windows\install-autostart.ps1 -DaemonArgs "--profile arcade --log %TEMP%\cyd-daemon.log" -StartNow
+```
+
+The script adds a `cyd-daemon` shortcut to your Startup folder that runs `host/cyd_supervise.py`.
+If a daemon is already running (for example one the plugin started), the supervisor leaves it
+alone. Remove it with `-Uninstall`. Its log is `%TEMP%\cyd-supervise.log`. On Linux use
+`frontends/linux/cyd-daemon.service`.
 
 ![Night info slides on the 2.8 and 3.5 inch displays](docs/night-slides-cyd.png)
 

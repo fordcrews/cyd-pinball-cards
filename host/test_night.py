@@ -3,6 +3,8 @@
 and fake HTTP: no network, no serial port, no board is flashed.
     python -m unittest -v test_night.py
 """
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -413,6 +415,49 @@ class NightDaemon(BusCase):
         self.assertTrue(wait_until(lambda: b3.cmds("brightness")))
         self.assertEqual(b3.cmds("brightness")[-1]["value"], 0)
 
+    def test_unacked_sleep_is_retried_and_reasserted(self):
+        """A brightness 0 that times out (flaky Wi-Fi at 23:00) must not leave the screen lit all night."""
+        self.clock.t = at(22, 59)
+        self.b2.delay = {"brightness": 3.0}                            # longer than the 2 s ack timeout
+        d = self.start()
+        self.clock.t = at(23, 10)
+        self.assertTrue(self.tick_until(lambda: d.night.state == "sleep"))
+        self.assertTrue(wait_until(lambda: "cyd-aaa001" in d.night.dark and "cyd-aaa002" in d.night.bl_retry, 8))
+        self.assertNotIn("cyd-aaa002", d.night.dark)
+        self.assertTrue(any("brightness 0 (sleep): FAILED" in m for m in self.log.lines))
+        self.b2.delay = 0.0
+        n = len(self.b2.cmds("brightness"))
+        self.clock.add(0.2)                                            # 12 s: not yet
+        d.night.tick()
+        time.sleep(0.3)
+        self.assertEqual(len(self.b2.cmds("brightness")), n)
+        self.clock.add(0.2)                                            # 24 s: retried and acked
+        self.assertTrue(self.tick_until(lambda: "cyd-aaa002" in d.night.dark))
+        self.assertEqual(self.b2.cmds("brightness")[-1]["value"], 0)
+        self.assertTrue(any("brightness 0 (sleep: retry): ok" in m for m in self.log.lines))
+        # still asleep 10 minutes later: every display is told brightness 0 again
+        n1, n2 = len(self.b1.cmds("brightness")), len(self.b2.cmds("brightness"))
+        self.clock.add(10.5)
+        self.assertTrue(self.tick_until(lambda: len(self.b1.cmds("brightness")) > n1 and len(self.b2.cmds("brightness")) > n2))
+        self.assertEqual({self.b1.cmds("brightness")[-1]["value"], self.b2.cmds("brightness")[-1]["value"]}, {0})
+        self.assertTrue(any("(sleep: keep dark): ok" in m for m in self.log.lines))
+        self.assertEqual(d.night.status()["dark_acked"], ["cyd-aaa001", "cyd-aaa002"])
+
+    def test_unacked_wake_is_retried(self):
+        self.clock.t = at(6, 50)
+        d = self.start()
+        self.clock.add(6)
+        self.assertTrue(self.tick_until(lambda: d.night.state == "sleep" and len(self.b2.cmds("brightness")) == 1))
+        self.assertTrue(wait_until(lambda: "cyd-aaa002" in d.night.dark))
+        self.b2.delay = {"brightness": 3.0}
+        self.clock.t = at(7, 0)
+        self.assertTrue(self.tick_until(lambda: d.night.state != "sleep"))
+        self.assertTrue(wait_until(lambda: "cyd-aaa002" in d.night.bl_retry and "cyd-aaa002" in d.night.slept, 8))
+        self.b2.delay = 0.0
+        self.clock.add(0.5)
+        self.assertTrue(self.tick_until(lambda: "cyd-aaa002" not in d.night.slept and not d.night.bl_busy))
+        self.assertEqual(self.b2.cmds("brightness")[-1]["value"], 220)
+
     def test_test_mode_via_socket_and_per_board_brightness(self):
         self.write_config({"displays": {"cyd-aaa002": {"brightness": 150}}})
         d = self.start()
@@ -442,6 +487,37 @@ class NightDaemon(BusCase):
         d.night.tick()
         self.assertEqual(d.night.state, "active")
         self.assertFalse(d.handle_request({"op": "night", "action": "info"})["ok"])
+
+
+class LoggerFile(unittest.TestCase):
+    def test_rotation_and_recovery_after_failed_open_or_write(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "d.log"
+            quiet = contextlib.redirect_stdout(io.StringIO())
+            quiet.__enter__()
+            self.addCleanup(quiet.__exit__, None, None, None)
+            log = cyd_daemon.Logger(logfile=path, max_bytes=200)
+            for i in range(20):
+                log(f"line {i:02d} " + "x" * 20)
+            self.assertTrue(path.with_name("d.log.1").is_file())
+            self.assertIn("line 19", path.read_text(encoding="utf-8"))
+            # the file handle breaks (e.g. closed under us): the next line reopens it
+            log.fh.close()
+            log("after a broken handle")
+            self.assertIn("after a broken handle", path.read_text(encoding="utf-8"))
+            # opening fails for a while (file locked): lines are counted, then logging resumes
+            real_open = log._open
+            log._close()
+            log._open = lambda: False
+            log("lost 1")
+            log("lost 2")
+            self.assertEqual(log.failed, 2)
+            log._open = real_open
+            log("back again")
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("(log: 2 line(s) could not be written)", text)
+            self.assertIn("back again", text)
+            log._close()
 
 
 class Persistence(BusCase):

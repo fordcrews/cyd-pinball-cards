@@ -291,7 +291,7 @@ class FirmwareSource(unittest.TestCase):
     def test_reconnect_safety_nets_present(self):
         main = (FW_SRC / "main.cpp").read_text(encoding="utf-8")
         link = (FW_SRC / "wifi_link.cpp").read_text(encoding="utf-8")
-        self.assertRegex(main, r'#define FW_VERSION "1\.6\.0"')
+        self.assertRegex(main, r'#define FW_VERSION "1\.6\.[1-9]"')
         self.assertIn("esp_task_wdt_add(NULL)", main)
         loop = main[main.index("void loop()"):]
         self.assertIn("esp_task_wdt_reset()", loop[:200])
@@ -303,6 +303,15 @@ class FirmwareSource(unittest.TestCase):
         self.assertIn("hbArmed && millis() - lastRx > WIFI_SILENCE_DROP_MS", link)
         self.assertTrue(re.search(r"void linkHeartbeat\(\) \{ hbArmed = true; \}", link))
 
+
+    def test_cyd_backlight_pwm_attached_after_tft_init(self):
+        """TFT_eSPI's init() does pinMode(TFT_BL, OUTPUT): an LEDC channel attached before it is cut
+        off and the backlight stays on whatever brightness is set (fw <= 1.6.0 night sleep bug)."""
+        src = (FW_SRC / "board_cyd.cpp").read_text(encoding="utf-8")
+        body = src[src.index("void boardInitDisplay("):]
+        body = body[:body.index("\n}\n")]
+        self.assertLess(body.index("tft.init()"), body.index("ledcAttachPin(TFT_BL"))
+        self.assertLess(body.index("ledcAttachPin(TFT_BL"), body.index("boardSetBacklight(brightness)"))
 
 if __name__ == "__main__":
     unittest.main()
