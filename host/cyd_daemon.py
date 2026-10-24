@@ -746,6 +746,9 @@ class Daemon:
             return
         with self.state_lock:
             self.current = cur
+            # a newer push (LaunchBox, a frontend) replaces cyd_push's generic copy; cyd_push sends a
+            # fresh one ({"op":"web"}) right after its own per-board send
+            self.web_current = None
         if self.current_file is not None:
             try:
                 self.current_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1321,6 +1324,17 @@ class Daemon:
             self.log(f"web hub: cannot listen on {settings.bind}:{settings.port} ({e}); browser displays off")
             return None
         self.web_hub = hub
+        try:
+            import immich_source
+            ims = immich_source.ImmichSettings.from_config(self.st.config if isinstance(self.st.config, dict) else {})
+            if ims.enabled:
+                hub.photos = immich_source.ImmichSource(ims, cache, self.log)
+                threading.Thread(target=hub.photos.refresh, name="immich-list", daemon=True).start()
+                self.log(f"web hub: photoframe photos from Immich album {ims.album_id[:8]}... every {ims.interval:.0f}s")
+            elif isinstance(self.st.config, dict) and self.st.config.get("immich"):
+                self.log("web hub: immich needs url, album_id and an API key (api_key_env); photoframe shows the clock")
+        except Exception as e:
+            self.log(f"web hub: immich off ({type(e).__name__}: {e})")
         for h, p in bound:
             self.log(f"web hub: browser displays on http://{h}:{p}/?id=NAME&role=ROLE")
         return hub

@@ -68,3 +68,7 @@ These are written from the docs and source above but have not been run on a real
   mapped, R-Cade's own keyboard mapping, the ch341/cp210x/cdc_acm kernel drivers).
 * RetroPie images based on Debian Buster ship Python 3.7; the host scripts are tested on 3.8 and
   newer (and written to run on 3.7).
+
+## pi-display (Raspberry Pi browser display)
+
+Not a frontend: [pi-display/SETUP.md](pi-display/SETUP.md) turns a Raspberry Pi into a full-screen browser display for the web hub (Chromium kiosk).

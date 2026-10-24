@@ -1,0 +1,17 @@
+# Cabinet browser display on a Raspberry Pi (Raspberry Pi OS Bookworm), installed by install.sh.
+# A user service: it starts with the desktop session of the auto-login user.
+#   systemctl --user status cyd-kiosk      journalctl --user -u cyd-kiosk -f
+[Unit]
+Description=CYD cabinet browser display (Chromium kiosk)
+After=graphical-session.target network-online.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/cyd-kiosk/kiosk.env
+ExecStart=%h/.local/bin/cyd-kiosk
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
