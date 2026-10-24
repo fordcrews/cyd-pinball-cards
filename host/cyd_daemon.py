@@ -474,6 +474,8 @@ class Daemon:
         # the latest content push (LaunchBox pick, game exit, cyd_push): a display that was away
         # when it went out is caught up with it when it (re)connects
         self.current: dict | None = None
+        self.web_hub = None                          # host/web_hub.py (config.json "web_hub")
+        self.web_current: dict | None = None         # generic content from cyd_push for browsers
         self.current_file: Path | None = None
 
     def enable_persistence(self, path: Path) -> None:
@@ -752,6 +754,8 @@ class Daemon:
                 tmp.replace(self.current_file)
             except (OSError, TypeError, ValueError) as e:
                 self.log(f"could not save current content: {e}", debug=True)
+        if self.web_hub is not None:
+            self.web_hub.publish("content")       # never blocks; browsers update on their own thread
 
     def catch_up_msgs(self, b: displays.Board) -> list[dict] | None:
         """What this display should show for the newest content push, or None when that push says
@@ -1282,6 +1286,45 @@ class Daemon:
             stop.wait(self.args.poll)
 
     # ---- local socket (cyd_push hand-off)
+    def current_snapshot(self) -> dict | None:
+        """What browser displays show: the newest push. cyd_push sends per-CYD content plus a generic
+        copy ({"op":"web"}) right after it; a generic copy at least as new wins (it keeps every role)."""
+        with self.state_lock:
+            cur, web = self.current, self.web_current
+        if web and (not cur or web.get("time", 0) >= cur.get("time", 0) - 2.0):
+            return web
+        return cur
+
+    def web_info(self) -> dict:
+        """Extras for browser displays: weather, news and the night state (idle screens)."""
+        out: dict = {"night": None}
+        n = self.night
+        if n is not None:
+            out["night"] = n.state
+            out["clock_24h"] = bool(getattr(n.s, "clock_24h", False))
+            out["news_title"] = getattr(n.s, "news_title", "NEWS")
+            try:
+                w, news = n.feeds.snapshot()
+                out["weather"], out["news"] = w, news
+                out["place"] = n.feeds.place()
+            except Exception as e:
+                out["feed_err"] = f"{type(e).__name__}: {e}"
+        out["cabinet"] = self.st.config.get("cabinet") if isinstance(self.st.config, dict) else None
+        return out
+
+    def start_web_hub(self, settings, cache: Path | None = None):
+        import web_hub
+        hub = web_hub.WebHub(settings, self.current_snapshot, self.web_info, self.boards, self.log, cache)
+        try:
+            bound = hub.start()
+        except OSError as e:
+            self.log(f"web hub: cannot listen on {settings.bind}:{settings.port} ({e}); browser displays off")
+            return None
+        self.web_hub = hub
+        for h, p in bound:
+            self.log(f"web hub: browser displays on http://{h}:{p}/?id=NAME&role=ROLE")
+        return hub
+
     def status(self) -> dict:
         boards = self.boards()
         first = boards[0] if boards else None
@@ -1293,6 +1336,8 @@ class Daemon:
                 "profile": self.st.profile, "key_backend": self.injector.backend,
                 "virtual_gamepad": self.st.virtual_gamepad,
                 "wifi_port": self.wifi_hub.tcp_port if self.wifi_hub else None,
+                "web_hub": ({"port": self.web_hub.s.port, "clients": self.web_hub.client_list()}
+                            if self.web_hub else None),
                 "night": ({"state": self.night.state, "force": self.night.force} if self.night else None),
                 "links": self.link_stats.snapshot()}
 
@@ -1361,6 +1406,16 @@ class Daemon:
             if self.night is None:
                 return {"ok": False, "err": "night mode is not running in this daemon"}
             return self.night.handle(req)
+        if op == "web":
+            msgs = req.get("messages")
+            if not isinstance(msgs, list) or not all(isinstance(m, dict) and m.get("cmd") for m in msgs):
+                return {"ok": False, "err": "messages must be a list of {\"cmd\":...} objects"}
+            with self.state_lock:
+                self.web_current = {"messages": msgs, "target": req.get("target"), "time": time.time()}
+            if self.web_hub is None:
+                return {"ok": False, "err": "web hub is off"}
+            self.web_hub.publish("content (cyd_push)")
+            return {"ok": True, "clients": self.web_hub.client_list()}
         if op == "send":
             timeout = float(req.get("timeout", self.args.timeout))
             wait = req.get("wait", True) is not False
@@ -1409,6 +1464,9 @@ class Daemon:
         if self.night is not None:
             self.night.stop.set()
             self.night.kick.set()
+        if self.web_hub is not None:
+            self.web_hub.stop()
+            self.web_hub = None
         if self.wifi_hub is not None:
             self.wifi_hub.stop()
             self.wifi_hub = None
@@ -1488,6 +1546,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="LAN TCP port wireless displays dial (default 47311, env CYD_WIFI_PORT). "
                          "Not the localhost hand-off port. UDP beacon stays on 47311.")
     ap.add_argument("--no-wifi", action="store_true", help="do not listen for wireless displays")
+    ap.add_argument("--web-port", type=int, default=None,
+                    help="browser display hub port (turns the hub on; default: config.json \"web_hub\", 47321)")
+    ap.add_argument("--no-web", action="store_true", help="no browser display hub (TVs, Pi kiosk, photo frames)")
     ap.add_argument("--no-night", action="store_true",
                     help="no quiet-hours sleep / idle info screens (same as config.json \"night\": false)")
     ap.add_argument("--cards-dir", type=Path, default=None)
@@ -1527,6 +1588,13 @@ def main(argv=None) -> int:
             f"{ns.idle_minutes:g} min idle (config.json \"night\")")
     if not args.no_wifi:
         d.start_wifi(args.wifi_port)
+    import web_hub
+    hs = web_hub.HubSettings.from_config(d.st.config.get("web_hub") if isinstance(d.st.config, dict) else None)
+    if args.web_port:
+        hs.enabled, hs.port = True, args.web_port
+    if hs.enabled and not args.no_web:
+        d.start_web_hub(hs, cache)
+    night_seen = d.night.state
     log(f"cyd_daemon on {cyd_push.DAEMON_HOST}:{args.listen_port}; profile {d.st.profile}"
         f"{' (' + str(d.st.config_src) + ')' if d.st.config_src else ''}; key injection "
         f"{'DRY-RUN (logging only)' if d.injector.dry_run else 'via ' + d.injector.backend}"
@@ -1551,6 +1619,9 @@ def main(argv=None) -> int:
                 d.night.tick()
             except Exception as e:
                 log(f"night tick failed: {type(e).__name__}: {e}")
+            if d.web_hub is not None and d.night.state != night_seen:
+                night_seen = d.night.state
+                d.web_hub.publish(f"night {night_seen}")
             time.sleep(0.5)
     except KeyboardInterrupt:
         log("stopping")

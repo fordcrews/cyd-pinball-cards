@@ -3,6 +3,22 @@
 Firmware versions are what a board reports in `ping` / `hello` / `ready` (`"fw"`). Host tools
 work with every firmware version listed here. Newer host features turn themselves off for older boards.
 
+## Unreleased: browser displays (web hub, phase 1)
+
+* `host/web_hub.py`: the daemon can serve the same now-playing content to any browser (TV, Fire TV /
+  Android TV, a Chromecast tab, a Raspberry Pi in Chromium kiosk mode). HTTP + WebSocket on port 47321
+  (`config.json` `"web_hub": {"enabled", "port", "bind", "allow"}`, `--web-port`, `--no-web`), with a
+  long-poll fallback for old TV browsers. Standard library only; its own threads and a one-slot publish
+  queue, so a slow TV never delays the CYDs.
+* `http://<pc>:47321/?id=den-tv&role=picture`: a browser display gets the payload a CYD with that role
+  gets (control_panel, howtoplay, picture, pictureboxart, videoofplay, gallery, keyboard, all). Pictures
+  are cached full-size URLs (`/art/<key>.jpg`, at most 1920 px), not chunked; only files named in a
+  published payload can be fetched. Idle and night: clock, weather and news slides; sleep shows a dim clock.
+* `host/web/display.{html,js,css}`: ES5 page with auto-reconnect, wake lock, fullscreen on click, `&status=1`.
+* `cyd_push.py` also sends the generic content to the hub (`{"op":"web"}`), so browsers work with no CYD
+  connected. `displays.web_board()` is the virtual board for a browser. `status` lists browser clients.
+* Requests from outside loopback / LAN / Tailscale get 403. The hub never accepts keys.
+
 ## v1.6.1 (2026-10-12)
 
 * Firmware 1.6.1: night sleep now really turns off the backlight on the 2.8" and 3.5" CYDs. TFT_eSPI's

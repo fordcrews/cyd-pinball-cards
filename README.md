@@ -863,6 +863,14 @@ to-verify in that file, as are the optional hooks for showing idle when Popper s
   the display resets when coils fire (mostly a real-pinball or DOF-toy issue).
 * The ESP32's Wi-Fi is never turned on, so the board runs cool and needs no ventilation.
 
+## Browser displays (TVs, photo frames, Raspberry Pi)
+
+The daemon also serves the same content to web browsers. Turn it on with `"web_hub": {"enabled": true}` in
+`config.json`, or with `--web-port 47321`. Then open
+`http://<cabinet PC>:47321/?id=den-tv&role=picture` on a TV, a Fire TV running Fully Kiosk, or a Pi in
+Chromium kiosk mode. Roles work the same way they do for CYDs. When idle, the page shows a clock, weather and news.
+Setup for each device is in [docs/TV_DISPLAYS.md](docs/TV_DISPLAYS.md).
+
 ## Multiple displays (1 to 5 boards)
 
 Plug in several CYDs (right and left of the lockdown bar, a topper, one by the coin door...) and

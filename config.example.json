@@ -34,6 +34,12 @@
     "right"
   ],
   "exclude_ports": [],
+  "web_hub": {
+    "_comment": "Browser displays (TVs, Fire TV / Android TV, Chromecast tab, Raspberry Pi in Chromium kiosk). Open http://<this PC>:47321/?id=den-tv&role=picture. bind: \"0.0.0.0\" (every interface), or a list of this PC's LAN / Tailscale addresses. allow: who may connect (default: loopback, private LAN ranges, Tailscale 100.64.0.0/10). Read-only: browsers never send keys. See docs/TV_DISPLAYS.md.",
+    "enabled": true,
+    "port": 47321,
+    "bind": "0.0.0.0"
+  },
   "night": {
     "_comment": "Screens sleep in quiet hours (backlight off) and show clock / weather / news after idle_minutes without a LaunchBox pick, launch or touch. Times are local 24 h (\"23:00\"); \"\" turns the sleep off, idle_minutes 0 the info slides. weather_location: \"City, ST\", \"lat,lon\" or \"\"; weather_lat/weather_lon pin exact coordinates (one IP lookup, cached in .cyd_cache/location.json). news_feed: any RSS/Atom URL (default The Verge tech headlines; news_title is the slide heading). Test: python host/cyd_night.py info|sleep|wake|auto.",
     "enabled": true,

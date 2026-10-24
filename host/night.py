@@ -502,7 +502,8 @@ class NightController:
     def feed_loop(self) -> None:
         while not self.stop.is_set():
             try:
-                if self.s.enabled and self.feed_wanted():
+                hub = getattr(self.d, "web_hub", None)       # browsers show weather/news when idle
+                if self.s.enabled and (self.feed_wanted() or (hub is not None and hub.client_list())):
                     self.feeds.refresh()
             except Exception as e:      # never let a feed kill the thread
                 self.log(f"info feed error: {type(e).__name__}: {e}")
