@@ -39,8 +39,10 @@ def jpeg(color=(10, 120, 200)) -> bytes:
 class FakeImmich:
     """Minimal read-only Immich: album, random search, thumbnails. Counts requests."""
 
-    def __init__(self, ids=IDS, random_api=True, fail=False):
+    def __init__(self, ids=IDS, random_api=True, fail=False, embed_assets=True, missing_thumbs=None):
         self.ids, self.random_api, self.fail = list(ids), random_api, fail
+        self.embed_assets = embed_assets
+        self.missing_thumbs = set(missing_thumbs or [])
         self.hits: list[str] = []
         fake = self
 
@@ -63,8 +65,22 @@ class FakeImmich:
                     return self._out(401, b'{"message":"Invalid API key"}')
                 p = self.path.split("?")[0]
                 if method == "GET" and p == f"/api/albums/{ALBUM}":
-                    assets = [{"id": i, "type": "IMAGE"} for i in fake.ids] + [{"id": "bbbbbbbb-1111", "type": "VIDEO"}]
-                    return self._out(200, json.dumps({"id": ALBUM, "assets": assets}).encode())
+                    body = {"id": ALBUM, "assetCount": len(fake.ids)}
+                    if fake.embed_assets:
+                        body["assets"] = ([{"id": i, "type": "IMAGE"} for i in fake.ids]
+                                          + [{"id": "bbbbbbbb-1111", "type": "VIDEO"}])
+                    return self._out(200, json.dumps(body).encode())
+                if method == "POST" and p == "/api/search/metadata":
+                    body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                    size = int(body.get("size") or 1000)
+                    page = int(body.get("page") or 1)
+                    start = (page - 1) * size
+                    chunk = fake.ids[start:start + size]
+                    nxt = str(page + 1) if start + size < len(fake.ids) else None
+                    payload = {"assets": {"items": [{"id": i, "type": "IMAGE"} for i in chunk],
+                                          "total": len(chunk), "count": len(chunk),
+                                          "nextPage": nxt}}
+                    return self._out(200, json.dumps(payload).encode())
                 if method == "POST" and p == "/api/search/random":
                     if not fake.random_api:
                         return self._out(404, b"{}")
@@ -72,6 +88,8 @@ class FakeImmich:
                     return self._out(200, json.dumps([{"id": i} for i in fake.ids[:n]]).encode())
                 if method == "GET" and p.startswith("/api/assets/") and p.endswith("/thumbnail"):
                     aid = p.split("/")[3]
+                    if aid in fake.missing_thumbs:
+                        return self._out(404, b'{"message":"Asset media not found"}')
                     if aid in fake.ids:
                         return self._out(200, jpeg(), "image/jpeg")
                 return self._out(404, b"{}")
@@ -251,6 +269,37 @@ class HubPhotoframeTest(unittest.TestCase):
     def test_quiet_setting_parsed(self):
         self.assertEqual(web_hub.HubSettings.from_config({"photoframe_quiet": "off"}).photoframe_quiet, "off")
         self.assertEqual(web_hub.HubSettings.from_config({"photoframe_quiet": "bogus"}).photoframe_quiet, "clock")
+
+
+
+class Immich3xListingTest(unittest.TestCase):
+    """Immich 3.x omits album.assets; list via search/metadata and skip 404 thumbs."""
+
+    def tearDown(self):
+        self.fake.close()
+
+    def test_lists_via_metadata_when_album_omits_assets(self):
+        self.fake = FakeImmich(embed_assets=False)
+        src = immich_source.ImmichSource(
+            immich_source.ImmichSettings(self.fake.url, KEY, ALBUM, 30), timeout=5)
+        self.assertTrue(src.refresh(force=True))
+        self.assertEqual(len(src.ids), len(IDS))
+        self.assertTrue(any(h.startswith("POST /api/search/metadata") for h in self.fake.hits))
+
+    def test_skips_missing_thumbnail_and_next_photo_finds_ready(self):
+        missing = set(IDS[:4])  # first four 404; last two OK
+        self.fake = FakeImmich(missing_thumbs=missing)
+        src = immich_source.ImmichSource(
+            immich_source.ImmichSettings(self.fake.url, KEY, ALBUM, 30), timeout=5)
+        self.assertTrue(src.refresh(force=True))
+        self.assertIsNone(src.photo(IDS[0]))
+        self.assertIn(IDS[0], src.missing)
+        got = src.next_photo()
+        self.assertIsNotNone(got)
+        aid, data, ctype = got
+        self.assertIn(aid, IDS[4:])
+        self.assertTrue(data.startswith(b"\xff\xd8\xff") or len(data) > 0)
+        self.assertEqual(ctype, "image/jpeg")
 
 
 if __name__ == "__main__":

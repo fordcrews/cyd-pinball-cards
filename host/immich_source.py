@@ -6,8 +6,10 @@ config.json:
 
 The API key stays on the cabinet PC: the hub fetches the pictures and serves them as
 /photo/<asset id>.jpg, so browsers never see the key or the Immich address. Read-only:
-only GET /api/albums/<id> (asset list), POST /api/search/random (random pick, when the
-server has it) and GET /api/assets/<id>/thumbnail are used. Standard library only.
+GET /api/albums/<id> (assetCount; Immich 3.x omits assets), POST /api/search/metadata
+(paginated album asset ids), POST /api/search/random (when the list is empty / as
+fallback) and GET /api/assets/<id>/thumbnail. Standard library only. Missing thumbnails
+(404 while Immich is still generating them) are skipped, not treated as a hard outage.
 """
 from __future__ import annotations
 
@@ -27,6 +29,9 @@ LIST_REFRESH_S = 15 * 60       # re-read the album's asset list (new photos whil
 RETRY_S = 60                   # after a failure, try again this long later
 MEM_CACHE = 24                 # pictures kept in memory
 DISK_CACHE_MAX = 400           # pictures kept in .cyd_cache/immich
+PAGE_SIZE = 1000               # Immich search/metadata page size
+MISSING_THUMB_MAX = 500        # ids with 404 thumbs we skip for a while
+NEXT_PHOTO_TRIES = 12          # attempts to find an id with a ready thumbnail
 
 
 class ImmichSettings:
@@ -86,6 +91,7 @@ class ImmichSource:
         self.mem: OrderedDict[str, bytes] = OrderedDict()
         self.random_api = True
         self.queue: list[str] = []        # shuffled order, so every photo comes up before repeats
+        self.missing: OrderedDict[str, float] = OrderedDict()  # id -> first-seen time (404 thumb)
 
     # ------------------------------------------------------------------ http
     def _req(self, method: str, path: str, body: dict | None = None, accept="application/json"):
@@ -104,24 +110,65 @@ class ImmichSource:
         self.last_error = msg
 
     # ------------------------------------------------------------------ assets
+    def _asset_ids(self, assets) -> list[str]:
+        return [a["id"] for a in (assets or []) if isinstance(a, dict) and a.get("id")
+                and str(a.get("type", "IMAGE")).upper() == "IMAGE" and not a.get("isTrashed")
+                and ASSET_ID.match(str(a["id"]))]
+
+    def _list_via_search(self, max_pages: int = 3) -> list[str]:
+        """Immich 3.x album GET omits assets; sample via search/metadata.
+
+        Large albums (100k+) are not fully paged — a few pages seed the shuffle
+        queue, and next_batch falls back to /search/random for the rest.
+        nextPage from Immich is a string; the API requires a numeric page.
+        """
+        ids: list[str] = []
+        page = 1
+        pages = 0
+        while pages < max_pages:
+            raw, _ = self._req("POST", "/api/search/metadata",
+                               {"albumIds": [self.s.album_id], "type": "IMAGE",
+                                "size": PAGE_SIZE, "page": page})
+            body = json.loads(raw.decode("utf-8"))
+            assets = body.get("assets") if isinstance(body, dict) else None
+            items = (assets or {}).get("items") if isinstance(assets, dict) else None
+            if not isinstance(items, list) or not items:
+                break
+            ids.extend(self._asset_ids(items))
+            pages += 1
+            nxt = (assets or {}).get("nextPage")
+            if nxt is None or nxt == "" or nxt is False:
+                break
+            try:
+                page = int(nxt)
+            except (TypeError, ValueError):
+                page += 1
+        return ids
+
     def refresh(self, force: bool = False) -> bool:
         if not self.s.enabled:
             return False
         now = time.time()
         if not force and (now - self.listed_at < LIST_REFRESH_S or now - self.fail_at < RETRY_S):
             return bool(self.ids)
+        ids: list[str] = []
+        asset_count = None
         try:
             raw, _ = self._req("GET", f"/api/albums/{self.s.album_id}")
-            assets = json.loads(raw.decode("utf-8")).get("assets") or []
+            alb = json.loads(raw.decode("utf-8"))
+            if isinstance(alb, dict):
+                asset_count = alb.get("assetCount")
+                ids = self._asset_ids(alb.get("assets"))
+            if not ids:
+                # Immich 3.x: no embedded assets — seed a shuffle sample.
+                ids = self._list_via_search()
         except Exception as e:
             self._fail("album list", e)
             return bool(self.ids)
-        ids = [a["id"] for a in assets if isinstance(a, dict) and a.get("id")
-               and str(a.get("type", "IMAGE")).upper() == "IMAGE" and not a.get("isTrashed")
-               and ASSET_ID.match(str(a["id"]))]
         with self.lock:
             if len(ids) != len(self.ids):
-                self.log(f"immich: album has {len(ids)} photos")
+                extra = f" (album reports {asset_count})" if asset_count not in (None, "") else ""
+                self.log(f"immich: album has {len(ids)} photos listed{extra}")
             self.ids = ids
             self.known.update(ids)
             self.queue = [i for i in self.queue if i in self.known]
@@ -174,12 +221,25 @@ class ImmichSource:
     def _disk(self, aid: str) -> Path | None:
         return self.cache_dir / f"{aid}-{self.s.size}.jpg" if self.cache_dir else None
 
+    def _mark_missing(self, aid: str) -> None:
+        with self.lock:
+            self.missing[aid] = time.time()
+            self.missing.move_to_end(aid)
+            while len(self.missing) > MISSING_THUMB_MAX:
+                self.missing.popitem(last=False)
+
     def photo(self, aid: str) -> tuple[bytes, str] | None:
-        """JPEG for an id that came from this album (anything else -> None)."""
+        """JPEG for an id that came from this album (anything else -> None).
+
+        A 404 (thumbnail not generated yet) is skipped and remembered; it does not
+        trip the hard-failure backoff used for network/auth errors.
+        """
         if not ASSET_ID.match(aid or ""):
             return None
         with self.lock:
             if aid not in self.known:
+                return None
+            if aid in self.missing:
                 return None
             if aid in self.mem:
                 self.mem.move_to_end(aid)
@@ -191,6 +251,12 @@ class ImmichSource:
             try:
                 data, ctype = self._req("GET", f"/api/assets/{aid}/thumbnail?size={self.s.size}",
                                         accept="image/*")
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    self._mark_missing(aid)
+                    return None
+                self._fail(f"photo {aid[:8]}", e)
+                return None
             except Exception as e:
                 self._fail(f"photo {aid[:8]}", e)
                 return None
@@ -208,6 +274,30 @@ class ImmichSource:
             while len(self.mem) > MEM_CACHE:
                 self.mem.popitem(last=False)
         return data, "image/jpeg"
+
+    def next_photo(self) -> tuple[str, bytes, str] | None:
+        """Pick the next album photo that already has a thumbnail (skip 404s).
+
+        Tries the shuffle queue first, then /search/random — useful while Immich is
+        still generating thumbnails for a large library.
+        """
+        for i in range(NEXT_PHOTO_TRIES):
+            if i and i % 2 == 1:
+                batch = self._random_search(1)
+                if batch:
+                    with self.lock:
+                        self.known.update(batch)
+                else:
+                    batch = self.next_batch(1)
+            else:
+                batch = self.next_batch(1)
+            if not batch:
+                continue
+            aid = batch[0]
+            got = self.photo(aid)
+            if got:
+                return aid, got[0], got[1]
+        return None
 
     def prefetch(self, ids) -> None:
         def run():

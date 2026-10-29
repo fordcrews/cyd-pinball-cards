@@ -213,11 +213,26 @@ class WebHub:
         return msgs, title
 
     def photo_batch(self, n: int) -> list[str]:
+        """Return /photo/<id>.jpg URLs that already have a fetchable thumbnail.
+
+        Immich may 404 on assets whose thumbs are still generating; skip those so
+        the photoframe never gets a broken URL in the batch.
+        """
         if self.photos is None:
             return []
-        ids = self.photos.next_batch(max(1, min(10, n)))
-        self.photos.prefetch(ids)
-        return [f"/photo/{i}.jpg" for i in ids]
+        n = max(1, min(10, n))
+        ready: list[str] = []
+        # Bound attempts so a mostly-unthumbnailed library cannot stall the hub.
+        for _ in range(n * 4):
+            if len(ready) >= n:
+                break
+            got = self.photos.next_photo()
+            if not got:
+                break
+            ready.append(got[0])
+        if ready:
+            self.photos.prefetch(ready)
+        return [f"/photo/{i}.jpg" for i in ready]
 
     def payload(self, cid: str, role: str) -> dict:
         board = self.web_board(cid, role)
