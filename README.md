@@ -869,6 +869,9 @@ The daemon also serves the same content to web browsers. Turn it on with `"web_h
 `config.json`, or with `--web-port 47321`. Then open
 `http://<cabinet PC>:47321/?id=den-tv&role=picture` on a TV, a Fire TV running Fully Kiosk, or a Pi in
 Chromium kiosk mode. Roles work the same way they do for CYDs. When idle, the page shows a clock, weather and news.
+Use `role=photoframe` on an always-on screen: it shows box art plus a now-playing banner during a game,
+and random photos from an Immich album (`"immich"` in config) when idle. For a Raspberry Pi,
+[frontends/pi-display](frontends/pi-display/SETUP.md) installs a Chromium kiosk service.
 Setup for each device is in [docs/TV_DISPLAYS.md](docs/TV_DISPLAYS.md).
 
 ## Multiple displays (1 to 5 boards)

@@ -203,6 +203,15 @@ class TestDaemonHook(unittest.TestCase):
         self.assertEqual(calls, ["content"])
         self.assertEqual(fake.current["messages"][0]["title"], "Attack from Mars")
 
+    def test_newer_push_replaces_cyd_push_generic_copy(self):
+        fake = types.SimpleNamespace(state_lock=threading.Lock(), current=None, current_file=None,
+                                     log=lambda *a, **k: None, web_hub=None,
+                                     web_current={"messages": [{"cmd": "idle"}], "time": time.time()})
+        cyd_daemon.Daemon.note_current(fake, {"op": "send", "messages": [dict(GAME)]})
+        self.assertIsNone(fake.web_current)
+        snap = cyd_daemon.Daemon.current_snapshot(fake)
+        self.assertEqual(snap["messages"][0]["title"], "Attack from Mars")
+
     def test_parser_flags(self):
         a = cyd_daemon.build_parser().parse_args(["--web-port", "48001", "--no-web"])
         self.assertEqual((a.web_port, a.no_web), (48001, True))

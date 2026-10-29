@@ -1,6 +1,7 @@
 /* Cabinet browser display (host/web_hub.py). ES5 only: old TV browsers, Fire TV Silk, Pi Chromium.
    URL: /?id=den-tv&role=picture   roles: all, control_panel, howtoplay, picture, pictureboxart,
-   videoofplay, gallery, keyboard. Add &status=1 to show the link state in a corner. */
+   videoofplay, gallery, keyboard, photoframe (box art + now-playing banner in a game, Immich photos
+   when idle). Add &status=1 to show the link state in a corner. */
 (function () {
   "use strict";
   var q = parseQuery(location.search);
@@ -98,8 +99,64 @@
     if (timer) clearTimeout(timer);
     timer = setTimeout(function () { rotIndex++; render(false); }, Math.max(3, sec || 10) * 1000);
   }
+  /* ---------------- photoframe role ---------------- */
+  var photoQ = [], photoBusy = false, photoTimer = null, photoShown = "";
+  function fetchPhotos(cb) {
+    if (photoBusy) return;
+    photoBusy = true;
+    var x = new XMLHttpRequest();
+    x.open("GET", "/api/photos?n=4&" + qs() + "&_=" + new Date().getTime(), true);
+    x.timeout = 30000;
+    x.onload = function () {
+      photoBusy = false;
+      try { var r = JSON.parse(x.responseText); photoQ = photoQ.concat(r.photos || []); } catch (e) {}
+      for (var i = 0; i < photoQ.length; i++) { var im = new Image(); im.src = photoQ[i]; }  // preload
+      if (cb) cb();
+    };
+    x.onerror = x.ontimeout = function () { photoBusy = false; if (cb) cb(); };
+    x.send();
+  }
+  function drawPhoto(pf, info, dim) {
+    var secs = pf.interval || 30;
+    if (!photoTimer) photoTimer = setTimeout(function () { photoTimer = null; nextPhoto(); }, secs * 1000);
+    if (photoQ.length < 2) fetchPhotos(photoQ.length ? null : function () { if (photoQ.length) nextPhoto(); });
+    if (!photoShown) { if (!photoQ.length) { drawClock(info); return; } photoShown = photoQ.shift(); }
+    var u = esc(photoShown), banner = pf.playing ? '<div class="np"><span>NOW PLAYING</span>' + esc(pf.playing) + "</div>" : "";
+    show('<div class="bg" style="background-image:url(\'' + u + '\')"></div><img src="' + u + '" alt="">' + banner +
+         '<div class="pclock">' + timeText(info) + "</div>", "pic photo" + (dim ? " dim" : ""));
+    var img = stage.getElementsByTagName("img")[0];
+    img.onerror = function () { photoShown = ""; if (photoQ.length) nextPhoto(); };
+  }
+  function nextPhoto() {
+    if (photoQ.length) photoShown = photoQ.shift();
+    if (state && state.photoframe) render(false);
+  }
+  function renderPhotoframe(info, m) {
+    var pf = state.photoframe;
+    if (info.night === "sleep") {
+      if (pf.quiet === "off") { show("", "off"); return schedule(60); }
+      if (pf.quiet === "clock" || !pf.photos) { drawSleep(); return schedule(30); }
+      return drawPhoto(pf, info, true);
+    }
+    if (m && (m.cmd === "image" || m.cmd === "gallery")) {   // a game is running: its box art + banner
+      if (photoTimer) { clearTimeout(photoTimer); photoTimer = null; }
+      var it = m.cmd === "image" ? m : (m.items || [])[rotIndex % Math.max(1, (m.items || []).length)] || {};
+      var url = it.url;
+      if (url) {
+        var u = esc(url);
+        show('<div class="bg" style="background-image:url(\'' + u + '\')"></div><img src="' + u + '" alt="">' +
+             '<div class="np"><span>NOW PLAYING</span>' + esc(pf.playing || m.title || it.title || "") + "</div>", "pic photo");
+        return schedule(m.interval || 60);
+      }
+    }
+    if (!pf.photos) { if (pf.playing) { show('<div class="np big"><span>NOW PLAYING</span>' + esc(pf.playing) + "</div>", "text"); return schedule(60); } return drawInfo(info, m); }
+    if (timer) { clearTimeout(timer); timer = null; }
+    drawPhoto(pf, info, false);
+  }
+
   function render(fresh) {
     var info = (state && state.info) || {};
+    if (state && state.photoframe) return renderPhotoframe(info, content());
     var m = content();
     var key = m ? JSON.stringify(m) : "none";
     if (fresh && key !== rotKey) { rotKey = key; rotIndex = 0; }
@@ -208,7 +265,7 @@
   }
 
   setInterval(function () {        // keep the clock ticking on clock / sleep screens
-    var el = stage.querySelector && stage.querySelector(".time");
+    var el = stage.querySelector && (stage.querySelector(".time") || stage.querySelector(".pclock"));
     if (el && state) el.innerHTML = timeText(state.info || {});
   }, 10000);
   setStatus("connecting...");

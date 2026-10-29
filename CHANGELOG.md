@@ -3,6 +3,19 @@
 Firmware versions are what a board reports in `ping` / `hello` / `ready` (`"fw"`). Host tools
 work with every firmware version listed here. Newer host features turn themselves off for older boards.
 
+## Unreleased: photo frames and Raspberry Pi kiosk (web hub, phases 3 and 4)
+
+* New `photoframe` browser role (`?role=photoframe`). During a game it shows the game's box art (or picture) with a
+  NOW PLAYING banner. When idle it shows random photos from an Immich album (`host/immich_source.py`, config
+  `"immich": {url, api_key_env | api_key, album_id, interval}`), shuffled so none repeats before all have shown,
+  with a corner clock. Quiet hours follow `night`: `web_hub.photoframe_quiet` is `clock` (default), `dim` or `off`.
+* The hub fetches the photos itself (`/photo/<id>.jpg`, `/api/photos?n=`), keeping 24 in memory and the last 400 on disk
+  (`.cyd_cache/immich`) and fetching ahead, so browsers never see the API key or the Immich address. Only photos
+  from the configured album are served. Read-only Immich calls only. If Immich is down, the frame keeps showing cached photos.
+* `frontends/pi-display/`: `install.sh` (asks for the URL, or takes `--url`), the user service `cyd-kiosk.service` and
+  `SETUP.md`. Chromium kiosk on Raspberry Pi OS Bookworm (Wayland and X11), screen blanking off, waits for the cabinet PC.
+* docs/TV_DISPLAYS.md: the photo frame, step-by-step Fire TV / Fully Kiosk setup, and Chromecast / Google TV options.
+
 ## Unreleased: browser displays (web hub, phase 1)
 
 * `host/web_hub.py`: the daemon can serve the same now-playing content to any browser (TV, Fire TV /

@@ -52,8 +52,10 @@ STATIC = {"/": "display.html", "/index.html": "display.html", "/display.html": "
 
 
 class HubSettings:
-    def __init__(self, enabled=False, port=DEFAULT_PORT, bind="0.0.0.0", allow=None):
+    def __init__(self, enabled=False, port=DEFAULT_PORT, bind="0.0.0.0", allow=None, photoframe_quiet="clock"):
         self.enabled = bool(enabled)
+        # photoframe role in quiet hours: "clock" (dim clock), "dim" (photos, darkened) or "off" (black)
+        self.photoframe_quiet = photoframe_quiet if photoframe_quiet in ("clock", "dim", "off") else "clock"
         self.port = int(port)
         self.bind = bind if isinstance(bind, list) else [str(bind or "0.0.0.0")]
         self.allow = list(allow) if allow else list(DEFAULT_ALLOW)
@@ -65,7 +67,8 @@ class HubSettings:
         if not isinstance(cfg, dict):
             return cls()
         return cls(enabled=cfg.get("enabled", True), port=cfg.get("port", DEFAULT_PORT),
-                   bind=cfg.get("bind", "0.0.0.0"), allow=cfg.get("allow"))
+                   bind=cfg.get("bind", "0.0.0.0"), allow=cfg.get("allow"),
+                   photoframe_quiet=str(cfg.get("photoframe_quiet", "clock")))
 
 
 def ws_accept_key(key: str) -> str:
@@ -101,6 +104,7 @@ class WebHub:
         self.get_boards = boards or (lambda: [])
         self.log = log or (lambda m, debug=False: None)
         self.cache_dir = Path(cache_dir) / "web_art" if cache_dir else None
+        self.photos = None                     # immich_source.ImmichSource (photoframe role), or None
         self.version = 0
         self.cond = threading.Condition()
         self.q: queue.Queue = queue.Queue(maxsize=1)
@@ -195,16 +199,60 @@ class WebHub:
             m["fallback"] = self._webify(m["fallback"])
         return m
 
+    def _photoframe_messages(self, cid: str) -> tuple[list[dict], str | None]:
+        """Box art (else any picture) for the running game, and its title for the banner."""
+        msgs: list[dict] = []
+        for r in ("pictureboxart", "picture"):
+            msgs = [m for m in self._messages_for(self.web_board(cid, r)) if m.get("cmd") in ("image", "gallery")]
+            if msgs:
+                break
+        title = None
+        for m in self._messages_for(self.web_board(cid, "all")):
+            if m.get("cmd") in ("table", "image", "gallery"):
+                title = m.get("title") or title
+        return msgs, title
+
+    def photo_batch(self, n: int) -> list[str]:
+        """Return /photo/<id>.jpg URLs that already have a fetchable thumbnail.
+
+        Immich may 404 on assets whose thumbs are still generating; skip those so
+        the photoframe never gets a broken URL in the batch.
+        """
+        if self.photos is None:
+            return []
+        n = max(1, min(10, n))
+        ready: list[str] = []
+        # Bound attempts so a mostly-unthumbnailed library cannot stall the hub.
+        for _ in range(n * 4):
+            if len(ready) >= n:
+                break
+            got = self.photos.next_photo()
+            if not got:
+                break
+            ready.append(got[0])
+        if ready:
+            self.photos.prefetch(ready)
+        return [f"/photo/{i}.jpg" for i in ready]
+
     def payload(self, cid: str, role: str) -> dict:
         board = self.web_board(cid, role)
-        msgs = [self._webify(m) for m in self._messages_for(board)]
+        extra = {}
+        if displays._fold(role) == "photoframe":
+            raw, title = self._photoframe_messages(cid)
+            msgs = [self._webify(m) for m in raw]
+            ps = self.photos
+            extra["photoframe"] = {"playing": title, "quiet": self.s.photoframe_quiet,
+                                   "interval": ps.s.interval if ps else 30,
+                                   "photos": ps is not None, "source": ps.status() if ps else None}
+        else:
+            msgs = [self._webify(m) for m in self._messages_for(board)]
         try:
             info = self.get_info() or {}
         except Exception as e:                      # never let a feed break a screen
             info = {"err": f"{type(e).__name__}: {e}"}
         return {"v": self.version, "id": cid, "role": board.role, "time": time.time(),
                 "tz_offset": -time.timezone if not time.localtime().tm_isdst else -time.altzone,
-                "messages": msgs, "info": info}
+                "messages": msgs, "info": info, **extra}
 
     # ---------------------------------------------------------------- serving
     def allowed(self, addr: str) -> bool:
@@ -350,6 +398,19 @@ class _Handler(BaseHTTPRequestHandler):
         if path.startswith("/art/"):
             key = path[5:].split(".")[0]
             got = hub.art_bytes(key) if key.isalnum() else None
+            if got is None:
+                return self._send(404, b"not found\n", "text/plain")
+            return self._send(200, got[0], got[1], {"Cache-Control": "public, max-age=86400"})
+        if path == "/api/photos":
+            try:
+                n = int((qs.get("n") or ["3"])[0])
+            except ValueError:
+                n = 3
+            return self._json({"ok": hub.photos is not None, "photos": hub.photo_batch(n),
+                               "source": hub.photos.status() if hub.photos else None})
+        if path.startswith("/photo/"):
+            aid = path[7:].rsplit(".", 1)[0]
+            got = hub.photos.photo(aid) if hub.photos is not None else None
             if got is None:
                 return self._send(404, b"not found\n", "text/plain")
             return self._send(200, got[0], got[1], {"Cache-Control": "public, max-age=86400"})
