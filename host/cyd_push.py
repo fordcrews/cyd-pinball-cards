@@ -1271,8 +1271,18 @@ def main(argv=None) -> int:
     listed: list[Board] = []
     direct_ports: list[str] | None = None
 
+    web_only = False
     if not args.no_daemon:
         dst = daemon_request({"op": "status"}, timeout=1.5)
+        if dst and dst.get("web_hub") and plan:
+            # browser displays (host/web_hub.py) get the generic content and specialize it per role
+            # themselves, even when no CYD is connected
+            web_msgs = [m for m in board_messages(plan, None) if isinstance(m, dict) and m.get("cmd") in ("table", "idle")]
+            if web_msgs:
+                wr = daemon_request({"op": "web", "messages": web_msgs, "target": select_target}, timeout=3.0)
+                if wr and wr.get("ok"):
+                    log(f"daemon: browser displays updated ({len(wr.get('clients') or [])} connected)", args.quiet)
+                    web_only = not dst.get("boards") and not explicit_ports
         if dst and isinstance(dst.get("boards"), list) and dst["boards"]:
             boards = [Board.from_dict(b) for b in dst["boards"]]
             if explicit_ports:
@@ -1317,6 +1327,9 @@ def main(argv=None) -> int:
                        "(keypad_roles / keypad off?)")
                 log(f"{why} (connected: {', '.join(b.label() for b in boards) or 'none'})")
                 return 2
+        elif dst and web_only:
+            log("no CYD connected; sent to browser displays only", args.quiet)
+            return 0
         elif dst:
             log("daemon running but no display connected; trying the ports directly", args.quiet)
 

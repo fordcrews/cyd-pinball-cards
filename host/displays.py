@@ -155,6 +155,14 @@ class Board:
         return cls(**known)
 
 
+def web_board(client_id: str, role: str = "all", w: int = 1920, h: int = 1080) -> Board:
+    """A browser display of the web hub (host/web_hub.py): a virtual board with the given role, so
+    the same per-role builders (cyd_push.specialize_message) serve TVs, Pi kiosks and photo frames."""
+    role = str(role or "all").strip() or "all"
+    return Board(port=f"web:{client_id}", id=str(client_id), name=str(client_id), role=role,
+                 fw="web", mode="web", keypad=False, hw="web", w=int(w), h=int(h), img_max=0)
+
+
 def identity_from_reply(reply: dict | None, port: str) -> dict:
     """ping/hello (or ready/config) reply -> identity fields. No id (fw 1.2.0) -> legacy."""
     reply = reply or {}
