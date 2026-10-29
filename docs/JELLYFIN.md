@@ -50,8 +50,8 @@ The hub already has `info_feeds.py`; RSS polling should reuse it.
 ### Rules
 - **Quiet hours** 23:00–07:00 local (configurable). During quiet hours: drop `news`, keep `doorbell`
   (configurable per priority), phone/SMS follow config.
-- Priorities: `high` (doorbell, call) bypass rate limits; `normal` (SMS); `low` (news, max 1 per 15 min,
-  never while paused/menus? — send only while playing).
+- Priorities: `high` (doorbell, call) bypass rate limits; `normal` (SMS); `low` (news, max 1 per 15 min).
+  News alerts only go out while something is playing.
 - Dedupe identical alerts within 60 s. Truncate Text to ~140 chars.
 - Privacy toggle: `sms_show_body: false` shows only the sender.
 
