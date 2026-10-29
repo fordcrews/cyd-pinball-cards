@@ -48,14 +48,14 @@ tries to keep the screen awake with the Wake Lock API.
 
 ```json
 "immich": {
-  "url": "https://photos.example.com",
+  "url": "http://photos:2283",
   "api_key_env": "IMMICH_API_KEY",
-  "album_id": "41085acc-089c-47b9-91ec-d1aef68eb4db",
+  "album_id": "9522da72-d9fb-4851-a921-dbd84efa3cae",
   "interval": 30
 }
 ```
 
-Put the key in the `IMMICH_API_KEY` environment variable on the cabinet PC. A read-only key with `asset.read`,
+Defaults target Immich on NAS **Real** (LAN mDNS `http://photos:2283`; if mDNS fails use `http://192.168.0.152:2283`). The `album_id` is the **Personal** album. Put the key in the `IMMICH_API_KEY` environment variable on the cabinet PC (never in `config.json` or git). A read-only key with `asset.read`,
 `asset.view` and `album.read` is enough. `"api_key"` also works but leaves the key in `config.json`. The hub
 fetches the photos itself (Immich's `preview` size, about 1440 px), keeps the most recent 400 in
 `.cyd_cache/immich` and fetches the next few before they're due. Browsers only ever see `/photo/<id>.jpg` on the

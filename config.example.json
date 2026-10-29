@@ -42,11 +42,11 @@
     "photoframe_quiet": "clock"
   },
   "immich": {
-    "_comment": "Photos for the photoframe role (?role=photoframe). Put the API key in the IMMICH_API_KEY environment variable (read-only key: asset.read, asset.view, album.read); browsers never see it. interval = seconds per photo. Remove this block or set enabled false to turn it off.",
+    "_comment": "Photos for the photoframe role (?role=photoframe). Defaults point at Immich on NAS Real (LAN mDNS http://photos:2283; IP fallback http://192.168.0.152:2283). Put the API key in the IMMICH_API_KEY environment variable only (read-only key: asset.read, asset.view, album.read); never commit the key. album_id is the Personal album. interval = seconds per photo. Remove this block or set enabled false to turn it off.",
     "enabled": true,
-    "url": "https://photos.example.com",
+    "url": "http://photos:2283",
     "api_key_env": "IMMICH_API_KEY",
-    "album_id": "00000000-0000-0000-0000-000000000000",
+    "album_id": "9522da72-d9fb-4851-a921-dbd84efa3cae",
     "interval": 30
   },
   "night": {
