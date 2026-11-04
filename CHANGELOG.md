@@ -3,6 +3,14 @@
 Firmware versions are what a board reports in `ping` / `hello` / `ready` (`"fw"`). Host tools
 work with every firmware version listed here. Newer host features turn themselves off for older boards.
 
+## v1.6.2 (2026-11-03)
+
+* Firmware 1.6.2 (Waveshare 7"): RGB panel pixel clock 16→12 MHz to ease ESP32-S3 RGB+Wi-Fi/PSRAM
+  contention; `esp_task_wdt_reset`/`yield` around JPEG draw and between image chunks; `free_heap` /
+  `min_heap` on ping/hello/ready/hb (`linkStatus`).
+* Host: smaller JPEG budget/quality for `ws-s3-7`, slower gallery (16 s) and night info slides on that
+  board, Wi-Fi gallery `max_bytes` cap.
+
 ## Unreleased: photo frames and Raspberry Pi kiosk (web hub, phases 3 and 4)
 
 * New `photoframe` browser role (`?role=photoframe`). During a game it shows the game's box art (or picture) with a

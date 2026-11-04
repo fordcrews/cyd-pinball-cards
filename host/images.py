@@ -43,12 +43,12 @@ ACK_TIMEOUT = 6.0           # per picture line: room for a Wi-Fi retransmit (a U
 # numbers keep tests and dry runs honest). Landscape (rotation 1/3) sizes.
 BOARD_SIZES = {"cyd": (320, 240), "cyd35": (480, 320), "ws-s3-7": (800, 480)}
 BOARD_STRIP = {"cyd": 24, "cyd35": 24, "ws-s3-7": 48}
-BOARD_IMG_MAX = {"cyd": 32 * 1024, "cyd35": 32 * 1024, "ws-s3-7": 200 * 1024}
+BOARD_IMG_MAX = {"cyd": 32 * 1024, "cyd35": 32 * 1024, "ws-s3-7": 120 * 1024}
 # Even when a board could take more, keep pictures small: every byte costs time on a 115200 baud
 # UART (about 11 KB/s of JPEG after base64). Quality steps down until the JPEG fits.
 # cyd35 (3.5" 480x320, no PSRAM): same heap as the 2.8" CYD, so the same ceiling; more pixels
 # just means a lower JPEG quality.
-BYTE_BUDGET = {"cyd": 28 * 1024, "cyd35": 34 * 1024, "ws-s3-7": 90 * 1024}
+BYTE_BUDGET = {"cyd": 28 * 1024, "cyd35": 34 * 1024, "ws-s3-7": 56 * 1024}
 
 
 def _ver(v) -> tuple:
@@ -250,7 +250,13 @@ def prepare(msg: dict, board) -> tuple[bytes, tuple[int, int], int, dict]:
         if not p.is_file():
             raise FileNotFoundError(str(p))
         src = p
-    q = int(msg.get("quality") or DEFAULT_QUALITY)
+    hw = str(_get(board, "hw") or "cyd").lower()
+    if "quality" in msg:
+        q = int(msg.get("quality") or DEFAULT_QUALITY)
+    elif hw == "ws-s3-7":
+        q = min(DEFAULT_QUALITY, 55)  # smaller JPEG: less PSRAM decode load on the RGB panel
+    else:
+        q = DEFAULT_QUALITY
     budget = g["budget"]
     if isinstance(msg.get("max_bytes"), int) and msg["max_bytes"] > 0:
         budget = min(budget, msg["max_bytes"])     # e.g. a gallery on a slow USB link

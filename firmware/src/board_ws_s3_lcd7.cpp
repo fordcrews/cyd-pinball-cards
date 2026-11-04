@@ -56,7 +56,7 @@ class LGFX_WS7 : public lgfx::LGFX_Device {
       cfg.pin_vsync = 3;
       cfg.pin_hsync = 46;
       cfg.pin_pclk = 7;
-      cfg.freq_write = 16000000;
+      cfg.freq_write = 12000000;  // 12 MHz: ease ESP32-S3 RGB+Wi-Fi/PSRAM contention (was 16)
       cfg.hsync_polarity = 0;
       cfg.hsync_pulse_width = 4;
       cfg.hsync_back_porch = 8;

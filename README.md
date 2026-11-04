@@ -358,7 +358,7 @@ Wi-Fi), and leave the USB and BOOT/RESET side reachable.
 * While a program on the PC has the native **USB** port open, USB is the session and Wi-Fi stays
   quiet. Run a Wi-Fi-only 7" from a charger.
 * Panel shows a correct, stable image (colours not swapped, no horizontal drift). If the image
-  drifts or flickers, try `cfg.freq_write = 14000000` or `12000000` in `board_ws_s3_lcd7.cpp`;
+  drifts or flickers, firmware 1.6.2 defaults to `12000000`; try `14000000` only if the panel needs it in `board_ws_s3_lcd7.cpp`;
   a short glitch while NVS is written (settings saved) is a known ESP32-S3 RGB/PSRAM effect.
 * Backlight on at boot; `--brightness 0` turns it off and any other value back on.
 * GT911 found at `0x5D`; taps and long-press work in landscape **and** portrait (rotation 0/2);
