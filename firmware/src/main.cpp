@@ -34,7 +34,7 @@
 //                         Arms the 90 s silence drop for that session (see wifi_link.h).
 //   {"cmd":"selftest","op":"drop"}   close the Wi-Fi session (the board dials again)
 //   {"cmd":"selftest","op":"hang","confirm":"hang"}   stop feeding the loop watchdog: reboots in ~30 s
-// fw 1.6.2: ping/hello/ready also report "free_heap"/"min_heap"; fw 1.6.0: also "hb" (silence timeout s), "up", "reset", "sessions",
+// fw 1.6.3: ws-s3-7 PCLK restored to 16 MHz (12 MHz white screen). fw 1.6.2: ping/hello/ready also report "free_heap"/"min_heap"; fw 1.6.0: also "hb" (silence timeout s), "up", "reset", "sessions",
 // "silence_drops", "wifi_lost", "rejoins", "rssi". The main loop runs under a 30 s task watchdog.
 // Events (device -> host, unsolicited):
 //   {"evt":"key","key":"alt+f4"[,"mods":["ctrl","shift","alt","win"]]}   keypad button released
@@ -104,7 +104,7 @@
 #define IDENTIFY_MS 5000
 #endif
 
-#define FW_VERSION "1.6.2"
+#define FW_VERSION "1.6.3"
 #ifndef LOOP_WDT_S
 #define LOOP_WDT_S 30         // task watchdog on the main loop: a hang reboots the board
 #endif
