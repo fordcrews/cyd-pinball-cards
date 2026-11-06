@@ -352,7 +352,8 @@ class NightDaemon(BusCase):
         self.assertEqual(self.b1.cmds("brightness"), [])          # info slides: backlight untouched
         n2 = len(self.b2.cmds("table"))
         # the slides rotate: clock on one board, weather on the other, then the next slide
-        self.clock.add(0.3)
+        # ws-s3-7 holds ~22.5s (1.6.2); 0.4 min = 24s clears that and the default 15s on other boards
+        self.clock.add(0.4)
         self.assertTrue(self.tick_until(lambda: len(self.b1.pictures) >= 2))
         self.b2.tap()
         self.assertTrue(wait_until(lambda: len(self.b2.cmds("table")) > n2))

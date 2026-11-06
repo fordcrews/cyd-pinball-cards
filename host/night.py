@@ -434,6 +434,8 @@ class NightController:
             pic = self.cards.render(key, w, h, now=datetime.fromtimestamp(self.now()), weather=wx, news=news,
                                     h24=self.s.clock_24h, cabinet=self.d.st.cabinet or "")
             hold = self.s.news_seconds if key.startswith("news") else self.s.slide_seconds
+            if str(getattr(b, "hw", "") or "").lower() == "ws-s3-7":
+                hold = max(float(hold) * 1.5, float(hold) + 5.0)  # slower info slides on the 7"
             if pic is None:
                 r.next_at = self.now()
                 return

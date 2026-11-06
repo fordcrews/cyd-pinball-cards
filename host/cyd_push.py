@@ -582,6 +582,7 @@ def message_for_table(data: dict, board: Board | None, with_clock: bool = True) 
 # Content roles that show a picture when a card carries an "image" path (howtoplay stays text).
 IMAGE_ROLES = frozenset({"control_panel", "picture", "pictureboxart", "videoofplay", "gallery"})
 GALLERY_INTERVAL_S = 9.0   # seconds each gallery picture stays up (counted after it is drawn)
+GALLERY_INTERVAL_WS7_S = 16.0  # Waveshare 7" RGB+PSRAM: slower slides reduce decode/Wi-Fi contention
 
 
 def gallery_items(cards: list) -> list[dict]:
@@ -634,8 +635,11 @@ def specialize_message(msg: dict, board: Board | None) -> dict | None:
             title = msg.get("title", "")
             for it in items:
                 it["title"] = it["title"] or title
+            default_iv = (GALLERY_INTERVAL_WS7_S
+                          if str(getattr(board, "hw", "") or "").lower() == "ws-s3-7"
+                          else GALLERY_INTERVAL_S)
             interval = next((c.get("interval") for c in kept if isinstance(c.get("interval"), (int, float))),
-                            GALLERY_INTERVAL_S)
+                            default_iv)
             return {"cmd": "gallery", "title": title, "items": items, "interval": float(interval),
                     "fallback": out}
         # A card with an "image" path on a picture role becomes a picture (fw 1.5.0); the cards

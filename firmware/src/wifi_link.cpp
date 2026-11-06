@@ -4,6 +4,7 @@
 #include "board.h"
 #include "wifi_secrets.h"
 #include <WiFi.h>
+#include <limits.h>
 #include <WiFiUdp.h>
 #include <ArduinoJson.h>
 #include <lwip/sockets.h>
@@ -254,6 +255,9 @@ static const char *resetReason() {
 void linkHeartbeat() { hbArmed = true; }
 
 void linkStatus(JsonDocument &r) {
+  static uint32_t minHeap = UINT32_MAX;
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < minHeap) minHeap = freeHeap;
   r["hb"] = (int)(WIFI_SILENCE_DROP_MS / 1000);
   r["up"] = (uint32_t)(millis() / 1000);
   r["reset"] = resetReason();
@@ -261,6 +265,8 @@ void linkStatus(JsonDocument &r) {
   r["silence_drops"] = silenceDrops;
   r["wifi_lost"] = wifiLost;
   r["rejoins"] = rejoins;
+  r["free_heap"] = freeHeap;
+  r["min_heap"] = minHeap;
   if (WiFi.status() == WL_CONNECTED) r["rssi"] = WiFi.RSSI();
 }
 

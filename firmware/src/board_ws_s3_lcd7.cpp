@@ -56,7 +56,7 @@ class LGFX_WS7 : public lgfx::LGFX_Device {
       cfg.pin_vsync = 3;
       cfg.pin_hsync = 46;
       cfg.pin_pclk = 7;
-      cfg.freq_write = 16000000;
+      cfg.freq_write = 16000000;  // 16 MHz: Waveshare RGB timing (1.6.2 12 MHz caused white panel)
       cfg.hsync_polarity = 0;
       cfg.hsync_pulse_width = 4;
       cfg.hsync_back_porch = 8;

@@ -88,6 +88,7 @@ LOG_MAX_BYTES = 2 * 1024 * 1024   # --log file is rotated to <name>.1 at this si
 REFUSED_LOG_S = 60.0   # "USB is the session" for a board dialing in over Wi-Fi: once per this many seconds
 IMAGE_JOB_S = 60.0     # extra wait per picture in a cyd_push hand-off (a 7" picture over a UART is ~8 s)
 GALLERY_USB_MAX_BYTES = 40 * 1024   # gallery pictures over USB: about 5 s each at 115200 baud
+GALLERY_WS7_MAX_BYTES = 48 * 1024   # Waveshare 7" over Wi-Fi: keep decode lighter than the 56 KB budget
 HEARTBEAT_S = 30.0          # {"cmd":"hb"} to every Wi-Fi board with fw >= 1.6.0 this often
 HEARTBEAT_TIMEOUT_S = 8.0   # wait this long for its ack
 HEARTBEAT_MISSES = 2        # this many unanswered in a row: close the session (the board dials again)
@@ -994,6 +995,8 @@ class Daemon:
             m = {"cmd": "image", "path": item["path"], "title": item.get("title") or g.msg.get("title", "")}
             if not lk.is_wifi:
                 m["max_bytes"] = GALLERY_USB_MAX_BYTES
+            elif str(getattr(lk.board, "hw", "") or "").lower() == "ws-s3-7":
+                m["max_bytes"] = GALLERY_WS7_MAX_BYTES
             r = images.deliver(
                 lambda mm, t: lk.request(mm, timeout=t, accept=lambda a, mm=mm: images.ack_matches(mm, a)),
                 m, lk.board, timeout, cache=lk.img_cache,
